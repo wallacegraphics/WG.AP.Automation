@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+	<OutputType>Exe</OutputType>
+	<TargetFramework>net10.0</TargetFramework>
+	<ImplicitUsings>enable</ImplicitUsings>
+	<Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+	<ProjectReference Include="..\WG.AP.Core\WG.AP.Core.csproj" />
+	<ProjectReference Include="..\WG.AP.DataAccess\WG.AP.DataAccess.csproj" />
+	<ProjectReference Include="..\WG.AP.Email\WG.AP.Email.csproj" />
+	<ProjectReference Include="..\WG.AP.Integrations.Pace\WG.AP.Integrations.Pace.csproj" />
+	<ProjectReference Include="..\WG.AP.Invoice\WG.AP.Invoice.csproj" />
+	<ProjectReference Include="..\WG.AP.Reporting\WG.AP.Reporting.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+	<None Update="appsettings*.json">
+	  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+	</None>
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,10 @@
+<Solution>
+	<Project Path="WG.AP.Core/WG.AP.Core.csproj" />
+  <Project Path="WG.AP.DataAccess/WG.AP.DataAccess.csproj" />
+  <Project Path="WG.AP.Email/WG.AP.Email.csproj" />
+  <Project Path="WG.AP.Integrations.Pace/WG.AP.Integrations.Pace.csproj" />
+  <Project Path="WG.AP.Invoice/WG.AP.Invoice.csproj" />
+	<Project Path="WG.AP.Processing/WG.AP.Processor.csproj" />
+  <Project Path="WG.AP.Reporting/WG.AP.Reporting.csproj" />
+  <Project Path="WG.AP.Tests/WG.AP.Tests.csproj" />
+</Solution>
