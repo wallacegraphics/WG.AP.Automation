@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - development
+      - master
+      - main
+
+jobs:
+  unit-tests:
+    name: unit-tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore test project
+        run: dotnet restore WG.AP.Tests/WG.AP.Tests.csproj
+
+      - name: Build test project
+        run: dotnet build WG.AP.Tests/WG.AP.Tests.csproj --configuration Release --no-restore
+
+      - name: Run tests
+        run: dotnet test WG.AP.Tests/WG.AP.Tests.csproj --configuration Release --no-build --verbosity normal
