@@ -105,7 +105,7 @@ Also confirmed: **no Graph/Exchange precedent exists in any repo** — mailbox a
 └───────────────────┘              └──────────────────────┘
 ```
 
-### Solution layout — `c:\Users\galina.zezetko\source\repos\APAutomation\`
+### Solution layout — repository root
 
 | Project | VS template | Produces | Contains |
 |---|---|---|---|
