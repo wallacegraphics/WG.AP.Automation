@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "WG.AP.Processing": {
+      "commandName": "Project",
+      "environmentVariables": {
+        "DOTNET_ENVIRONMENT": "Development"
+      }
+    }
+  }
+}
