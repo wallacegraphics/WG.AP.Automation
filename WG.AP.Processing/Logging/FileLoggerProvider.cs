@@ -39,13 +39,13 @@ public sealed class FileLoggerProvider : ILoggerProvider
                 return;
             }
 
-            var cutoff = DateTimeOffset.Now - TimeSpan.FromDays(retentionDays);
+            var cutoffUtc = DateTime.UtcNow - TimeSpan.FromDays(retentionDays);
 
             foreach (var file in Directory.EnumerateFiles(directory, "WG.AP.Processing-*.log"))
             {
                 try
                 {
-                    if (File.GetLastWriteTime(file) < cutoff)
+                    if (File.GetLastWriteTimeUtc(file) < cutoffUtc)
                     {
                         File.Delete(file);
                     }
