@@ -78,7 +78,20 @@ public sealed class GraphMailboxProcessor : IMailSource, IMailSender
                 ApplyImmutableId(requestConfiguration.Headers);
             }, cancellationToken);
 
-            var existingByName = (childFolders?.Value ?? [])
+            var allChildFolders = new List<MailFolder>();
+
+            while (childFolders is not null)
+            {
+                allChildFolders.AddRange(childFolders.Value ?? []);
+
+                childFolders = string.IsNullOrEmpty(childFolders.OdataNextLink)
+                    ? null
+                    : await _graphClient.Users[_options.MailboxUser].MailFolders[inboxId].ChildFolders
+                        .WithUrl(childFolders.OdataNextLink)
+                        .GetAsync(requestConfiguration => ApplyImmutableId(requestConfiguration.Headers), cancellationToken);
+            }
+
+            var existingByName = allChildFolders
                 .Where(folder => folder.DisplayName is not null && folder.Id is not null)
                 .ToDictionary(folder => folder.DisplayName!, folder => folder.Id!, StringComparer.OrdinalIgnoreCase);
 

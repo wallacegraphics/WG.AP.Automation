@@ -58,7 +58,7 @@ Three `appsettings*.json` files in `WG.AP.Processing`, all starting with empty `
 
 ## How it runs today
 
-`WG.AP.Processing` is a plain console app, not a long-running service. `Program.cs` does one pass and exits: build the host → validate auth → ensure folders exist → enumerate the inbox, logging a line per message → log a summary count. It's meant to be invoked on a recurring schedule by something external (e.g. Windows Task Scheduler), not run as a Windows Service/`BackgroundService` — each run is independent and crash-safe, and there's no process supervision to own.
+`WG.AP.Processing` is a plain console app, not a long-running service. `Program.cs` does one pass and exits: build the host → validate auth → ensure folders exist → fetch new/changed messages via `MailboxSyncProcessor` (delta sync) → log a line per message → commit the new delta link → log a summary count. It's meant to be invoked on a recurring schedule by something external (e.g. Windows Task Scheduler), not run as a Windows Service/`BackgroundService` — each run is independent and crash-safe, and there's no process supervision to own.
 
 Run locally: `dotnet run --project WG.AP.Processing`.
 
@@ -75,7 +75,7 @@ Run locally: `dotnet run --project WG.AP.Processing`.
 
 ## Explicit non-scope (SDP-157)
 
-This adapter deliberately does **not**: save attachments to storage, write ledger rows, detect statements, or decide whether a message goes to `Processed` vs `Errors` vs `NeedsReview`. It touches no database and writes no files. All of that consumption logic belongs to SDP-157, which is meant to depend on `IMailSource`/`IMailSender` rather than on `GraphMailboxProcessor` directly.
+This adapter deliberately does **not**: save attachments to storage, write ledger rows, detect statements, or decide whether a message goes to `Processed` vs `Errors` vs `NeedsReview`. `GraphMailboxProcessor` itself touches no database and writes no files; the pipeline persists only a small delta-link checkpoint file via `IMailboxSyncStateStore` so incremental sync can resume safely. All consumption logic belongs to SDP-157, which is meant to depend on `IMailSource`/`IMailSender` rather than on `GraphMailboxProcessor` directly.
 
 ## Known follow-ups
 

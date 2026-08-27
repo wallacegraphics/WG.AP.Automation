@@ -28,7 +28,10 @@ builder.Services
 
 builder.Services
     .AddOptions<FileLoggerOptions>()
-    .Bind(builder.Configuration.GetSection(FileLoggerOptions.SectionName));
+    .Bind(builder.Configuration.GetSection(FileLoggerOptions.SectionName))
+    .Validate(options => !string.IsNullOrWhiteSpace(options.Directory), $"{FileLoggerOptions.SectionName}:Directory is required.")
+    .Validate(options => options.LogFilesRetentionDays > 0, $"{FileLoggerOptions.SectionName}:LogFilesRetentionDays must be greater than 0.")
+    .ValidateOnStart();
 
 builder.Services.AddSingleton(serviceProvider =>
 {

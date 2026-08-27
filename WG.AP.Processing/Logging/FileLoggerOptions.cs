@@ -12,4 +12,6 @@ public sealed class FileLoggerOptions
         "Logs");
 
     public LogLevel MinLevel { get; init; } = LogLevel.Information;
+
+    public int LogFilesRetentionDays { get; init; }
 }
