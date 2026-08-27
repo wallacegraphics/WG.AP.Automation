@@ -7,11 +7,12 @@ namespace WG.AP.Tests.Processing;
 public class FileLoggerTests : IDisposable
 {
     private readonly string _directory = Path.Combine(Path.GetTempPath(), "WG.AP.Tests", Guid.NewGuid().ToString("N"));
+    private readonly string _today = DateTimeOffset.Now.ToString("yyyy-MM-dd");
 
-    private string ExpectedLogFilePath => Path.Combine(_directory, $"WG.AP.Processing-{DateTime.Now:yyyy-MM-dd}.log");
+    private string ExpectedLogFilePath => Path.Combine(_directory, $"WG.AP.Processing-{_today}.log");
 
-    private FileLoggerProvider CreateProvider(LogLevel minLevel = LogLevel.Information) =>
-        new(Options.Create(new FileLoggerOptions { Directory = _directory, MinLevel = minLevel }));
+    private FileLoggerProvider CreateProvider(LogLevel minLevel = LogLevel.Information, int logFilesRetentionDays = 60) =>
+        new(Options.Create(new FileLoggerOptions { Directory = _directory, MinLevel = minLevel, LogFilesRetentionDays = logFilesRetentionDays }));
 
     [Fact]
     public void LogInformation_AppendsALineToTodaysLogFile()
@@ -75,6 +76,49 @@ public class FileLoggerTests : IDisposable
         {
             File.Delete(blockingFilePath);
         }
+    }
+
+    [Fact]
+    public void Construction_DeletesLogFilesOlderThanRetentionDays_AndKeepsRecentOnes()
+    {
+        Directory.CreateDirectory(_directory);
+        var oldFile = Path.Combine(_directory, "WG.AP.Processing-2020-01-01.log");
+        var recentFile = Path.Combine(_directory, "WG.AP.Processing-2020-06-01.log");
+        File.WriteAllText(oldFile, "old");
+        File.WriteAllText(recentFile, "recent");
+        File.SetLastWriteTime(oldFile, DateTime.Now.AddDays(-90));
+        File.SetLastWriteTime(recentFile, DateTime.Now.AddDays(-10));
+
+        CreateProvider(logFilesRetentionDays: 60);
+
+        Assert.False(File.Exists(oldFile));
+        Assert.True(File.Exists(recentFile));
+    }
+
+    [Fact]
+    public void Construction_DoesNotDeleteOldLogFiles_WhenRetentionDaysIsZero()
+    {
+        Directory.CreateDirectory(_directory);
+        var oldFile = Path.Combine(_directory, "WG.AP.Processing-2020-01-01.log");
+        File.WriteAllText(oldFile, "old");
+        File.SetLastWriteTime(oldFile, DateTime.Now.AddDays(-90));
+
+        CreateProvider(logFilesRetentionDays: 0);
+
+        Assert.True(File.Exists(oldFile));
+    }
+
+    [Fact]
+    public void Construction_DoesNotDeleteOldFiles_ThatDoNotMatchTheLogFileNamingPattern()
+    {
+        Directory.CreateDirectory(_directory);
+        var unrelatedFile = Path.Combine(_directory, "some-other-file.txt");
+        File.WriteAllText(unrelatedFile, "old");
+        File.SetLastWriteTime(unrelatedFile, DateTime.Now.AddDays(-90));
+
+        CreateProvider(logFilesRetentionDays: 60);
+
+        Assert.True(File.Exists(unrelatedFile));
     }
 
     public void Dispose()

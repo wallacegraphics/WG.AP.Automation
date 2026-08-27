@@ -224,6 +224,45 @@ public class GraphMailboxProcessorTests
     }
 
     [Fact]
+    public async Task EnsureFoldersExistAsync_FollowsPagination_AndFindsFoldersOnLaterPages()
+    {
+        var (processor, handler) = CreateProcessor();
+        const string nextLink = "https://graph.microsoft.com/v1.0/users/test-mailbox@wallacegraphics.com/mailFolders/inbox-id/childFolders?%24skiptoken=page2";
+        string? capturedDestinationId = null;
+
+        handler
+            .On(r => r.Method == HttpMethod.Get && r.RequestUri!.AbsolutePath.EndsWith("/mailFolders/inbox"),
+                """{"id":"inbox-id"}""")
+            // Registered before the plain childFolders route below: Uri.AbsolutePath excludes the query
+            // string, so an AbsolutePath.EndsWith(...) route would also match this next-link request
+            // (same path, different query) and — since FakeGraphHandler is first-match-wins — feed page 1
+            // back forever, spinning EnsureFoldersExistAsync's pagination loop indefinitely.
+            .On(r => r.Method == HttpMethod.Get && r.RequestUri!.ToString() == nextLink,
+                """{"value":[{"id":"folder-errors","displayName":"Errors"},{"id":"folder-needsreview","displayName":"NeedsReview"}]}""")
+            .On(r => r.Method == HttpMethod.Get && r.RequestUri!.AbsolutePath.EndsWith("/mailFolders/inbox-id/childFolders"),
+                """{"value":[{"id":"folder-processed","displayName":"Processed"}],"@odata.nextLink":"__NEXT_LINK__"}""".Replace("__NEXT_LINK__", nextLink))
+            .On(r => r.Method == HttpMethod.Post && r.RequestUri!.AbsolutePath.EndsWith("/messages/AAMk-1/move"),
+                r =>
+                {
+                    // Read the body here, synchronously, while the request's content is still live —
+                    // Kiota disposes the request (and its content stream) once the response is handled,
+                    // so re-reading it afterward from handler.Requests throws ObjectDisposedException.
+                    capturedDestinationId = ReadJsonField(r, "DestinationId");
+                    return """{"id":"AAMk-1"}""";
+                });
+        // No POST route registered for "/mailFolders/inbox-id/childFolders" — since all three folders
+        // are found across the two pages, EnsureFoldersExistAsync must not try to create any of them.
+
+        await processor.EnsureFoldersExistAsync(CancellationToken.None);
+
+        // "Errors" only appears on the second page — targeting it correctly proves pagination was
+        // followed and _folderIds was populated with the existing folder's id, not a newly created one.
+        await processor.MoveMessageAsync("AAMk-1", MailDestinationFolder.Errors, CancellationToken.None);
+
+        Assert.Equal("folder-errors", capturedDestinationId);
+    }
+
+    [Fact]
     public async Task MoveMessageAsync_PreservesTheImmutableId_AndTheMessageIsReadableByItAfterTheMove()
     {
         var (processor, handler) = CreateProcessor();

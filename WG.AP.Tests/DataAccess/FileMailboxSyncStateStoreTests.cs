@@ -61,6 +61,26 @@ public class FileMailboxSyncStateStoreTests : IDisposable
         Assert.Equal("token-b", await store.GetDeltaLinkAsync("mailbox-b@wallacegraphics.com", CancellationToken.None));
     }
 
+    [Fact]
+    public async Task SaveDeltaLinkAsync_CleansUpTheTempFile_WhenTheMoveFails()
+    {
+        var store = CreateStore();
+        const string mailboxUser = "mailbox@wallacegraphics.com";
+
+        // Force File.Move(tempPath, path, overwrite: true) to fail deterministically by making the
+        // destination an existing directory instead of a file.
+        var destinationPath = Path.Combine(_dataDirectory, "mailbox_wallacegraphics_com.json");
+        Directory.CreateDirectory(destinationPath);
+
+        // The destination being an existing directory makes File.Move fail — the exact exception
+        // type is platform-dependent (IOException vs UnauthorizedAccessException), so only assert
+        // that the write fails and the temp file is nonetheless cleaned up.
+        await Assert.ThrowsAnyAsync<Exception>(() =>
+            store.SaveDeltaLinkAsync(mailboxUser, "token-1", CancellationToken.None));
+
+        Assert.Empty(Directory.GetFiles(_dataDirectory, "*.tmp"));
+    }
+
     public void Dispose()
     {
         if (Directory.Exists(_dataDirectory))

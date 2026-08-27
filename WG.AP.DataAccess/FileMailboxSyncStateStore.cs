@@ -59,6 +59,19 @@ public sealed class FileMailboxSyncStateStore(
             logger.LogError(exception, "Failed to write mailbox sync state file {Path} for {MailboxUser}.", path, mailboxUser);
             throw;
         }
+        finally
+        {
+            // File.Move already removed the temp file on the success path; this is a best-effort
+            // cleanup for the failure path (serialization or the move itself throwing) so retries
+            // after a transient failure don't leave orphaned *.tmp files behind indefinitely.
+            try
+            {
+                File.Delete(tempPath);
+            }
+            catch
+            {
+            }
+        }
     }
 
     private string GetFilePath(string mailboxUser)
