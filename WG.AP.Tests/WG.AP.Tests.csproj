@@ -20,6 +20,7 @@
     <ProjectReference Include="..\WG.AP.Email\WG.AP.Email.csproj" />
     <ProjectReference Include="..\WG.AP.Integrations.Pace\WG.AP.Integrations.Pace.csproj" />
     <ProjectReference Include="..\WG.AP.Invoice\WG.AP.Invoice.csproj" />
+    <ProjectReference Include="..\WG.AP.Processing\WG.AP.Processor.csproj" />
     <ProjectReference Include="..\WG.AP.Reporting\WG.AP.Reporting.csproj" />
   </ItemGroup>
 
