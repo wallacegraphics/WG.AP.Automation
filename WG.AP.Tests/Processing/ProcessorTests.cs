@@ -294,8 +294,9 @@ public class ProcessorTests
 
         await processor.ProcessInvoicesAsync(CancellationToken.None);
 
-        Assert.Equal(("m1", MailDestinationFolder.Processed), Assert.Single(mailSource.Moves));
-        Assert.Equal(2, mailSource.AttachmentRequests.Count);
-        Assert.Equal(("m1", "a2"), mailSource.AttachmentRequests[1]);
+Assert.Equal(("m1", MailDestinationFolder.Processed), Assert.Single(mailSource.Moves));
+Assert.Equal(2, mailSource.AttachmentRequests.Count);
+Assert.Contains(("m1", "a2"), mailSource.AttachmentRequests);
+Assert.DoesNotContain(("m1", "a3"), mailSource.AttachmentRequests);
     }
 }
