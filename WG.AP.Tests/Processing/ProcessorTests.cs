@@ -265,7 +265,7 @@ public class ProcessorTests
     }
 
     [Fact]
-    public async Task ProcessInvoicesAsync_DuplicatePdfFilenames_UsesTheFirstMatch()
+    public async Task ProcessInvoicesAsync_DuplicatePdfFilenames_DoesNotThrow_AndRoutesToProcessed()
     {
         var row = new ManifestRow("INV-1", null, null, null, 100m, null, null, null, null);
         var extractedFields = new InvoiceFields("INV-1", null, null, null, 100m, null, null);
