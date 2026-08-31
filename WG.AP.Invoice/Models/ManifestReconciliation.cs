@@ -7,8 +7,9 @@ namespace WG.AP.Invoice.Models;
 public sealed record ManifestReconciliation(
     IReadOnlyList<string> MissingPdfVouchers,
     IReadOnlyList<string> UnexpectedAttachments,
+    IReadOnlyList<string> DuplicateAttachments,
     IReadOnlyList<string> DuplicateVouchers,
     IReadOnlyList<ManifestPair> MatchedPairs)
 {
-    public bool HasDiscrepancies => MissingPdfVouchers.Count > 0 || UnexpectedAttachments.Count > 0 || DuplicateVouchers.Count > 0;
+    public bool HasDiscrepancies => MissingPdfVouchers.Count > 0 || UnexpectedAttachments.Count > 0 || DuplicateAttachments.Count > 0 || DuplicateVouchers.Count > 0;
 }

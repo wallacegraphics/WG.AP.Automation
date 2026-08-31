@@ -64,7 +64,7 @@ public class ProcessorTests
         public IReadOnlyList<ManifestRow> ReadManifest(byte[] excelBytes) => OnReadManifest!(excelBytes);
 
         public ManifestReconciliation Reconcile(IReadOnlyList<ManifestRow> manifestRows, IReadOnlyList<MailAttachmentSummary> pdfAttachments) =>
-            OnReconcile is not null ? OnReconcile(manifestRows, pdfAttachments) : new ManifestReconciliation([], [], [], []);
+            OnReconcile is not null ? OnReconcile(manifestRows, pdfAttachments) : new ManifestReconciliation([], [], [], [], []);
 
         public InvoiceFieldComparisonResult CompareFields(ManifestRow row, InvoiceFields extractedFields) =>
             OnCompareFields is not null ? OnCompareFields(row, extractedFields) : new InvoiceFieldComparisonResult(row.Voucher, []);
@@ -148,7 +148,7 @@ public class ProcessorTests
         var verifier = new FakeManifestVerifier
         {
             OnReadManifest = _ => [row],
-            OnReconcile = (_, _) => new ManifestReconciliation([], [], [], [new ManifestPair("INV-1", "INV-1.pdf", row)])
+            OnReconcile = (_, _) => new ManifestReconciliation([], [], [], [], [new ManifestPair("INV-1", "INV-1.pdf", row)])
         };
         var extractor = new FakeInvoiceFieldExtractor(); // OnExtract left null -> throws, simulating a suspicious PDF
         var (processor, mailSource) = CreateProcessor(extractor, verifier);
@@ -173,13 +173,37 @@ public class ProcessorTests
         var verifier = new FakeManifestVerifier
         {
             OnReadManifest = _ => [row],
-            OnReconcile = (_, _) => new ManifestReconciliation(["INV-1"], [], [], [])
+            OnReconcile = (_, _) => new ManifestReconciliation(["INV-1"], [], [], [], [])
         };
         var (processor, mailSource) = CreateProcessor(verifier: verifier);
 
         var message = MessageWith("m1", new MailAttachmentSummary("a1", "manifest.xlsx", 100, "application/vnd.openxmlformats"));
         mailSource.DeltaResult = new MailboxDeltaResult([message], "delta-1");
         mailSource.AttachmentContents[("m1", "a1")] = [1];
+
+        await processor.ProcessInvoicesAsync(CancellationToken.None);
+
+        Assert.Equal(("m1", MailDestinationFolder.NeedsReview), Assert.Single(mailSource.Moves));
+    }
+
+    [Fact]
+    public async Task ProcessInvoicesAsync_ManifestDiscrepancy_SkipsPdfExtraction()
+    {
+        var row = new ManifestRow("INV-1", null, null, null, 100m, null, null, null, null);
+        var verifier = new FakeManifestVerifier
+        {
+            OnReadManifest = _ => [row],
+            OnReconcile = (_, _) => new ManifestReconciliation(["INV-2"], [], [], [], [new ManifestPair("INV-1", "INV-1.pdf", row)])
+        };
+        var (processor, mailSource) = CreateProcessor(verifier: verifier);
+
+        var message = MessageWith(
+            "m1",
+            new MailAttachmentSummary("a1", "manifest.xlsx", 100, "application/vnd.openxmlformats"),
+            new MailAttachmentSummary("a2", "INV-1.pdf", 100, "application/pdf"));
+        mailSource.DeltaResult = new MailboxDeltaResult([message], "delta-1");
+        mailSource.AttachmentContents[("m1", "a1")] = [1];
+        mailSource.AttachmentContents[("m1", "a2")] = [2];
 
         await processor.ProcessInvoicesAsync(CancellationToken.None);
 
@@ -194,7 +218,7 @@ public class ProcessorTests
         var verifier = new FakeManifestVerifier
         {
             OnReadManifest = _ => [row],
-            OnReconcile = (_, _) => new ManifestReconciliation([], [], [], [new ManifestPair("INV-1", "INV-1.pdf", row)]),
+            OnReconcile = (_, _) => new ManifestReconciliation([], [], [], [], [new ManifestPair("INV-1", "INV-1.pdf", row)]),
             OnCompareFields = (r, f) => new InvoiceFieldComparisonResult(r.Voucher, [new FieldMismatch("InvoiceAmount", "100.00", "999.00")])
         };
         var extractor = new FakeInvoiceFieldExtractor { OnExtract = _ => extractedFields };
@@ -221,7 +245,7 @@ public class ProcessorTests
         var verifier = new FakeManifestVerifier
         {
             OnReadManifest = _ => [row],
-            OnReconcile = (_, _) => new ManifestReconciliation([], [], [], [new ManifestPair("INV-1", "INV-1.pdf", row)]),
+            OnReconcile = (_, _) => new ManifestReconciliation([], [], [], [], [new ManifestPair("INV-1", "INV-1.pdf", row)]),
             OnCompareFields = (r, f) => new InvoiceFieldComparisonResult(r.Voucher, [])
         };
         var extractor = new FakeInvoiceFieldExtractor { OnExtract = _ => extractedFields };
@@ -234,6 +258,35 @@ public class ProcessorTests
         mailSource.DeltaResult = new MailboxDeltaResult([message], "delta-1");
         mailSource.AttachmentContents[("m1", "a1")] = [1];
         mailSource.AttachmentContents[("m1", "a2")] = [2];
+
+        await processor.ProcessInvoicesAsync(CancellationToken.None);
+
+        Assert.Equal(("m1", MailDestinationFolder.Processed), Assert.Single(mailSource.Moves));
+    }
+
+    [Fact]
+    public async Task ProcessInvoicesAsync_DuplicatePdfFilenames_DoesNotThrow_AndRoutesToProcessed()
+    {
+        var row = new ManifestRow("INV-1", null, null, null, 100m, null, null, null, null);
+        var extractedFields = new InvoiceFields("INV-1", null, null, null, 100m, null, null);
+        var verifier = new FakeManifestVerifier
+        {
+            OnReadManifest = _ => [row],
+            OnReconcile = (_, _) => new ManifestReconciliation([], [], [], [], [new ManifestPair("INV-1", "INV-1.pdf", row)]),
+            OnCompareFields = (r, f) => new InvoiceFieldComparisonResult(r.Voucher, [])
+        };
+        var extractor = new FakeInvoiceFieldExtractor { OnExtract = _ => extractedFields };
+        var (processor, mailSource) = CreateProcessor(extractor, verifier);
+
+        var message = MessageWith(
+            "m1",
+            new MailAttachmentSummary("a1", "manifest.xlsx", 100, "application/vnd.openxmlformats"),
+            new MailAttachmentSummary("a2", "INV-1.pdf", 100, "application/pdf"),
+            new MailAttachmentSummary("a3", "INV-1.pdf", 100, "application/pdf"));
+        mailSource.DeltaResult = new MailboxDeltaResult([message], "delta-1");
+        mailSource.AttachmentContents[("m1", "a1")] = [1];
+        mailSource.AttachmentContents[("m1", "a2")] = [2];
+        mailSource.AttachmentContents[("m1", "a3")] = [3];
 
         await processor.ProcessInvoicesAsync(CancellationToken.None);
 

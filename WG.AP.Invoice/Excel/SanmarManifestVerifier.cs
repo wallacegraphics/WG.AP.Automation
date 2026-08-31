@@ -97,9 +97,17 @@ public sealed class SanmarManifestVerifier(ILogger<SanmarManifestVerifier> logge
             .GroupBy(row => row.Voucher, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(group => group.Key, group => group.First(), StringComparer.OrdinalIgnoreCase);
 
-        var attachmentsByStem = pdfAttachments
+        var attachmentGroups = pdfAttachments
             .GroupBy(attachment => Path.GetFileNameWithoutExtension(attachment.Name), StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var attachmentsByStem = attachmentGroups
             .ToDictionary(group => group.Key, group => group.First(), StringComparer.OrdinalIgnoreCase);
+
+        var duplicateAttachments = attachmentGroups
+            .Where(group => group.Count() > 1)
+            .Select(group => group.Key)
+            .ToList();
 
         var matched = new List<ManifestPair>();
         var missing = new List<string>();
@@ -120,7 +128,7 @@ public sealed class SanmarManifestVerifier(ILogger<SanmarManifestVerifier> logge
             .Where(stem => !distinctRowsByVoucher.ContainsKey(stem))
             .ToList();
 
-        return new ManifestReconciliation(missing, unexpected, duplicateVouchers, matched);
+        return new ManifestReconciliation(missing, unexpected, duplicateAttachments, duplicateVouchers, matched);
     }
 
     public InvoiceFieldComparisonResult CompareFields(ManifestRow row, InvoiceFields extractedFields)
