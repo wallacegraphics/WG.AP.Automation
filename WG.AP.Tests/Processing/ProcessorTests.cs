@@ -14,6 +14,7 @@ public class ProcessorTests
     {
         public MailboxDeltaResult DeltaResult { get; set; } = new([], "delta-1");
         public Dictionary<(string MessageId, string AttachmentId), byte[]> AttachmentContents { get; } = [];
+        public List<(string MessageId, string AttachmentId)> AttachmentRequests { get; } = [];
         public List<(string MessageId, MailDestinationFolder Destination)> Moves { get; } = [];
 
         public Task ValidateAuthAsync(CancellationToken cancellationToken) => Task.CompletedTask;
@@ -28,8 +29,11 @@ public class ProcessorTests
         public Task<MailMessageSummary?> GetMessageAsync(string messageId, CancellationToken cancellationToken) =>
             throw new NotSupportedException("Not exercised by these tests.");
 
-        public Task<byte[]> GetAttachmentContentAsync(string messageId, string attachmentId, CancellationToken cancellationToken) =>
-            Task.FromResult(AttachmentContents[(messageId, attachmentId)]);
+        public Task<byte[]> GetAttachmentContentAsync(string messageId, string attachmentId, CancellationToken cancellationToken)
+        {
+            AttachmentRequests.Add((messageId, attachmentId));
+            return Task.FromResult(AttachmentContents[(messageId, attachmentId)]);
+        }
 
         public Task<string> MoveMessageAsync(string messageId, MailDestinationFolder destination, CancellationToken cancellationToken)
         {
@@ -290,6 +294,9 @@ public class ProcessorTests
 
         await processor.ProcessInvoicesAsync(CancellationToken.None);
 
-        Assert.Equal(("m1", MailDestinationFolder.Processed), Assert.Single(mailSource.Moves));
+Assert.Equal(("m1", MailDestinationFolder.Processed), Assert.Single(mailSource.Moves));
+Assert.Equal(2, mailSource.AttachmentRequests.Count);
+Assert.Contains(("m1", "a2"), mailSource.AttachmentRequests);
+Assert.DoesNotContain(("m1", "a3"), mailSource.AttachmentRequests);
     }
 }
