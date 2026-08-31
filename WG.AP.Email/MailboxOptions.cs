@@ -17,4 +17,11 @@ public sealed class MailboxOptions
     /// mailbox — it moves mail into subfolders and must never be pointed at the live AP inbox.
     /// </summary>
     public required bool IsTestMailbox { get; init; }
+
+    /// <summary>
+    /// Hard cap on a single attachment's size. Defaults to Exchange Online's standard org-wide
+    /// message size limit (35MB) — an attachment above this is a hard error rather than an attempt
+    /// to load an arbitrarily large blob into memory.
+    /// </summary>
+    public long MaxAttachmentSizeBytes { get; init; } = 35L * 1024 * 1024;
 }

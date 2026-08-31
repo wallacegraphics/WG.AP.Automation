@@ -25,7 +25,7 @@ public class GraphMailboxProcessorTests
             Entries.Add((logLevel, formatter(state, exception), exception));
     }
 
-    private static (GraphMailboxProcessor Processor, FakeGraphHandler Handler) CreateProcessor(ILogger<GraphMailboxProcessor>? logger = null)
+    private static (GraphMailboxProcessor Processor, FakeGraphHandler Handler) CreateProcessor(ILogger<GraphMailboxProcessor>? logger = null, long? maxAttachmentSizeBytes = null)
     {
         var handler = new FakeGraphHandler();
         var httpClient = new HttpClient(handler);
@@ -41,7 +41,8 @@ public class GraphMailboxProcessorTests
             ClientId = "client",
             ClientSecret = "secret",
             MailboxUser = "test-mailbox@wallacegraphics.com",
-            IsTestMailbox = true
+            IsTestMailbox = true,
+            MaxAttachmentSizeBytes = maxAttachmentSizeBytes ?? 35L * 1024 * 1024
         });
 
         var processor = new GraphMailboxProcessor(graphClient, options, logger ?? NullLogger<GraphMailboxProcessor>.Instance);
@@ -192,6 +193,38 @@ public class GraphMailboxProcessorTests
 
         Assert.Equal(expectedBytes.Length, content.Length);
         Assert.Equal(expectedBytes, content);
+    }
+
+    [Fact]
+    public async Task GetAttachmentContentAsync_FallsBackToValueStream_WhenNoInlineContentBytes()
+    {
+        var (processor, handler) = CreateProcessor();
+        var expectedBytes = Encoding.UTF8.GetBytes("Streamed content, no inline bytes.");
+
+        handler
+            .On(r => r.Method == HttpMethod.Get && r.RequestUri!.AbsolutePath.EndsWith("/messages/AAMk-1/attachments/attach-1"),
+                """{"@odata.type":"#microsoft.graph.fileAttachment","id":"attach-1","name":"invoice.pdf","contentType":"application/pdf","size":35}""")
+            .OnBinary(r => r.Method == HttpMethod.Get && r.RequestUri!.AbsolutePath.EndsWith("/attachments/attach-1/$value"), expectedBytes);
+
+        var content = await processor.GetAttachmentContentAsync("AAMk-1", "attach-1", CancellationToken.None);
+
+        Assert.Equal(expectedBytes, content);
+    }
+
+    [Fact]
+    public async Task GetAttachmentContentAsync_ThrowsAndLogs_WhenAttachmentExceedsConfiguredMaxSize()
+    {
+        var logger = new CapturingLogger();
+        var (processor, handler) = CreateProcessor(logger, maxAttachmentSizeBytes: 10);
+
+        handler.On(
+            r => r.Method == HttpMethod.Get && r.RequestUri!.AbsolutePath.EndsWith("/messages/AAMk-1/attachments/attach-1"),
+            """{"@odata.type":"#microsoft.graph.fileAttachment","id":"attach-1","name":"invoice.pdf","contentType":"application/pdf","size":999999}""");
+
+        await Assert.ThrowsAnyAsync<Exception>(() =>
+            processor.GetAttachmentContentAsync("AAMk-1", "attach-1", CancellationToken.None));
+
+        Assert.Contains(logger.Entries, e => e.Level == LogLevel.Error && e.Message.Contains("attach-1"));
     }
 
     [Fact]

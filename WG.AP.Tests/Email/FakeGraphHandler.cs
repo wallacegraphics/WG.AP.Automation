@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Http.Headers;
 using System.Text;
 
 namespace WG.AP.Tests.Email;
@@ -9,19 +10,26 @@ namespace WG.AP.Tests.Email;
 /// </summary>
 internal sealed class FakeGraphHandler : HttpMessageHandler
 {
-    private readonly List<(Func<HttpRequestMessage, bool> Matches, Func<HttpRequestMessage, string> Respond)> _routes = [];
+    private readonly List<(Func<HttpRequestMessage, bool> Matches, Func<HttpRequestMessage, HttpContent> Respond)> _routes = [];
 
     public List<HttpRequestMessage> Requests { get; } = [];
 
     public FakeGraphHandler On(Func<HttpRequestMessage, bool> matches, string jsonResponse)
     {
-        _routes.Add((matches, _ => jsonResponse));
+        _routes.Add((matches, _ => new StringContent(jsonResponse, Encoding.UTF8, "application/json")));
         return this;
     }
 
     public FakeGraphHandler On(Func<HttpRequestMessage, bool> matches, Func<HttpRequestMessage, string> respond)
     {
-        _routes.Add((matches, respond));
+        _routes.Add((matches, request => new StringContent(respond(request), Encoding.UTF8, "application/json")));
+        return this;
+    }
+
+    /// <summary>Fakes a raw/binary response — used for the attachment $value endpoint, which returns bytes, not JSON.</summary>
+    public FakeGraphHandler OnBinary(Func<HttpRequestMessage, bool> matches, byte[] content, string contentType = "application/octet-stream")
+    {
+        _routes.Add((matches, _ => new ByteArrayContent(content) { Headers = { ContentType = new MediaTypeHeaderValue(contentType) } }));
         return this;
     }
 
@@ -38,10 +46,9 @@ internal sealed class FakeGraphHandler : HttpMessageHandler
             });
         }
 
-        var body = route.Respond(request);
         var response = new HttpResponseMessage(HttpStatusCode.OK)
         {
-            Content = new StringContent(body, Encoding.UTF8, "application/json")
+            Content = route.Respond(request)
         };
 
         return Task.FromResult(response);

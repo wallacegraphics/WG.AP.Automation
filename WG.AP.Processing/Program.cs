@@ -7,6 +7,9 @@ using Microsoft.Graph;
 using WG.AP.Core.Abstractions;
 using WG.AP.DataAccess;
 using WG.AP.Email;
+using WG.AP.Invoice.Abstractions;
+using WG.AP.Invoice.AI;
+using WG.AP.Invoice.Excel;
 using WG.AP.Processor;
 using WG.AP.Processor.Logging;
 
@@ -33,6 +36,13 @@ builder.Services
     .Validate(options => options.LogFilesRetentionDays >= 0, $"{FileLoggerOptions.SectionName}:LogFilesRetentionDays must be 0 (disable) or greater.")
     .ValidateOnStart();
 
+builder.Services
+    .AddOptions<OllamaOptions>()
+    .Bind(builder.Configuration.GetSection(OllamaOptions.SectionName))
+    .Validate(options => !string.IsNullOrWhiteSpace(options.BaseUrl), $"{OllamaOptions.SectionName}:BaseUrl is required.")
+    .Validate(options => !string.IsNullOrWhiteSpace(options.Model), $"{OllamaOptions.SectionName}:Model is required.")
+    .ValidateOnStart();
+
 builder.Services.AddSingleton(serviceProvider =>
 {
     var mailboxOptions = serviceProvider.GetRequiredService<IOptions<MailboxOptions>>().Value;
@@ -45,6 +55,16 @@ builder.Services.AddSingleton<IMailSource>(serviceProvider => serviceProvider.Ge
 builder.Services.AddSingleton<IMailSender>(serviceProvider => serviceProvider.GetRequiredService<GraphMailboxProcessor>());
 builder.Services.AddSingleton<IMailboxSyncStateStore, FileMailboxSyncStateStore>();
 builder.Services.AddSingleton<MailboxSyncProcessor>();
+
+builder.Services.AddHttpClient<OllamaClient>((serviceProvider, httpClient) =>
+{
+    var ollamaOptions = serviceProvider.GetRequiredService<IOptions<OllamaOptions>>().Value;
+    httpClient.BaseAddress = new Uri(ollamaOptions.BaseUrl);
+    httpClient.Timeout = TimeSpan.FromSeconds(ollamaOptions.TimeoutSeconds);
+});
+builder.Services.AddSingleton<IInvoiceFieldExtractor, PdfInvoiceFieldExtractor>();
+builder.Services.AddSingleton<IAttachmentManifestVerifier, SanmarManifestVerifier>();
+
 builder.Services.AddSingleton<APProcessor>();
 
 builder.Logging.ClearProviders();
