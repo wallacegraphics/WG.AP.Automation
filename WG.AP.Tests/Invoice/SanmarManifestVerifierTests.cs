@@ -112,6 +112,23 @@ public class SanmarManifestVerifierTests
     }
 
     [Fact]
+    public void Reconcile_DuplicatePdfAttachments_AreReported()
+    {
+        var rows = new List<ManifestRow> { new("INV-1", null, null, null, 100m, null, null, null, null) };
+        var attachments = new List<MailAttachmentSummary>
+        {
+            new("a1", "INV-1.pdf", 100, "application/pdf"),
+            new("a2", "INV-1.pdf", 120, "application/pdf")
+        };
+
+        var result = CreateVerifier().Reconcile(rows, attachments);
+
+        Assert.True(result.HasDiscrepancies);
+        Assert.Equal("INV-1", Assert.Single(result.DuplicateAttachments));
+        Assert.Single(result.MatchedPairs);
+    }
+
+    [Fact]
     public void Reconcile_DuplicateVoucherInManifest_IsReported()
     {
         var rows = new List<ManifestRow>

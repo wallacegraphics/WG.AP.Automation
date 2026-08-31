@@ -126,52 +126,53 @@ public sealed class APProcessor(
         }
 
         var reconciliation = manifestVerifier.Reconcile(manifestRows, pdfAttachments);
+        if (reconciliation.HasDiscrepancies)
+        {
+            logger.LogWarning(
+                "Message {MessageId}: manifest discrepancy — missing PDF(s) for voucher(s) [{Missing}], unexpected attachment(s) [{Unexpected}], duplicate attachment(s) [{DuplicateAttachments}], duplicate voucher(s) [{Duplicates}].",
+                message.Id,
+                string.Join(", ", reconciliation.MissingPdfVouchers),
+                string.Join(", ", reconciliation.UnexpectedAttachments),
+                string.Join(", ", reconciliation.DuplicateAttachments),
+                string.Join(", ", reconciliation.DuplicateVouchers));
+            return MailDestinationFolder.NeedsReview;
+        }
+
         var extractedByVoucher = new Dictionary<string, InvoiceFields>(StringComparer.OrdinalIgnoreCase);
         var hasParseFailure = false;
 
         foreach (var pair in reconciliation.MatchedPairs)
         {
-            var attachment = pdfAttachments.Single(a => a.Name == pair.AttachmentName);
+                var attachment = pdfAttachments.First(a => a.Name == pair.AttachmentName);
 
-            try
-            {
-                var pdfBytes = await mailSource.GetAttachmentContentAsync(message.Id, attachment.Id, cancellationToken);
-                extractedByVoucher[pair.Voucher] = await invoiceFieldExtractor.ExtractAsync(pdfBytes, cancellationToken);
-            }
-            catch (Exception exception) when (exception is HttpRequestException or TaskCanceledException)
-            {
-                // Ollama itself is unreachable/timed out — an infrastructure problem, not a bad
-                // invoice. Propagate so nothing gets committed and the whole batch retries next run,
-                // rather than misfiling a possibly-good invoice into Errors.
-                throw;
-            }
-            catch (Exception exception)
-            {
-                logger.LogError(exception, "Message {MessageId}: PDF attachment '{FileName}' (voucher {Voucher}) could not be parsed.", message.Id, attachment.Name, pair.Voucher);
-                hasParseFailure = true;
-            }
+                try
+                {
+                    var pdfBytes = await mailSource.GetAttachmentContentAsync(message.Id, attachment.Id, cancellationToken);
+                    extractedByVoucher[pair.Voucher] = await invoiceFieldExtractor.ExtractAsync(pdfBytes, cancellationToken);
+                }
+                catch (Exception exception) when (exception is HttpRequestException or TaskCanceledException)
+                {
+                    // Ollama itself is unreachable/timed out — an infrastructure problem, not a bad
+                    // invoice. Propagate so nothing gets committed and the whole batch retries next run,
+                    // rather than misfiling a possibly-good invoice into Errors.
+                    throw;
+                }
+                catch (Exception exception)
+                {
+                    logger.LogError(exception, "Message {MessageId}: PDF attachment '{FileName}' (voucher {Voucher}) could not be parsed.", message.Id, attachment.Name, pair.Voucher);
+                    hasParseFailure = true;
+                }
         }
 
         if (hasParseFailure)
         {
-            return MailDestinationFolder.Errors;
-        }
-
-        if (reconciliation.HasDiscrepancies)
-        {
-            logger.LogWarning(
-                "Message {MessageId}: manifest discrepancy — missing PDF(s) for voucher(s) [{Missing}], unexpected attachment(s) [{Unexpected}], duplicate voucher(s) [{Duplicates}].",
-                message.Id,
-                string.Join(", ", reconciliation.MissingPdfVouchers),
-                string.Join(", ", reconciliation.UnexpectedAttachments),
-                string.Join(", ", reconciliation.DuplicateVouchers));
-            return MailDestinationFolder.NeedsReview;
+                return MailDestinationFolder.Errors;
         }
 
         var fieldMismatches = reconciliation.MatchedPairs
-            .Select(pair => manifestVerifier.CompareFields(pair.Row, extractedByVoucher[pair.Voucher]))
-            .Where(result => !result.IsMatch)
-            .ToList();
+                .Select(pair => manifestVerifier.CompareFields(pair.Row, extractedByVoucher[pair.Voucher]))
+                .Where(result => !result.IsMatch)
+                .ToList();
 
         if (fieldMismatches.Count > 0)
         {
