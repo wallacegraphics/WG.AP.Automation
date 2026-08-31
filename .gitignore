@@ -361,3 +361,6 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+
+# Real invoice PDFs for local-only integration testing - never commit real invoice data
+WG.AP.Tests/Invoice/Fixtures.local/

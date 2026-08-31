@@ -268,17 +268,44 @@ public sealed class GraphMailboxProcessor : IMailSource, IMailSender
                 requestConfiguration => ApplyImmutableId(requestConfiguration.Headers),
                 cancellationToken);
 
-            if (attachment is FileAttachment { ContentBytes: { Length: > 0 } contentBytes })
+            if (attachment is not FileAttachment fileAttachment)
+            {
+                throw CreateInvalidOperation($"Attachment {attachmentId} on message {messageId} is not a file attachment.");
+            }
+
+            if (fileAttachment.Size is { } size && size > _options.MaxAttachmentSizeBytes)
+            {
+                throw CreateInvalidOperation(
+                    $"Attachment {attachmentId} on message {messageId} is {size} bytes, exceeding the configured limit of {_options.MaxAttachmentSizeBytes} bytes.");
+            }
+
+            if (fileAttachment.ContentBytes is { Length: > 0 } contentBytes)
             {
                 return contentBytes;
             }
 
-            _logger.LogWarning(
-                "Attachment {AttachmentId} on message {MessageId} returned no inline content bytes. Large attachments streamed via $value are not yet supported by this adapter.",
+            // Graph only inlines contentBytes up to ~3MB (base64/JSON overhead caps it there);
+            // anything larger comes back with no inline bytes and must be streamed via $value.
+            // The Graph SDK has no strongly-typed builder for this segment, so the request is built
+            // from the normal attachment request and sent as a raw/primitive stream request instead.
+            _logger.LogInformation(
+                "Attachment {AttachmentId} on message {MessageId} returned no inline content bytes; streaming via $value.",
                 attachmentId,
                 messageId);
 
-            return [];
+            var requestInformation = _graphClient.Users[_options.MailboxUser].Messages[messageId].Attachments[attachmentId]
+                .ToGetRequestInformation(requestConfiguration => ApplyImmutableId(requestConfiguration.Headers));
+            requestInformation.UrlTemplate += "/$value";
+
+            var stream = await _graphClient.RequestAdapter.SendPrimitiveAsync<Stream>(requestInformation, cancellationToken: cancellationToken)
+                ?? throw CreateInvalidOperation($"Attachment {attachmentId} on message {messageId} returned no content via $value.");
+
+            await using (stream)
+            {
+                using var memoryStream = new MemoryStream();
+                await stream.CopyToAsync(memoryStream, cancellationToken);
+                return memoryStream.ToArray();
+            }
         }
         catch (Exception exception)
         {
