@@ -91,7 +91,31 @@ public sealed class InvoiceRepository(
             // Reading the attachment's row back separates them. Doing it here rather than before the
             // insert keeps the index authoritative: the query only runs once the constraint has already
             // spoken, so it adds no check-then-insert race.
-            var existingInvoiceId = await FindByAttachmentAsync(invoice.MailAttachmentId, cancellationToken);
+            long? existingInvoiceId;
+
+            try
+            {
+                existingInvoiceId = await FindByAttachmentAsync(invoice.MailAttachmentId, cancellationToken);
+            }
+            catch (Exception lookupException)
+            {
+                // An exception thrown from inside a catch block does not reach the sibling catch clauses
+                // of the same try, so without this the failure would leave this repository with nothing
+                // logged - the one thing the convention here exists to prevent.
+                //
+                // Rethrown rather than guessed at. Falling back to "duplicate" would misfile a good
+                // invoice into NeedsReview, and falling back to "not a duplicate" would report an
+                // invoice id this method does not have. A ledger read that fails is infrastructure, so
+                // the right outcome is the same as any other transient fault: stop, commit nothing, and
+                // let the uncommitted delta link redeliver the message next run.
+                logger.LogError(
+                    lookupException,
+                    "Failed to determine whether attachment {MailAttachmentId} on mail message {MailMessageId} already has "
+                    + "an invoice, after its insert was rejected by unique constraint violation {SqlErrorNumber}.",
+                    invoice.MailAttachmentId, invoice.MailMessageId, exception.Number);
+
+                throw;
+            }
 
             if (existingInvoiceId is not null)
             {
