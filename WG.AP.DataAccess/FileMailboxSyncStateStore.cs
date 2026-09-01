@@ -15,8 +15,10 @@ namespace WG.AP.DataAccess;
 /// <see cref="DualMailboxSyncStateStore"/> for the first week after cutover, then deleted.
 /// <para>
 /// The file is now named after the mailbox id rather than the address. Naming it after the address
-/// was lossy — <see cref="GetFilePath"/> maps every non-alphanumeric character to '_', so
-/// <c>a.b@x.com</c> and <c>a_b@x.com</c> resolved to one file and silently shared a cursor.
+/// was lossy — the old scheme mapped every non-alphanumeric character to '_', so <c>a.b@x.com</c> and
+/// <c>a_b@x.com</c> resolved to one file and silently shared a cursor. Reads still look under the old
+/// name when nothing exists under the new one, so a cursor written before cutover is not stranded;
+/// writes only ever use the new one.
 /// </para>
 /// </remarks>
 public sealed class FileMailboxSyncStateStore(
@@ -26,13 +28,32 @@ public sealed class FileMailboxSyncStateStore(
     public async Task<string?> GetDeltaLinkAsync(MailboxRef mailbox, CancellationToken cancellationToken)
     {
         var mailboxUser = mailbox.MailboxUser;
-        var path = GetFilePath(mailbox);
+        var currentPath = GetFilePath(mailbox);
+        var path = currentPath;
 
         try
         {
             if (!File.Exists(path))
             {
-                return null;
+                // Reads fall back to the pre-cutover name, which was derived from the address. Without
+                // this, the fallback half of DualMailboxSyncStateStore cannot see the very file it
+                // exists to fall back on: the first run after cutover would find no row in SQL and no
+                // file under the new name, conclude there is no cursor, and resync the whole inbox.
+                // Reads only — saves always write the id-named path, so one save supersedes the legacy
+                // file and this branch stops being taken.
+                var legacyPath = GetLegacyFilePath(mailbox);
+
+                if (!File.Exists(legacyPath))
+                {
+                    return null;
+                }
+
+                logger.LogWarning(
+                    "Read the mailbox sync state for {MailboxUser} from the pre-cutover file {LegacyPath}; "
+                    + "the next save writes {Path} instead. Expected at most once, on the first run after cutover.",
+                    mailboxUser, legacyPath, currentPath);
+
+                path = legacyPath;
             }
 
             using var stream = File.OpenRead(path);
@@ -89,6 +110,18 @@ public sealed class FileMailboxSyncStateStore(
     // address, which it replaced for exactly that reason.
     private string GetFilePath(MailboxRef mailbox) =>
         Path.Combine(options.Value.DataDirectory, $"{mailbox.MailboxId:D}.json");
+
+    // The naming this store used before it keyed on the mailbox id. Reproduced verbatim rather than
+    // improved, because its only job is to locate files the old code actually wrote. Read-only, and it
+    // goes when this class does.
+    private string GetLegacyFilePath(MailboxRef mailbox)
+    {
+        var safeName = new string(mailbox.MailboxUser
+            .Select(character => char.IsLetterOrDigit(character) || character is '-' or '_' ? character : '_')
+            .ToArray());
+
+        return Path.Combine(options.Value.DataDirectory, $"{safeName}.json");
+    }
 
     private sealed record StateFile(Guid MailboxId, string MailboxUser, string DeltaLink, DateTimeOffset UpdatedAtUtc);
 }

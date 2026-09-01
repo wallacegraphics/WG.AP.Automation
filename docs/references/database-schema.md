@@ -252,8 +252,8 @@ dotnet test WG.AP.Tests/WG.AP.Tests.csproj
 
 | Output | Meaning |
 |---|---|
-| `Passed: 84, Skipped: 0` | The database tests ran |
-| `Passed: 77, Skipped: 7` | No connection string — the database layer was **not** covered |
+| `Passed: 87, Skipped: 0` | The database tests ran |
+| `Passed: 79, Skipped: 8` | No connection string — the database layer was **not** covered |
 
 That distinction exists because these tests use `Skip.If` (via `Xunit.SkippableFact`) rather than
 returning early. An early return reports as *Passed*, so a run with no database looked identical to a

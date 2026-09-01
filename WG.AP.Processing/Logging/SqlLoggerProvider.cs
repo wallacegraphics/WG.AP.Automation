@@ -65,11 +65,18 @@ public sealed class SqlLoggerProvider : ILoggerProvider
         {
         }
 
-        if (flushNow || _buffer.Count >= _options.BatchSize)
+        if (flushNow || _buffer.Count >= FlushThreshold)
         {
             Flush();
         }
     }
+
+    // Clamped rather than taken as configured, because both ends of the range fail quietly. A BatchSize
+    // above MaxBufferedEntries can never be reached - the trim above caps the buffer first - so the
+    // count-based flush would simply never fire and warnings would sit until Dispose. A BatchSize of 0
+    // or less flushes every line, turning a buffered sink into one round trip per log call, which is
+    // the cost this class exists to avoid.
+    private int FlushThreshold => Math.Clamp(_options.BatchSize, 1, MaxBufferedEntries);
 
     private void Flush()
     {

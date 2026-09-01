@@ -84,6 +84,56 @@ public class FileMailboxSyncStateStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task GetDeltaLinkAsync_ReadsThePreCutoverFile_WhenNothingExistsUnderTheNewName()
+    {
+        // The fallback half of DualMailboxSyncStateStore exists to carry the cursor through a week-one
+        // SQL problem. A file written before this store keyed on the mailbox id sits under a name
+        // derived from the address, so without the legacy read the safety net cannot see the very file
+        // it is the safety net for - and the first run after cutover resyncs the whole inbox while
+        // looking, from the outside, exactly like a mailbox that had never been synced.
+        var store = CreateStore();
+        var mailbox = new MailboxRef(Guid.NewGuid(), "ap.invoices@wallacegraphics.com");
+
+        WriteLegacyStateFile(mailbox, "legacy-token");
+
+        Assert.Equal("legacy-token", await store.GetDeltaLinkAsync(mailbox, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task SaveDeltaLinkAsync_SupersedesThePreCutoverFile_RatherThanWritingToIt()
+    {
+        var store = CreateStore();
+        var mailbox = new MailboxRef(Guid.NewGuid(), "ap.invoices@wallacegraphics.com");
+        var legacyPath = Path.Combine(_dataDirectory, "ap_invoices_wallacegraphics_com.json");
+
+        WriteLegacyStateFile(mailbox, "legacy-token");
+        await store.SaveDeltaLinkAsync(mailbox, "new-token", CancellationToken.None);
+
+        // The new name is what is read from now on, so the legacy file stops mattering the moment one
+        // run commits - which is what keeps this a one-time concession rather than two live cursors.
+        Assert.True(File.Exists(Path.Combine(_dataDirectory, $"{mailbox.MailboxId:D}.json")));
+        Assert.Equal("new-token", await store.GetDeltaLinkAsync(mailbox, CancellationToken.None));
+        Assert.Contains("legacy-token", await File.ReadAllTextAsync(legacyPath));
+    }
+
+    // Byte-for-byte what the pre-cutover store wrote: the filename derived from the address, and a
+    // payload with no MailboxId property, since the record did not have one yet.
+    private void WriteLegacyStateFile(MailboxRef mailbox, string deltaLink)
+    {
+        var safeName = new string(mailbox.MailboxUser
+            .Select(character => char.IsLetterOrDigit(character) || character is '-' or '_' ? character : '_')
+            .ToArray());
+
+        Directory.CreateDirectory(_dataDirectory);
+
+        File.WriteAllText(
+            Path.Combine(_dataDirectory, $"{safeName}.json"),
+            $$"""
+            {"MailboxUser":"{{mailbox.MailboxUser}}","DeltaLink":"{{deltaLink}}","UpdatedAtUtc":"2026-08-31T12:00:00+00:00"}
+            """);
+    }
+
+    [Fact]
     public async Task SaveDeltaLinkAsync_CleansUpTheTempFile_WhenTheMoveFails()
     {
         var store = CreateStore();

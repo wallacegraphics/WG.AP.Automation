@@ -73,10 +73,17 @@ public sealed record InvoiceRecord
 }
 
 /// <summary>The outcome of trying to record an invoice.</summary>
-/// <param name="InvoiceId">Null when the insert was rejected as a duplicate.</param>
+/// <param name="InvoiceId">
+/// Null when the insert was rejected as a duplicate number. On a replay of the same attachment this is
+/// the id of the row already recorded, not a new one.
+/// </param>
 /// <param name="IsDuplicate">
 /// True when <c>UQ_Invoice_ClientNumber</c> rejected the row. The constraint decides and the code
 /// records — a duplicate is never determined by querying first, because a check-then-insert has a
 /// race that a unique index does not.
+/// <para>
+/// False when <c>UQ_Invoice_Attachment</c> rejected it instead: re-extracting one attachment is
+/// idempotency after a crash, not a duplicate invoice, and the two must not share an outcome.
+/// </para>
 /// </param>
 public sealed record InvoiceInsertResult(long? InvoiceId, bool IsDuplicate);

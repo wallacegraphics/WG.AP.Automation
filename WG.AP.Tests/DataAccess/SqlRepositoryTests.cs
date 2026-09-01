@@ -204,6 +204,46 @@ public class SqlRepositoryTests
     }
 
     [SkippableFact]
+    public async Task RecordInvoice_TreatsTheSameAttachmentTwiceAsIdempotent_NotAsADuplicateNumber()
+    {
+        SkipUnlessConfigured();
+
+        var factory = CreateFactory();
+        var runs = new ProcessingRunRepository(factory, NullLogger<ProcessingRunRepository>.Instance);
+        var messages = new MailMessageRepository(factory, NullLogger<MailMessageRepository>.Instance);
+        var attachments = new MailAttachmentRepository(factory, NullLogger<MailAttachmentRepository>.Instance);
+        var invoices = new InvoiceRepository(factory, NullLogger<InvoiceRepository>.Instance);
+
+        var mailbox = new MailboxRef(Guid.NewGuid(), "sql-test@wallacegraphics.com");
+        var runId = await runs.StartAsync(mailbox, CancellationToken.None);
+
+        MailAttachmentSummary[] summaries =
+        [
+            new MailAttachmentSummary($"att-{Guid.NewGuid():N}", "a.pdf", 1024, "application/pdf")
+        ];
+
+        var message = new MailMessageSummary($"immutable-{Guid.NewGuid():N}", DateTimeOffset.UtcNow, "billing@sanmar.com", "Invoice", summaries);
+        var claim = await messages.DiscoverAndClaimAsync(mailbox, runId, message, CancellationToken.None);
+        var recorded = await attachments.RecordAsync(claim.MailMessageId, summaries, CancellationToken.None);
+
+        var invoiceNumber = $"INV-{Guid.NewGuid():N}"[..20];
+        var invoice = NewInvoice(claim.MailMessageId, recorded[0].MailAttachmentId, invoiceNumber);
+
+        var first = await invoices.RecordAsync(invoice, CancellationToken.None);
+        Assert.False(first.IsDuplicate);
+
+        // This is the crash-recovery path, not a duplicate invoice: the message was claimed, the
+        // invoice recorded, and the process died before the status went final - so the next run
+        // re-delivers the message and extracts the same PDF again. UQ_Invoice_Attachment rejects the
+        // second insert, and reading that as a duplicate number would file a good invoice into
+        // NeedsReview. The caller has to get the row that is already there.
+        var replay = await invoices.RecordAsync(invoice, CancellationToken.None);
+
+        Assert.False(replay.IsDuplicate);
+        Assert.Equal(first.InvoiceId, replay.InvoiceId);
+    }
+
+    [SkippableFact]
     public async Task LoadCatalogs_ReturnTheSeededSanmarConfiguration()
     {
         SkipUnlessConfigured();
