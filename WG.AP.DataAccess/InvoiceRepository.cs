@@ -12,16 +12,24 @@ public sealed class InvoiceRepository(
     ILogger<InvoiceRepository> logger)
 {
     /// <summary>
-    /// Records an extracted invoice, or reports that its number is a duplicate for that client.
+    /// Records an extracted invoice, reports that its number is a duplicate for that client, or returns
+    /// the row this attachment already has.
     /// </summary>
     /// <remarks>
-    /// Duplicates are detected by attempting the insert and catching the unique-index violation, not
+    /// Duplicates are detected by attempting the insert and catching the unique-index violation, never
     /// by querying first. A check-then-insert has a race that <c>UQ_Invoice_ClientNumber</c> does not,
     /// and the index is the thing that must be authoritative — it is what prevents paying an invoice
     /// twice. The constraint decides; this method reports.
     /// <para>
-    /// Note the index deliberately excludes ClientId 0, so two unresolved-client invoices sharing a
-    /// number are both recorded rather than one being rejected as a false duplicate. Those go to
+    /// Two indexes can reject the insert, so which one fired is then established by reading the
+    /// attachment's row back: <c>UQ_Invoice_Attachment</c> means this PDF was already recorded and is
+    /// being re-extracted after a crash, which is not a duplicate; <c>UQ_Invoice_ClientNumber</c> means
+    /// a different attachment reused a number. That read happens only <em>after</em> a violation, so it
+    /// resolves which rule fired without becoming the rule.
+    /// </para>
+    /// <para>
+    /// Note the number index deliberately excludes ClientId 0, so two unresolved-client invoices sharing
+    /// a number are both recorded rather than one being rejected as a false duplicate. Those go to
     /// NeedsReview instead, where a human can see both.
     /// </para>
     /// </remarks>

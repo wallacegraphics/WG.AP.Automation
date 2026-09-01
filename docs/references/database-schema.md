@@ -252,8 +252,9 @@ dotnet test WG.AP.Tests/WG.AP.Tests.csproj
 
 | Output | Meaning |
 |---|---|
-| `Passed: 87, Skipped: 0` | The database tests ran |
-| `Passed: 79, Skipped: 8` | No connection string — the database layer was **not** covered |
+| `Passed: 90, Skipped: 0` | The database tests ran (and local invoice fixtures were present) |
+| `Passed: 82, Skipped: 8` | No connection string — the database layer was **not** covered |
+| `Passed: 81, Skipped: 9` | What CI shows: no connection string and no local invoice fixtures |
 
 That distinction exists because these tests use `Skip.If` (via `Xunit.SkippableFact`) rather than
 returning early. An early return reports as *Passed*, so a run with no database looked identical to a

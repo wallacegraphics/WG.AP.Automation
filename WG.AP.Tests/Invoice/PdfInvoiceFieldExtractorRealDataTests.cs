@@ -8,8 +8,15 @@ using Xunit.Abstractions;
 namespace WG.AP.Tests.Invoice;
 
 // Opt-in local integration test: it needs real invoice PDFs plus their SanMar Excel manifest (never
-// committed) and a locally running Ollama server, so it no-ops on CI and on any machine without
-// both. See WG.AP.Tests/Invoice/Fixtures.local/ (gitignored) for how to add fixtures.
+// committed) and a locally running Ollama server. With no fixtures present it reports as Skipped, so
+// it is inert on CI. With fixtures present but Ollama unreachable it fails rather than skipping -
+// deliberately, because at that point the only thing missing is a service the developer meant to have
+// running. See WG.AP.Tests/Invoice/Fixtures.local/ (gitignored) for how to add fixtures.
+//
+// Skipped rather than an early return, for the same reason SqlRepositoryTests uses Skip.If: an early
+// return reports as Passed, so "no fixtures, nothing ran" looked exactly like "verified against the
+// client's own numbers". That mattered here more than anywhere - a path bug in FixturePaths had this
+// test finding no fixtures and passing, which is the one failure mode a real-data test must not have.
 //
 // Verification is against the real manifest - not hand-written expected-value files - so it
 // automatically covers whichever PDF/manifest-row pairs happen to be present, and it checks the
@@ -18,16 +25,14 @@ namespace WG.AP.Tests.Invoice;
 // at the same time as the production cross-check would have left extraction with no real-data check.
 public class PdfInvoiceFieldExtractorRealDataTests(ITestOutputHelper output)
 {
-    [Fact]
+    [SkippableFact]
     public async Task ExtractAsync_OnRealInvoicePdfs_MatchesTheExcelManifest()
     {
         var fixturesDir = FixturePaths.ResolveRealInvoiceDirectory();
 
-        if (!Directory.Exists(fixturesDir))
-        {
-            output.WriteLine($"Skipping: fixtures directory not found at {fixturesDir}. Drop real invoice PDFs and a manifest there to run this test.");
-            return;
-        }
+        Skip.IfNot(
+            Directory.Exists(fixturesDir),
+            $"Fixtures directory not found at {fixturesDir}. Drop real invoice PDFs and a manifest there to run this test.");
 
         var manifestRows = Directory.GetFiles(fixturesDir, "*.xlsx")
             .SelectMany(path => TestManifestReader.ReadManifest(File.ReadAllBytes(path)))
@@ -42,11 +47,10 @@ public class PdfInvoiceFieldExtractorRealDataTests(ITestOutputHelper output)
             .Where(pdf => manifestRows.ContainsKey(pdf.Voucher))
             .ToList();
 
-        if (pairs.Count == 0)
-        {
-            output.WriteLine("No manifest row matched a local PDF by voucher/filename - nothing was run.");
-            return;
-        }
+        Skip.If(
+            pairs.Count == 0,
+            "No manifest row matched a local PDF by voucher/filename - nothing to run. The join key is the "
+            + "PDF filename matching the Excel 'Voucher' column.");
 
         var (baseUrl, model) = ResolveOllamaConnection();
         var totalElapsed = TimeSpan.Zero;
