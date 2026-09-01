@@ -24,9 +24,10 @@ public sealed class MailboxSyncProcessor(
         {
             // Read inside the try, not before it: this can itself throw (e.g. required Mailbox
             // config missing) and must be logged with context like everything else here.
-            mailboxUser = mailboxOptions.Value.MailboxUser;
+            var mailbox = mailboxOptions.Value.ToMailboxRef();
+            mailboxUser = mailbox.MailboxUser;
 
-            var deltaLink = await syncStateStore.GetDeltaLinkAsync(mailboxUser, cancellationToken);
+            var deltaLink = await syncStateStore.GetDeltaLinkAsync(mailbox, cancellationToken);
 
             logger.LogInformation(
                 "Fetching mailbox delta for {MailboxUser} ({SyncKind} sync).",
@@ -48,8 +49,9 @@ public sealed class MailboxSyncProcessor(
 
         try
         {
-            mailboxUser = mailboxOptions.Value.MailboxUser;
-            await syncStateStore.SaveDeltaLinkAsync(mailboxUser, batch.DeltaLink, cancellationToken);
+            var mailbox = mailboxOptions.Value.ToMailboxRef();
+            mailboxUser = mailbox.MailboxUser;
+            await syncStateStore.SaveDeltaLinkAsync(mailbox, batch.DeltaLink, cancellationToken);
         }
         catch (Exception exception)
         {

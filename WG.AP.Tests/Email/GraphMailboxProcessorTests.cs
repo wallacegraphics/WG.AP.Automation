@@ -41,6 +41,7 @@ public class GraphMailboxProcessorTests
             ClientId = "client",
             ClientSecret = "secret",
             MailboxUser = "test-mailbox@wallacegraphics.com",
+            MailboxId = new Guid("3f2504e0-4f89-11d3-9a0c-0305e82c3301"),
             IsTestMailbox = true,
             MaxAttachmentSizeBytes = maxAttachmentSizeBytes ?? 35L * 1024 * 1024
         });

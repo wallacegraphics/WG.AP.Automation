@@ -44,9 +44,9 @@ public class ProcessorTests
 
     private sealed class FakeSyncStateStore : IMailboxSyncStateStore
     {
-        public Task<string?> GetDeltaLinkAsync(string mailboxUser, CancellationToken cancellationToken) => Task.FromResult<string?>(null);
+        public Task<string?> GetDeltaLinkAsync(MailboxRef mailbox, CancellationToken cancellationToken) => Task.FromResult<string?>(null);
 
-        public Task SaveDeltaLinkAsync(string mailboxUser, string deltaLink, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task SaveDeltaLinkAsync(MailboxRef mailbox, string deltaLink, CancellationToken cancellationToken) => Task.CompletedTask;
     }
 
     private sealed class FakeInvoiceFieldExtractor : IInvoiceFieldExtractor
@@ -85,6 +85,7 @@ public class ProcessorTests
             ClientId = "client",
             ClientSecret = "secret",
             MailboxUser = "test-mailbox@wallacegraphics.com",
+            MailboxId = new Guid("3f2504e0-4f89-11d3-9a0c-0305e82c3301"),
             IsTestMailbox = true
         });
 

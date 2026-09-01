@@ -6,17 +6,27 @@ using WG.AP.Core.Abstractions;
 namespace WG.AP.DataAccess;
 
 /// <summary>
-/// Persists one mailbox delta link per mailbox user as a small JSON file. Writes go through a
+/// Persists one mailbox delta link per mailbox as a small JSON file. Writes go through a
 /// temp file plus an atomic <see cref="File.Move(string, string, bool)"/> so a crash mid-write
 /// can't leave a corrupt/partial state file behind.
 /// </summary>
+/// <remarks>
+/// Superseded by <see cref="SqlMailboxSyncStateStore"/>; kept as the fallback half of
+/// <see cref="DualMailboxSyncStateStore"/> for the first week after cutover, then deleted.
+/// <para>
+/// The file is now named after the mailbox id rather than the address. Naming it after the address
+/// was lossy — <see cref="GetFilePath"/> maps every non-alphanumeric character to '_', so
+/// <c>a.b@x.com</c> and <c>a_b@x.com</c> resolved to one file and silently shared a cursor.
+/// </para>
+/// </remarks>
 public sealed class FileMailboxSyncStateStore(
     IOptions<MailboxSyncStateOptions> options,
     ILogger<FileMailboxSyncStateStore> logger) : IMailboxSyncStateStore
 {
-    public async Task<string?> GetDeltaLinkAsync(string mailboxUser, CancellationToken cancellationToken)
+    public async Task<string?> GetDeltaLinkAsync(MailboxRef mailbox, CancellationToken cancellationToken)
     {
-        var path = GetFilePath(mailboxUser);
+        var mailboxUser = mailbox.MailboxUser;
+        var path = GetFilePath(mailbox);
 
         try
         {
@@ -36,16 +46,17 @@ public sealed class FileMailboxSyncStateStore(
         }
     }
 
-    public async Task SaveDeltaLinkAsync(string mailboxUser, string deltaLink, CancellationToken cancellationToken)
+    public async Task SaveDeltaLinkAsync(MailboxRef mailbox, string deltaLink, CancellationToken cancellationToken)
     {
-        var path = GetFilePath(mailboxUser);
+        var mailboxUser = mailbox.MailboxUser;
+        var path = GetFilePath(mailbox);
         var tempPath = $"{path}.{Guid.NewGuid():N}.tmp";
 
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
 
-            var state = new StateFile(mailboxUser, deltaLink, DateTimeOffset.UtcNow);
+            var state = new StateFile(mailbox.MailboxId, mailboxUser, deltaLink, DateTimeOffset.UtcNow);
 
             await using (var stream = File.Create(tempPath))
             {
@@ -74,14 +85,10 @@ public sealed class FileMailboxSyncStateStore(
         }
     }
 
-    private string GetFilePath(string mailboxUser)
-    {
-        var safeName = new string(mailboxUser
-            .Select(c => char.IsLetterOrDigit(c) || c is '-' or '_' ? c : '_')
-            .ToArray());
+    // The mailbox id is a GUID, so this needs no sanitising and cannot collide - unlike the
+    // address, which it replaced for exactly that reason.
+    private string GetFilePath(MailboxRef mailbox) =>
+        Path.Combine(options.Value.DataDirectory, $"{mailbox.MailboxId:D}.json");
 
-        return Path.Combine(options.Value.DataDirectory, $"{safeName}.json");
-    }
-
-    private sealed record StateFile(string MailboxUser, string DeltaLink, DateTimeOffset UpdatedAtUtc);
+    private sealed record StateFile(Guid MailboxId, string MailboxUser, string DeltaLink, DateTimeOffset UpdatedAtUtc);
 }
