@@ -42,7 +42,7 @@ public class SanmarPdfHeaderExtractorTests
         Assert.Equal("Net60", fields.Terms);
         Assert.Equal("58195-AMC-5263", fields.CustomerPO);
         Assert.Equal("76274-0000", fields.OrderAccount);
-        Assert.Equal("SanMar", fields.VendorName);
+        Assert.Equal("SanMar", fields.ClientName);
         Assert.Equal(79.27m, fields.Total);
         Assert.Equal(string.Empty, fields.RawText);
     }

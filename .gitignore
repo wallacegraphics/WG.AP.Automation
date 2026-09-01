@@ -181,6 +181,12 @@ publish/
 
 # Publish Web Output
 *.[Pp]ublish.xml
+# ...but SQL Database Project publish profiles must be checked in. They are not web deploy
+# settings: they carry the deployment safety rules (Prod has DropObjectsNotInSource=False
+# and BlockOnPossibleDataLoss=True), and those must be identical for everyone who publishes
+# rather than whatever each developer's local copy happens to say. The connection strings in
+# them are placeholders with Integrated Security and no passwords.
+!WG.AP.Database/*.publish.xml
 *.azurePubxml
 # Note: Comment the next line if you want to checkin your web deploy settings,
 # but database connection strings (with potential passwords) will be unencrypted

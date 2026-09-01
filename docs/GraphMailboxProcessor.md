@@ -80,5 +80,5 @@ This adapter deliberately does **not**: save attachments to storage, write ledge
 ## Known follow-ups
 
 - **Large attachments**: `GetAttachmentContentAsync` only handles inline `ContentBytes`. Attachments large enough that Graph omits inline content (streamed via `/attachments/{id}/$value` instead) currently log a warning and return an empty byte array — not yet implemented.
-- **`xunit` → `xunit.v3`**: `WG.AP.Tests` still uses `xunit` 2.x, which is deprecated in favor of `xunit.v3` (a different package id and test host, not a version bump) — a separate migration, not done yet.
+- **`xunit` → `xunit.v3`**: `WG.AP.Tests` still uses `xunit` 2.x, which is deprecated in favor of `xunit.v3` (a different package id and test host, not a version bump) — a separate migration, not done yet. When it lands, the `Xunit.SkippableFact` package reference can go with it: it exists only to supply the conditional `Skip.If` that 2.x lacks, which `SqlRepositoryTests` needs so a database test that could not run reports as Skipped rather than Passed. v3 has `Assert.Skip` built in.
 - **`.github/workflows/unit-tests.yml`**: was deleted from disk outside of any change made while building this adapter; still uncommitted either way (restore or finalize the deletion) as of this writing.

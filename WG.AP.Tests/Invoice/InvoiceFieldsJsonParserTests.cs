@@ -29,7 +29,7 @@ public class InvoiceFieldsJsonParserTests
         Assert.Equal(new DateOnly(2026, 7, 21), fields.InvoiceDate);
         Assert.Equal(new DateOnly(2026, 9, 19), fields.DueDate);
         Assert.Equal(438.90m, fields.Total);
-        Assert.Equal("SanMar", fields.VendorName);
+        Assert.Equal("SanMar", fields.ClientName);
         Assert.Equal("2702-2225 Cobb Nutri Team", fields.CustomerPO);
         Assert.Equal("76274-0000", fields.CustomerNumber);
         Assert.Equal("76274-0000", fields.OrderAccount);
@@ -65,7 +65,7 @@ public class InvoiceFieldsJsonParserTests
         Assert.Null(fields.SalesOrder);
         Assert.Null(fields.InvoiceDate);
         Assert.Null(fields.DueDate);
-        Assert.Null(fields.VendorName);
+        Assert.Null(fields.ClientName);
         Assert.Null(fields.CustomerPO);
         Assert.Null(fields.CustomerNumber);
         Assert.Null(fields.OrderAccount);

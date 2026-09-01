@@ -38,7 +38,7 @@ public class OllamaClientTests
             r => r.Method == HttpMethod.Post && r.RequestUri!.AbsolutePath.EndsWith("/api/generate"),
             """{"response": "{\"InvoiceNumber\":\"INV-1\"}", "done": true}""");
 
-        var response = await client.GenerateAsync("extract fields", format: null, CancellationToken.None);
+        var response = await client.GenerateAsync("extract fields", format: null, model: null, CancellationToken.None);
 
         Assert.Equal("""{"InvoiceNumber":"INV-1"}""", response);
     }
@@ -61,7 +61,7 @@ public class OllamaClientTests
             },
             """{"response": "{}", "done": true}""");
 
-        await client.GenerateAsync("extract fields from this text", format: null, CancellationToken.None);
+        await client.GenerateAsync("extract fields from this text", format: null, model: null, CancellationToken.None);
 
         Assert.NotNull(capturedBody);
         Assert.Contains("\"model\":\"qwen3:14b\"", capturedBody, StringComparison.OrdinalIgnoreCase);
@@ -75,7 +75,7 @@ public class OllamaClientTests
         var (client, _) = CreateClient(logger);
         // No route registered — the fake handler 404s, which EnsureSuccessStatusCode turns into an exception.
 
-        await Assert.ThrowsAnyAsync<Exception>(() => client.GenerateAsync("prompt", format: null, CancellationToken.None));
+        await Assert.ThrowsAnyAsync<Exception>(() => client.GenerateAsync("prompt", format: null, model: null, CancellationToken.None));
 
         Assert.Contains(logger.Entries, e => e.Level == LogLevel.Error && e.Exception is not null);
     }

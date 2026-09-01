@@ -28,23 +28,27 @@ public class MailboxSyncProcessorTests
         public Task<string> MoveMessageAsync(string messageId, MailDestinationFolder destination, CancellationToken cancellationToken) => throw new NotImplementedException();
     }
 
+    // Keyed on the mailbox id rather than the address, matching the store it fakes: state is keyed on
+    // the Entra object id so renaming the mailbox does not start a fresh delta sync.
     private sealed class FakeSyncStateStore : IMailboxSyncStateStore
     {
-        private readonly Dictionary<string, string> _deltaLinksByMailbox = [];
+        private readonly Dictionary<Guid, string> _deltaLinksByMailbox = [];
         public int SaveCallCount { get; private set; }
 
-        public void Seed(string mailboxUser, string deltaLink) => _deltaLinksByMailbox[mailboxUser] = deltaLink;
+        public void Seed(Guid mailboxId, string deltaLink) => _deltaLinksByMailbox[mailboxId] = deltaLink;
 
-        public Task<string?> GetDeltaLinkAsync(string mailboxUser, CancellationToken cancellationToken) =>
-            Task.FromResult(_deltaLinksByMailbox.GetValueOrDefault(mailboxUser));
+        public Task<string?> GetDeltaLinkAsync(MailboxRef mailbox, CancellationToken cancellationToken) =>
+            Task.FromResult(_deltaLinksByMailbox.GetValueOrDefault(mailbox.MailboxId));
 
-        public Task SaveDeltaLinkAsync(string mailboxUser, string deltaLink, CancellationToken cancellationToken)
+        public Task SaveDeltaLinkAsync(MailboxRef mailbox, string deltaLink, CancellationToken cancellationToken)
         {
             SaveCallCount++;
-            _deltaLinksByMailbox[mailboxUser] = deltaLink;
+            _deltaLinksByMailbox[mailbox.MailboxId] = deltaLink;
             return Task.CompletedTask;
         }
     }
+
+    private static readonly Guid MailboxId = new("3f2504e0-4f89-11d3-9a0c-0305e82c3301");
 
     private static MailboxSyncProcessor CreateProcessor(FakeMailSource mailSource, FakeSyncStateStore syncStateStore) =>
         new(
@@ -56,6 +60,7 @@ public class MailboxSyncProcessorTests
                 ClientId = "client",
                 ClientSecret = "secret",
                 MailboxUser = MailboxUser,
+                MailboxId = MailboxId,
                 IsTestMailbox = true
             }),
             NullLogger<MailboxSyncProcessor>.Instance);
@@ -77,7 +82,7 @@ public class MailboxSyncProcessorTests
     {
         var mailSource = new FakeMailSource();
         var syncStateStore = new FakeSyncStateStore();
-        syncStateStore.Seed(MailboxUser, "saved-delta-link");
+        syncStateStore.Seed(MailboxId, "saved-delta-link");
         var processor = CreateProcessor(mailSource, syncStateStore);
 
         await processor.GetNewMessagesAsync(CancellationToken.None);
@@ -111,6 +116,6 @@ public class MailboxSyncProcessorTests
         await processor.CommitAsync(batch, CancellationToken.None);
 
         Assert.Equal(1, syncStateStore.SaveCallCount);
-        Assert.Equal("new-delta-link", await syncStateStore.GetDeltaLinkAsync(MailboxUser, CancellationToken.None));
+        Assert.Equal("new-delta-link", await syncStateStore.GetDeltaLinkAsync(new MailboxRef(MailboxId, MailboxUser), CancellationToken.None));
     }
 }
