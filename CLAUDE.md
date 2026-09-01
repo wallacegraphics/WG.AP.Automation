@@ -10,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Run the console app: `dotnet run --project WG.AP.Processing` (uses `appsettings.Production.json` unless `DOTNET_ENVIRONMENT=Development` is set — an IDE F5 run picks up `Development` via `WG.AP.Processing/Properties/launchSettings.json`; a plain CLI `dotnet run` does not)
 - CI (`.github/workflows/unit-tests.yml`) runs on PRs into `development`/`master`/`main`: restores, builds, and tests only `WG.AP.Tests.csproj` in Release config.
 
-**Known repo state:** `WG.AP.Email/Class1.cs` is leftover scaffold code that does not compile (calls to methods that don't exist on `IMailSource`, invalid syntax) and currently blocks `dotnet build`/`dotnet test` for the whole solution. The repo owner has explicitly asked for it to be left in place — they'll delete it themselves. Do not delete or "fix" it. If you need to verify a build/test run, temporarily rename it aside (e.g. `Class1.cs` → `Class1.cs.disabled`), run the build/tests, then restore the exact file and confirm via `git status` that no diff was introduced.
+**Known repo state:** `WG.AP.Email/Class1.cs` is leftover scaffold code — an empty class holding a commented-out sketch that calls methods which don't exist on `IMailSource`. Because that body is commented out it **compiles cleanly**, so it no longer blocks `dotnet build`/`dotnet test` and needs no renaming aside to verify a build. (It did block the build while the sketch was live; that is no longer the case.) The repo owner has asked for it to be left in place — they'll delete it themselves. Do not delete or "fix" it.
 
 ## Architecture
 
