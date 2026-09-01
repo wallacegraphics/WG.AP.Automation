@@ -1,0 +1,28 @@
+<!-- Microsoft.Build.Sql 2.2.0 or later is required: 1.x imports NuGet.Build.Tasks.Pack
+     from a path the .NET 10 SDK no longer uses, so it cannot restore here. -->
+<Project Sdk="Microsoft.Build.Sql/2.2.0">
+
+  <PropertyGroup>
+    <Name>WG.AP.Database</Name>
+    <DSP>Microsoft.Data.Tools.Schema.Sql.Sql160DatabaseSchemaProvider</DSP>
+    <ModelCollation>1033, CI</ModelCollation>
+    <!-- Reporting SELECTs must never block the single writer. -->
+    <ReadCommittedSnapshot>True</ReadCommittedSnapshot>
+    <AnsiNullsOn>True</AnsiNullsOn>
+    <QuotedIdentifierOn>True</QuotedIdentifierOn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The SDK globs every .sql file under the project as a schema object, so anything
+         that is a script rather than an object has to be removed from Build:
+           * seed scripts are pulled in by PostDeployment.sql via :r
+           * Tests\constraints.sql is run by hand against a scratch database
+         Left in Build, either would fail with SQL71006 (one statement per batch). -->
+    <Build Remove="Scripts\**\*.sql" />
+    <Build Remove="Tests\**\*.sql" />
+    <PostDeploy Include="Scripts\PostDeployment.sql" />
+    <None Include="Scripts\Seed\*.sql" />
+    <None Include="Tests\*.sql" />
+  </ItemGroup>
+
+</Project>

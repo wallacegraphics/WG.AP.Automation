@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Dev publish profile.
+
+  TargetConnectionString is intentionally left with a placeholder server name: it is
+  developer- and environment-specific, and a real one committed here would be published
+  over by whoever cloned the repo next. Set it once in Visual Studio's Publish dialog and
+  it is remembered locally.
+-->
+<Project ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <TargetDatabaseName>WG_AP_Dev</TargetDatabaseName>
+    <TargetConnectionString>Data Source=SET-ME;Initial Catalog=WG_AP_Dev;Integrated Security=True;Encrypt=True;TrustServerCertificate=True</TargetConnectionString>
+    <ProfileVersionNumber>1</ProfileVersionNumber>
+    <DeployScriptFileName>WG.AP.Database.Dev.sql</DeployScriptFileName>
+
+    <!-- Seeds are MERGE/IF NOT EXISTS, so re-publishing is the normal case. -->
+    <ScriptDatabaseOptions>True</ScriptDatabaseOptions>
+    <BlockOnPossibleDataLoss>True</BlockOnPossibleDataLoss>
+    <!-- Dev is allowed to converge to the project: an object removed from source goes. -->
+    <DropObjectsNotInSource>True</DropObjectsNotInSource>
+    <DropPermissionsNotInSource>False</DropPermissionsNotInSource>
+    <DropRoleMembersNotInSource>False</DropRoleMembersNotInSource>
+    <IgnorePermissions>True</IgnorePermissions>
+    <IgnoreUserSettingsObjects>True</IgnoreUserSettingsObjects>
+    <IgnoreLoginSids>True</IgnoreLoginSids>
+    <VerifyDeployment>True</VerifyDeployment>
+    <IncludeCompositeObjects>True</IncludeCompositeObjects>
+    <AllowIncompatiblePlatform>False</AllowIncompatiblePlatform>
+  </PropertyGroup>
+</Project>

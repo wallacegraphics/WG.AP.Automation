@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Production publish profile.
+
+  Differs from Dev in three ways that all point the same direction - a publish must never
+  be able to destroy invoice history:
+
+    DropObjectsNotInSource = False   an object missing from the project is left alone
+                                     rather than dropped. A stale local checkout cannot
+                                     delete a production table.
+    BlockOnPossibleDataLoss = True   any change that would lose rows fails the publish
+                                     instead of proceeding.
+    GenerateSmartDefaults = False    a new NOT NULL column must ship with an explicit
+                                     default in the project, not an invented one.
+
+  Invoice attachments carry a 7-year retention requirement, so a dropped table is a
+  compliance event rather than an inconvenience.
+-->
+<Project ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <TargetDatabaseName>WG_AP</TargetDatabaseName>
+    <TargetConnectionString>Data Source=SET-ME;Initial Catalog=WG_AP;Integrated Security=True;Encrypt=True;TrustServerCertificate=True</TargetConnectionString>
+    <ProfileVersionNumber>1</ProfileVersionNumber>
+    <DeployScriptFileName>WG.AP.Database.Prod.sql</DeployScriptFileName>
+
+    <ScriptDatabaseOptions>True</ScriptDatabaseOptions>
+    <BlockOnPossibleDataLoss>True</BlockOnPossibleDataLoss>
+    <DropObjectsNotInSource>False</DropObjectsNotInSource>
+    <DropPermissionsNotInSource>False</DropPermissionsNotInSource>
+    <DropRoleMembersNotInSource>False</DropRoleMembersNotInSource>
+    <GenerateSmartDefaults>False</GenerateSmartDefaults>
+    <IgnorePermissions>True</IgnorePermissions>
+    <IgnoreUserSettingsObjects>True</IgnoreUserSettingsObjects>
+    <IgnoreLoginSids>True</IgnoreLoginSids>
+    <VerifyDeployment>True</VerifyDeployment>
+    <IncludeCompositeObjects>True</IncludeCompositeObjects>
+    <AllowIncompatiblePlatform>False</AllowIncompatiblePlatform>
+    <!-- Keep the generated script: it is the record of what was actually applied. -->
+    <CreateNewDatabase>False</CreateNewDatabase>
+  </PropertyGroup>
+</Project>
