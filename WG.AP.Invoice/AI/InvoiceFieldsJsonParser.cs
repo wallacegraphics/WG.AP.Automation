@@ -21,6 +21,9 @@ public static class InvoiceFieldsJsonParser
             ParseDate(GetOptionalString(root, "InvoiceDate")),
             ParseDate(GetOptionalString(root, "DueDate")),
             GetAmount(root),
+            // The schema key stays "VendorName" while the model reads it: that is the wording the
+            // prompt was tuned with, and changing it would change extraction behaviour for no gain.
+            // The C# side calls the concept a client, so the mapping happens here.
             GetOptionalString(root, "VendorName"),
             GetOptionalString(root, "CustomerPO"),
             GetOptionalString(root, "CustomerNumber"),

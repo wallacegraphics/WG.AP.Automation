@@ -28,4 +28,10 @@
 	</None>
   </ItemGroup>
 
+  <ItemGroup>
+	<!-- The routing classification helpers stay internal rather than being widened to public just so
+	     tests can reach them. -->
+	<InternalsVisibleTo Include="WG.AP.Tests" />
+  </ItemGroup>
+
 </Project>

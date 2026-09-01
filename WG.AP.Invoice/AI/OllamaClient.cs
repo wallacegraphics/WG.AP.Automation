@@ -31,13 +31,20 @@ public sealed class OllamaClient
     /// Ollama's structured-output parameter — either the string "json" or a JSON schema object —
     /// used to constrain the model's output instead of relying on prompt wording alone.
     /// </param>
-    public async Task<string> GenerateAsync(string prompt, object? format, CancellationToken cancellationToken)
+    /// <param name="model">
+    /// A model pinned to the prompt being sent, or null to use the configured default. A prompt is
+    /// tuned against a specific model, so without this an operational upgrade from one model to
+    /// another would silently change extraction results with nothing recording that it had.
+    /// </param>
+    public async Task<string> GenerateAsync(string prompt, object? format, string? model, CancellationToken cancellationToken)
     {
+        var effectiveModel = string.IsNullOrWhiteSpace(model) ? _options.Value.Model : model;
+
         try
         {
             var request = new OllamaGenerateRequest
             {
-                Model = _options.Value.Model,
+                Model = effectiveModel,
                 Prompt = prompt,
                 Format = format
             };
@@ -53,7 +60,7 @@ public sealed class OllamaClient
         }
         catch (Exception exception)
         {
-            _logger.LogError(exception, "Ollama generate call failed against {BaseUrl} using model {Model}.", _httpClient.BaseAddress, _options.Value.Model);
+            _logger.LogError(exception, "Ollama generate call failed against {BaseUrl} using model {Model}.", _httpClient.BaseAddress, effectiveModel);
             throw;
         }
     }

@@ -1,303 +1,146 @@
-using Microsoft.Extensions.Logging.Abstractions;
-using Microsoft.Extensions.Options;
-using WG.AP.Core.Abstractions;
-using WG.AP.Email;
-using WG.AP.Invoice.Abstractions;
+using WG.AP.DataAccess;
 using WG.AP.Invoice.Models;
 using WG.AP.Processor;
 
 namespace WG.AP.Tests.Processing;
 
+/// <summary>
+/// Covers <see cref="APProcessor"/>'s classification rules.
+/// </summary>
+/// <remarks>
+/// These replace the manifest-shaped tests that went with the Excel cross-check. The routing tree
+/// they exercised — reconcile vouchers against filenames, compare Excel fields to PDF fields — no
+/// longer exists; what decides an outcome now is whether the five required fields came out of the PDF.
+/// <para>
+/// They target <see cref="APProcessor.Classify"/> directly rather than driving
+/// <c>ProcessInvoicesAsync</c>, because that method now needs a real database: recording and claiming
+/// a message, resolving a client, loading a prompt and writing an invoice are all SQL, and faking six
+/// repositories to assert on a status would be testing the fakes. The end-to-end path is verified
+/// against a real database instead (see the run-twice check in the verification steps), which is the
+/// only way the guarantee that actually matters — that a message is never claimed twice — can be
+/// tested at all, since it is enforced by a unique index rather than by this code.
+/// </para>
+/// </remarks>
 public class ProcessorTests
 {
-    private sealed class FakeMailSource : IMailSource
-    {
-        public MailboxDeltaResult DeltaResult { get; set; } = new([], "delta-1");
-        public Dictionary<(string MessageId, string AttachmentId), byte[]> AttachmentContents { get; } = [];
-        public List<(string MessageId, string AttachmentId)> AttachmentRequests { get; } = [];
-        public List<(string MessageId, MailDestinationFolder Destination)> Moves { get; } = [];
+    private static readonly ClientResolution KnownClient = new(ClientId: 1, InvoiceFormatId: 1, ExtractorKey: "SANMAR_PDF_HEADER_V1");
 
-        public Task ValidateAuthAsync(CancellationToken cancellationToken) => Task.CompletedTask;
-
-        public Task EnsureFoldersExistAsync(CancellationToken cancellationToken) => Task.CompletedTask;
-
-        public IAsyncEnumerable<MailMessageSummary> EnumerateInboxAsync(CancellationToken cancellationToken = default) =>
-            throw new NotSupportedException("Not exercised by these tests.");
-
-        public Task<MailboxDeltaResult> GetInboxDeltaAsync(string? deltaLink, CancellationToken cancellationToken) => Task.FromResult(DeltaResult);
-
-        public Task<MailMessageSummary?> GetMessageAsync(string messageId, CancellationToken cancellationToken) =>
-            throw new NotSupportedException("Not exercised by these tests.");
-
-        public Task<byte[]> GetAttachmentContentAsync(string messageId, string attachmentId, CancellationToken cancellationToken)
-        {
-            AttachmentRequests.Add((messageId, attachmentId));
-            return Task.FromResult(AttachmentContents[(messageId, attachmentId)]);
-        }
-
-        public Task<string> MoveMessageAsync(string messageId, MailDestinationFolder destination, CancellationToken cancellationToken)
-        {
-            Moves.Add((messageId, destination));
-            return Task.FromResult(messageId);
-        }
-    }
-
-    private sealed class FakeSyncStateStore : IMailboxSyncStateStore
-    {
-        public Task<string?> GetDeltaLinkAsync(MailboxRef mailbox, CancellationToken cancellationToken) => Task.FromResult<string?>(null);
-
-        public Task SaveDeltaLinkAsync(MailboxRef mailbox, string deltaLink, CancellationToken cancellationToken) => Task.CompletedTask;
-    }
-
-    private sealed class FakeInvoiceFieldExtractor : IInvoiceFieldExtractor
-    {
-        public Func<byte[], InvoiceFields>? OnExtract { get; set; }
-
-        public Task<InvoiceFields> ExtractAsync(byte[] pdfBytes, CancellationToken cancellationToken) =>
-            OnExtract is not null
-                ? Task.FromResult(OnExtract(pdfBytes))
-                : throw new InvalidOperationException("Simulated suspicious PDF — cannot be parsed.");
-    }
-
-    private sealed class FakeManifestVerifier : IAttachmentManifestVerifier
-    {
-        public Func<byte[], IReadOnlyList<ManifestRow>>? OnReadManifest { get; set; }
-        public Func<IReadOnlyList<ManifestRow>, IReadOnlyList<MailAttachmentSummary>, ManifestReconciliation>? OnReconcile { get; set; }
-        public Func<ManifestRow, InvoiceFields, InvoiceFieldComparisonResult>? OnCompareFields { get; set; }
-
-        public IReadOnlyList<ManifestRow> ReadManifest(byte[] excelBytes) => OnReadManifest!(excelBytes);
-
-        public ManifestReconciliation Reconcile(IReadOnlyList<ManifestRow> manifestRows, IReadOnlyList<MailAttachmentSummary> pdfAttachments) =>
-            OnReconcile is not null ? OnReconcile(manifestRows, pdfAttachments) : new ManifestReconciliation([], [], [], [], []);
-
-        public InvoiceFieldComparisonResult CompareFields(ManifestRow row, InvoiceFields extractedFields) =>
-            OnCompareFields is not null ? OnCompareFields(row, extractedFields) : new InvoiceFieldComparisonResult(row.Voucher, []);
-    }
-
-    private static (APProcessor Processor, FakeMailSource MailSource) CreateProcessor(
-        FakeInvoiceFieldExtractor? extractor = null,
-        FakeManifestVerifier? verifier = null)
-    {
-        var mailSource = new FakeMailSource();
-        var mailboxOptions = Options.Create(new MailboxOptions
-        {
-            TenantId = "tenant",
-            ClientId = "client",
-            ClientSecret = "secret",
-            MailboxUser = "test-mailbox@wallacegraphics.com",
-            MailboxId = new Guid("3f2504e0-4f89-11d3-9a0c-0305e82c3301"),
-            IsTestMailbox = true
-        });
-
-        var syncProcessor = new MailboxSyncProcessor(mailSource, new FakeSyncStateStore(), mailboxOptions, NullLogger<MailboxSyncProcessor>.Instance);
-
-        var processor = new APProcessor(
-            mailSource,
-            syncProcessor,
-            extractor ?? new FakeInvoiceFieldExtractor(),
-            verifier ?? new FakeManifestVerifier(),
-            mailboxOptions,
-            NullLogger<APProcessor>.Instance);
-
-        return (processor, mailSource);
-    }
-
-    private static MailMessageSummary MessageWith(string id, params MailAttachmentSummary[] attachments) =>
-        new(id, DateTimeOffset.UtcNow, "vendor@example.com", "Invoice email", attachments);
+    private static InvoiceFields Complete(
+        string? invoiceNumber = "INV-162393962",
+        DateOnly? invoiceDate = null,
+        decimal total = 1234.56m,
+        string? customerPO = "PO-4455") =>
+        new(
+            invoiceNumber!,
+            SalesOrder: "SO-1",
+            invoiceDate ?? new DateOnly(2026, 9, 1),
+            DueDate: new DateOnly(2026, 11, 1),
+            total,
+            ClientName: "SanMar",
+            customerPO,
+            CustomerNumber: "C-1",
+            OrderAccount: "A-1",
+            Terms: "Net60",
+            RawText: "raw");
 
     [Fact]
-    public async Task ProcessInvoicesAsync_MessageWithNoAttachments_IsLeftUntouched()
+    public void Classify_WithEveryRequiredField_IsExtractedAndProcessed()
     {
-        var (processor, mailSource) = CreateProcessor();
-        mailSource.DeltaResult = new MailboxDeltaResult([MessageWith("m1")], "delta-1");
+        var (invoiceStatus, mailStatus, reason) = APProcessor.Classify(KnownClient, Complete(), "INV-1.pdf");
 
-        await processor.ProcessInvoicesAsync(CancellationToken.None);
+        Assert.Equal(ApStatus.InvoiceExtracted, invoiceStatus);
+        Assert.Equal(ApStatus.MailProcessed, mailStatus);
+        Assert.Null(reason);
+    }
 
-        Assert.Empty(mailSource.Moves);
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-0.01)]
+    [InlineData(-500)]
+    public void Classify_WithATotalThatIsNotPositive_IsAnError(decimal total)
+    {
+        // An error rather than a review, deliberately: a zero or negative total is not a
+        // low-confidence read of a real number, it is a wrong one.
+        var (invoiceStatus, mailStatus, reason) = APProcessor.Classify(KnownClient, Complete(total: total), "INV-1.pdf");
+
+        Assert.Equal(ApStatus.InvoiceError, invoiceStatus);
+        Assert.Equal(ApStatus.MailError, mailStatus);
+        Assert.Contains("total", reason!, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
-    public async Task ProcessInvoicesAsync_PdfWithNoExcelManifest_RoutesToNeedsReview()
+    public void Classify_WithAMissingInvoiceNumber_NeedsReview()
     {
-        var (processor, mailSource) = CreateProcessor();
-        var message = MessageWith("m1", new MailAttachmentSummary("a1", "INV-1.pdf", 100, "application/pdf"));
-        mailSource.DeltaResult = new MailboxDeltaResult([message], "delta-1");
+        var (invoiceStatus, mailStatus, reason) = APProcessor.Classify(KnownClient, Complete(invoiceNumber: ""), "INV-1.pdf");
 
-        await processor.ProcessInvoicesAsync(CancellationToken.None);
-
-        Assert.Equal(("m1", MailDestinationFolder.NeedsReview), Assert.Single(mailSource.Moves));
+        Assert.Equal(ApStatus.InvoiceNeedsReview, invoiceStatus);
+        Assert.Equal(ApStatus.MailNeedsReview, mailStatus);
+        Assert.Contains(nameof(InvoiceFields.InvoiceNumber), reason!);
     }
 
     [Fact]
-    public async Task ProcessInvoicesAsync_UnreadableManifest_RoutesToErrors()
+    public void Classify_WithAMissingInvoiceDate_NeedsReview()
     {
-        var verifier = new FakeManifestVerifier { OnReadManifest = _ => throw new InvalidOperationException("corrupt workbook") };
-        var (processor, mailSource) = CreateProcessor(verifier: verifier);
+        var fields = Complete() with { InvoiceDate = null };
+        var (invoiceStatus, _, reason) = APProcessor.Classify(KnownClient, fields, "INV-1.pdf");
 
-        var message = MessageWith(
-            "m1",
-            new MailAttachmentSummary("a1", "manifest.xlsx", 100, "application/vnd.openxmlformats"),
-            new MailAttachmentSummary("a2", "INV-1.pdf", 100, "application/pdf"));
-        mailSource.DeltaResult = new MailboxDeltaResult([message], "delta-1");
-        mailSource.AttachmentContents[("m1", "a1")] = [1, 2, 3];
-
-        await processor.ProcessInvoicesAsync(CancellationToken.None);
-
-        Assert.Equal(("m1", MailDestinationFolder.Errors), Assert.Single(mailSource.Moves));
+        Assert.Equal(ApStatus.InvoiceNeedsReview, invoiceStatus);
+        Assert.Contains(nameof(InvoiceFields.InvoiceDate), reason!);
     }
 
     [Fact]
-    public async Task ProcessInvoicesAsync_UnparseablePdf_RoutesToErrors()
+    public void Classify_WithAMissingCustomerPO_NeedsReview()
     {
-        var row = new ManifestRow("INV-1", null, null, null, 100m, null, null, null, null);
-        var verifier = new FakeManifestVerifier
-        {
-            OnReadManifest = _ => [row],
-            OnReconcile = (_, _) => new ManifestReconciliation([], [], [], [], [new ManifestPair("INV-1", "INV-1.pdf", row)])
-        };
-        var extractor = new FakeInvoiceFieldExtractor(); // OnExtract left null -> throws, simulating a suspicious PDF
-        var (processor, mailSource) = CreateProcessor(extractor, verifier);
+        var (invoiceStatus, _, reason) = APProcessor.Classify(KnownClient, Complete(customerPO: null), "INV-1.pdf");
 
-        var message = MessageWith(
-            "m1",
-            new MailAttachmentSummary("a1", "manifest.xlsx", 100, "application/vnd.openxmlformats"),
-            new MailAttachmentSummary("a2", "INV-1.pdf", 100, "application/pdf"));
-        mailSource.DeltaResult = new MailboxDeltaResult([message], "delta-1");
-        mailSource.AttachmentContents[("m1", "a1")] = [1];
-        mailSource.AttachmentContents[("m1", "a2")] = [2];
-
-        await processor.ProcessInvoicesAsync(CancellationToken.None);
-
-        Assert.Equal(("m1", MailDestinationFolder.Errors), Assert.Single(mailSource.Moves));
+        Assert.Equal(ApStatus.InvoiceNeedsReview, invoiceStatus);
+        Assert.Contains(nameof(InvoiceFields.CustomerPO), reason!);
     }
 
     [Fact]
-    public async Task ProcessInvoicesAsync_ManifestMismatch_RoutesToNeedsReview()
+    public void Classify_WithAnUnresolvedClient_NeedsReview()
     {
-        var row = new ManifestRow("INV-1", null, null, null, 100m, null, null, null, null);
-        var verifier = new FakeManifestVerifier
-        {
-            OnReadManifest = _ => [row],
-            OnReconcile = (_, _) => new ManifestReconciliation(["INV-1"], [], [], [], [])
-        };
-        var (processor, mailSource) = CreateProcessor(verifier: verifier);
+        // Unknown-client invoices are also excluded from UQ_Invoice_ClientNumber, so two of them can
+        // share a number without one being rejected as a false duplicate. Review is where a human sees
+        // both.
+        var (invoiceStatus, mailStatus, reason) = APProcessor.Classify(ClientResolution.Unknown, Complete(), "INV-1.pdf");
 
-        var message = MessageWith("m1", new MailAttachmentSummary("a1", "manifest.xlsx", 100, "application/vnd.openxmlformats"));
-        mailSource.DeltaResult = new MailboxDeltaResult([message], "delta-1");
-        mailSource.AttachmentContents[("m1", "a1")] = [1];
-
-        await processor.ProcessInvoicesAsync(CancellationToken.None);
-
-        Assert.Equal(("m1", MailDestinationFolder.NeedsReview), Assert.Single(mailSource.Moves));
+        Assert.Equal(ApStatus.InvoiceNeedsReview, invoiceStatus);
+        Assert.Equal(ApStatus.MailNeedsReview, mailStatus);
+        Assert.Contains("Client", reason!);
     }
 
     [Fact]
-    public async Task ProcessInvoicesAsync_ManifestDiscrepancy_SkipsPdfExtraction()
+    public void Classify_WithSeveralMissingFields_NamesThemAll()
     {
-        var row = new ManifestRow("INV-1", null, null, null, 100m, null, null, null, null);
-        var verifier = new FakeManifestVerifier
-        {
-            OnReadManifest = _ => [row],
-            OnReconcile = (_, _) => new ManifestReconciliation(["INV-2"], [], [], [], [new ManifestPair("INV-1", "INV-1.pdf", row)])
-        };
-        var (processor, mailSource) = CreateProcessor(verifier: verifier);
+        var fields = Complete(invoiceNumber: "", customerPO: " ") with { InvoiceDate = null };
+        var (_, _, reason) = APProcessor.Classify(ClientResolution.Unknown, fields, "INV-1.pdf");
 
-        var message = MessageWith(
-            "m1",
-            new MailAttachmentSummary("a1", "manifest.xlsx", 100, "application/vnd.openxmlformats"),
-            new MailAttachmentSummary("a2", "INV-1.pdf", 100, "application/pdf"));
-        mailSource.DeltaResult = new MailboxDeltaResult([message], "delta-1");
-        mailSource.AttachmentContents[("m1", "a1")] = [1];
-        mailSource.AttachmentContents[("m1", "a2")] = [2];
-
-        await processor.ProcessInvoicesAsync(CancellationToken.None);
-
-        Assert.Equal(("m1", MailDestinationFolder.NeedsReview), Assert.Single(mailSource.Moves));
+        Assert.Contains("Client", reason!);
+        Assert.Contains(nameof(InvoiceFields.InvoiceNumber), reason!);
+        Assert.Contains(nameof(InvoiceFields.InvoiceDate), reason!);
+        Assert.Contains(nameof(InvoiceFields.CustomerPO), reason!);
     }
 
     [Fact]
-    public async Task ProcessInvoicesAsync_FieldMismatch_RoutesToNeedsReview()
+    public void Classify_ChecksTheTotalBeforeMissingFields()
     {
-        var row = new ManifestRow("INV-1", null, null, null, 100m, null, null, null, null);
-        var extractedFields = new InvoiceFields("INV-1", null, null, null, 999m, null, null);
-        var verifier = new FakeManifestVerifier
-        {
-            OnReadManifest = _ => [row],
-            OnReconcile = (_, _) => new ManifestReconciliation([], [], [], [], [new ManifestPair("INV-1", "INV-1.pdf", row)]),
-            OnCompareFields = (r, f) => new InvoiceFieldComparisonResult(r.Voucher, [new FieldMismatch("InvoiceAmount", "100.00", "999.00")])
-        };
-        var extractor = new FakeInvoiceFieldExtractor { OnExtract = _ => extractedFields };
-        var (processor, mailSource) = CreateProcessor(extractor, verifier);
+        // A document with a bad total AND missing fields is an error, not a review: the total is the
+        // stronger signal that the read is wrong rather than merely incomplete.
+        var fields = Complete(invoiceNumber: "", total: 0m);
+        var (invoiceStatus, _, _) = APProcessor.Classify(ClientResolution.Unknown, fields, "INV-1.pdf");
 
-        var message = MessageWith(
-            "m1",
-            new MailAttachmentSummary("a1", "manifest.xlsx", 100, "application/vnd.openxmlformats"),
-            new MailAttachmentSummary("a2", "INV-1.pdf", 100, "application/pdf"));
-        mailSource.DeltaResult = new MailboxDeltaResult([message], "delta-1");
-        mailSource.AttachmentContents[("m1", "a1")] = [1];
-        mailSource.AttachmentContents[("m1", "a2")] = [2];
-
-        await processor.ProcessInvoicesAsync(CancellationToken.None);
-
-        Assert.Equal(("m1", MailDestinationFolder.NeedsReview), Assert.Single(mailSource.Moves));
+        Assert.Equal(ApStatus.InvoiceError, invoiceStatus);
     }
 
-    [Fact]
-    public async Task ProcessInvoicesAsync_EverythingReconciles_RoutesToProcessed()
+    [Theory]
+    [InlineData(ApStatus.MailError, ApStatus.MailNeedsReview)]
+    [InlineData(ApStatus.MailError, ApStatus.MailProcessed)]
+    [InlineData(ApStatus.MailNeedsReview, ApStatus.MailProcessed)]
+    public void Severity_RanksTheWorseOutcomeHigher(ApStatus worse, ApStatus better)
     {
-        var row = new ManifestRow("INV-1", null, null, null, 100m, null, null, null, null);
-        var extractedFields = new InvoiceFields("INV-1", null, null, null, 100m, null, null);
-        var verifier = new FakeManifestVerifier
-        {
-            OnReadManifest = _ => [row],
-            OnReconcile = (_, _) => new ManifestReconciliation([], [], [], [], [new ManifestPair("INV-1", "INV-1.pdf", row)]),
-            OnCompareFields = (r, f) => new InvoiceFieldComparisonResult(r.Voucher, [])
-        };
-        var extractor = new FakeInvoiceFieldExtractor { OnExtract = _ => extractedFields };
-        var (processor, mailSource) = CreateProcessor(extractor, verifier);
-
-        var message = MessageWith(
-            "m1",
-            new MailAttachmentSummary("a1", "manifest.xlsx", 100, "application/vnd.openxmlformats"),
-            new MailAttachmentSummary("a2", "INV-1.pdf", 100, "application/pdf"));
-        mailSource.DeltaResult = new MailboxDeltaResult([message], "delta-1");
-        mailSource.AttachmentContents[("m1", "a1")] = [1];
-        mailSource.AttachmentContents[("m1", "a2")] = [2];
-
-        await processor.ProcessInvoicesAsync(CancellationToken.None);
-
-        Assert.Equal(("m1", MailDestinationFolder.Processed), Assert.Single(mailSource.Moves));
-    }
-
-    [Fact]
-    public async Task ProcessInvoicesAsync_DuplicatePdfFilenames_DoesNotThrow_AndRoutesToProcessed()
-    {
-        var row = new ManifestRow("INV-1", null, null, null, 100m, null, null, null, null);
-        var extractedFields = new InvoiceFields("INV-1", null, null, null, 100m, null, null);
-        var verifier = new FakeManifestVerifier
-        {
-            OnReadManifest = _ => [row],
-            OnReconcile = (_, _) => new ManifestReconciliation([], [], [], [], [new ManifestPair("INV-1", "INV-1.pdf", row)]),
-            OnCompareFields = (r, f) => new InvoiceFieldComparisonResult(r.Voucher, [])
-        };
-        var extractor = new FakeInvoiceFieldExtractor { OnExtract = _ => extractedFields };
-        var (processor, mailSource) = CreateProcessor(extractor, verifier);
-
-        var message = MessageWith(
-            "m1",
-            new MailAttachmentSummary("a1", "manifest.xlsx", 100, "application/vnd.openxmlformats"),
-            new MailAttachmentSummary("a2", "INV-1.pdf", 100, "application/pdf"),
-            new MailAttachmentSummary("a3", "INV-1.pdf", 100, "application/pdf"));
-        mailSource.DeltaResult = new MailboxDeltaResult([message], "delta-1");
-        mailSource.AttachmentContents[("m1", "a1")] = [1];
-        mailSource.AttachmentContents[("m1", "a2")] = [2];
-        mailSource.AttachmentContents[("m1", "a3")] = [3];
-
-        await processor.ProcessInvoicesAsync(CancellationToken.None);
-
-Assert.Equal(("m1", MailDestinationFolder.Processed), Assert.Single(mailSource.Moves));
-Assert.Equal(2, mailSource.AttachmentRequests.Count);
-Assert.Contains(("m1", "a2"), mailSource.AttachmentRequests);
-Assert.DoesNotContain(("m1", "a3"), mailSource.AttachmentRequests);
+        // One email with several PDFs takes the worst verdict, so this ordering is what stops a single
+        // clean invoice filing an email that also contained an unparseable one.
+        Assert.True(APProcessor.Severity(worse) > APProcessor.Severity(better));
     }
 }

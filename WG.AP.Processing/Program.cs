@@ -9,7 +9,6 @@ using WG.AP.DataAccess;
 using WG.AP.Email;
 using WG.AP.Invoice.Abstractions;
 using WG.AP.Invoice.AI;
-using WG.AP.Invoice.Excel;
 using WG.AP.Processor;
 using WG.AP.Processor.Logging;
 
@@ -22,12 +21,32 @@ builder.Services
     .Validate(options => !string.IsNullOrWhiteSpace(options.ClientId), $"{MailboxOptions.SectionName}:ClientId is required.")
     .Validate(options => !string.IsNullOrWhiteSpace(options.ClientSecret), $"{MailboxOptions.SectionName}:ClientSecret is required.")
     .Validate(options => !string.IsNullOrWhiteSpace(options.MailboxUser), $"{MailboxOptions.SectionName}:MailboxUser is required.")
+    // An empty mailbox id would key every row and the delta cursor on Guid.Empty, which works right
+    // up until a second mailbox is added and the two silently share a namespace.
+    .Validate(options => options.MailboxId != Guid.Empty, $"{MailboxOptions.SectionName}:MailboxId is required — the mailbox's Entra object id.")
     .Validate(options => options.IsTestMailbox, $"{MailboxOptions.SectionName}:IsTestMailbox must be true — this process moves mail and must never target the live AP inbox.")
     .ValidateOnStart();
 
 builder.Services
     .AddOptions<MailboxSyncStateOptions>()
     .Bind(builder.Configuration.GetSection(MailboxSyncStateOptions.SectionName));
+
+builder.Services
+    .AddOptions<DatabaseOptions>()
+    .Bind(builder.Configuration.GetSection(DatabaseOptions.SectionName))
+    .Validate(options => !string.IsNullOrWhiteSpace(options.ConnectionString), $"{DatabaseOptions.SectionName}:ConnectionString is required.")
+    .Validate(options => options.MaxAttempts >= 1, $"{DatabaseOptions.SectionName}:MaxAttempts must be 1 or greater.")
+    .ValidateOnStart();
+
+builder.Services
+    .AddOptions<FileStorageOptions>()
+    .Bind(builder.Configuration.GetSection(FileStorageOptions.SectionName))
+    .Validate(options => !string.IsNullOrWhiteSpace(options.RootDirectory), $"{FileStorageOptions.SectionName}:RootDirectory is required — invoice attachments are kept for 7 years and the database only stores paths relative to it.")
+    .ValidateOnStart();
+
+builder.Services
+    .AddOptions<SqlLoggerOptions>()
+    .Bind(builder.Configuration.GetSection(SqlLoggerOptions.SectionName));
 
 builder.Services
     .AddOptions<FileLoggerOptions>()
@@ -53,7 +72,24 @@ builder.Services.AddSingleton(serviceProvider =>
 builder.Services.AddSingleton<GraphMailboxProcessor>();
 builder.Services.AddSingleton<IMailSource>(serviceProvider => serviceProvider.GetRequiredService<GraphMailboxProcessor>());
 builder.Services.AddSingleton<IMailSender>(serviceProvider => serviceProvider.GetRequiredService<GraphMailboxProcessor>());
-builder.Services.AddSingleton<IMailboxSyncStateStore, FileMailboxSyncStateStore>();
+builder.Services.AddSingleton<SqlConnectionFactory>();
+builder.Services.AddSingleton<ProcessingRunRepository>();
+builder.Services.AddSingleton<MailMessageRepository>();
+builder.Services.AddSingleton<MailAttachmentRepository>();
+builder.Services.AddSingleton<InvoiceRepository>();
+builder.Services.AddSingleton<ClientRepository>();
+builder.Services.AddSingleton<ExtractionPromptRepository>();
+builder.Services.AddSingleton<ApplicationLogRepository>();
+builder.Services.AddSingleton<AttachmentFileStore>();
+
+// Both stores are registered concretely so the dual store can hold each. The database is
+// authoritative; the file is a safety net for the first week after cutover, because a delta link that
+// silently fails to save means a full inbox re-delivery on every run until someone notices. Once the
+// two have agreed for a week, drop DualMailboxSyncStateStore, FileMailboxSyncStateStore and
+// MailboxSyncStateOptions, and register SqlMailboxSyncStateStore directly.
+builder.Services.AddSingleton<SqlMailboxSyncStateStore>();
+builder.Services.AddSingleton<FileMailboxSyncStateStore>();
+builder.Services.AddSingleton<IMailboxSyncStateStore, DualMailboxSyncStateStore>();
 builder.Services.AddSingleton<MailboxSyncProcessor>();
 
 builder.Services.AddHttpClient<OllamaClient>((serviceProvider, httpClient) =>
@@ -63,13 +99,18 @@ builder.Services.AddHttpClient<OllamaClient>((serviceProvider, httpClient) =>
     httpClient.Timeout = TimeSpan.FromSeconds(ollamaOptions.TimeoutSeconds);
 });
 builder.Services.AddSingleton<IInvoiceFieldExtractor, PdfInvoiceFieldExtractor>();
-builder.Services.AddSingleton<IAttachmentManifestVerifier, SanmarManifestVerifier>();
 
 builder.Services.AddSingleton<APProcessor>();
 
 builder.Logging.ClearProviders();
 builder.Logging.AddConsole();
+
+// Three sinks, and the file one is not redundant: it is the only one that still works when the
+// database is what is broken, and the only one that cannot vanish with a rolled-back transaction.
+// The database sink defaults to Warning while the file stays at Information, so the file keeps the
+// full narrative of a single run and the database keeps what is worth querying across runs.
 builder.Services.AddSingleton<ILoggerProvider, FileLoggerProvider>();
+builder.Services.AddSingleton<ILoggerProvider, SqlLoggerProvider>();
 
 // Everything from here on can fail before APProcessor ever gets a chance to run its own
 // try/catch (e.g. required Mailbox config missing throws OptionsValidationException the moment
@@ -96,6 +137,11 @@ try
             !string.IsNullOrWhiteSpace(mailboxOptions.ClientSecret),
             !string.IsNullOrWhiteSpace(mailboxOptions.MailboxUser),
             mailboxOptions.IsTestMailbox);
+
+        // The mailbox id is logged in full, unlike the secrets above: it is not sensitive, and it is
+        // the key every stored row and the delta cursor hang off - so if it is ever wrong, seeing the
+        // actual value is what makes that discoverable.
+        logger.LogInformation("Mailbox id in use: {MailboxId} ({MailboxUser}).", mailboxOptions.MailboxId, mailboxOptions.MailboxUser);
     }
 
     var apProcessor = host.Services.GetRequiredService<APProcessor>();

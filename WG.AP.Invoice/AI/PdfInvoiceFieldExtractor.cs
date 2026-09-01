@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using UglyToad.PdfPig;
 using UglyToad.PdfPig.DocumentLayoutAnalysis.TextExtractor;
@@ -8,32 +9,13 @@ using WG.AP.Invoice.Pdf;
 namespace WG.AP.Invoice.AI;
 
 /// <summary>
-/// Extracts invoice fields from a PDF's selectable text via a local Ollama model. PDFs in scope
-/// here (SanMar and similar vendor invoices) carry selectable text, not scanned images, so no OCR
-/// step is involved.
+/// Extracts invoice fields from a PDF's selectable text, deterministically where the layout is
+/// recognised and via a local Ollama model otherwise. PDFs in scope here carry selectable text, not
+/// scanned images, so no OCR step is involved.
 /// </summary>
 public sealed class PdfInvoiceFieldExtractor(OllamaClient ollamaClient, ILogger<PdfInvoiceFieldExtractor> logger) : IInvoiceFieldExtractor
 {
-    private static readonly object ResponseFormat = new
-    {
-        type = "object",
-        properties = new
-        {
-            InvoiceNumber = new { type = "string" },
-            SalesOrder = new { type = "string" },
-            InvoiceDate = new { type = "string" },
-            DueDate = new { type = "string" },
-            Total = new { type = "number" },
-            VendorName = new { type = "string" },
-            CustomerPO = new { type = "string" },
-            CustomerNumber = new { type = "string" },
-            OrderAccount = new { type = "string" },
-            Terms = new { type = "string" }
-        },
-        required = new[] { "InvoiceNumber", "Total" }
-    };
-
-    public async Task<InvoiceFields> ExtractAsync(byte[] pdfBytes, CancellationToken cancellationToken)
+    public async Task<ExtractionResult> ExtractAsync(byte[] pdfBytes, ExtractionRequest request, CancellationToken cancellationToken)
     {
         try
         {
@@ -44,20 +26,49 @@ public sealed class PdfInvoiceFieldExtractor(OllamaClient ollamaClient, ILogger<
                 throw new InvalidOperationException("PDF contains no extractable text.");
             }
 
-            var deterministic = SanmarPdfHeaderExtractor.TryExtract(naturalOrderText);
-
-            if (deterministic is not null)
+            // Gated on the resolved format rather than tried unconditionally. SanmarPdfHeaderExtractor
+            // encodes one client's layout, so running it against another client's invoice risks a
+            // silent wrong read - see ExtractionRequest.ExtractorKey.
+            if (request.ExtractorKey == ExtractionRequest.SanmarPdfHeaderExtractorKey)
             {
-                logger.LogInformation("Extracted invoice fields deterministically from a recognized SanMar header layout, without calling Ollama.");
-                return deterministic with { RawText = auditText };
+                var deterministic = SanmarPdfHeaderExtractor.TryExtract(naturalOrderText);
+
+                if (deterministic is not null)
+                {
+                    logger.LogInformation("Extracted invoice fields deterministically from a recognized SanMar header layout, without calling Ollama.");
+                    return new ExtractionResult(deterministic with { RawText = auditText }, ExtractionResult.RegexMethod, ExtractionPromptId: null);
+                }
+
+                logger.LogInformation("PDF header layout not recognized for deterministic extraction; falling back to Ollama.");
             }
 
-            logger.LogInformation("PDF header layout not recognized for deterministic extraction; falling back to Ollama.");
+            if (request.PromptTemplate is null || request.ResponseSchemaJson is null)
+            {
+                // Not a bad PDF, a gap in configuration - so it says which gap, rather than surfacing
+                // as an opaque parse failure that looks like the document's fault.
+                throw new InvalidOperationException(
+                    "No active extraction prompt is configured for this document's invoice format, so Ollama cannot be used. "
+                    + "Seed dbo.ExtractionPrompt for the format, or check that the client resolved to one.");
+            }
 
-            var rawResponse = await ollamaClient.GenerateAsync(BuildPrompt(auditText), ResponseFormat, cancellationToken);
+            var prompt = BuildPrompt(request.PromptTemplate, auditText);
+
+            // The schema is stored as text and forwarded as parsed JSON, so what reaches Ollama is what
+            // was reviewed in the seed script rather than a re-serialisation of it.
+            using var responseSchema = JsonDocument.Parse(request.ResponseSchemaJson);
+
+            var rawResponse = await ollamaClient.GenerateAsync(
+                prompt,
+                responseSchema.RootElement,
+                request.ModelName,
+                cancellationToken);
+
             var fields = InvoiceFieldsJsonParser.Parse(rawResponse);
 
-            return fields with { RawText = auditText };
+            return new ExtractionResult(
+                fields with { RawText = auditText },
+                ExtractionResult.OllamaMethod,
+                request.ExtractionPromptId);
         }
         catch (Exception exception)
         {
@@ -87,37 +98,22 @@ public sealed class PdfInvoiceFieldExtractor(OllamaClient ollamaClient, ILogger<
         return (naturalOrderText, auditText);
     }
 
-    private static string BuildPrompt(string documentText) => $$"""
-        Extract fields from this invoice text.
+    /// <summary>
+    /// Substitutes the document text into the stored prompt template.
+    /// </summary>
+    /// <remarks>
+    /// Both sides are normalised to LF. The template arrives that way from
+    /// <c>ExtractionPromptRepository</c> (it is stored CRLF so it stays readable in SSMS), and the
+    /// document text is normalised here because PdfPig joins pages with
+    /// <see cref="Environment.NewLine"/>, which is CRLF on Windows and LF elsewhere. Without this the
+    /// exact bytes sent to the model would depend on the machine, and replaying a stored extraction
+    /// would not reproduce it.
+    /// </remarks>
+    internal static string BuildPrompt(string promptTemplate, string documentText) =>
+        promptTemplate.Replace(
+            ExtractionPromptPlaceholder,
+            documentText.Replace("\r\n", "\n").Replace("\r", "\n"));
 
-        Return only valid JSON with exactly these keys:
-        {
-          "InvoiceNumber": "",
-          "SalesOrder": "",
-          "InvoiceDate": "",
-          "DueDate": "",
-          "Total": 0,
-          "VendorName": "",
-          "CustomerPO": "",
-          "CustomerNumber": "",
-          "OrderAccount": "",
-          "Terms": ""
-        }
-
-        Rules:
-        - InvoiceNumber is the invoice/voucher number the vendor assigned (example: INV-162393962 or CR-005662167).
-        - VendorName is the supplier/company shown in the logo/header.
-        - Total is the invoice's printed total amount due (may be labeled "Total", "Total Due", or "Subtotal amount").
-        - CustomerPO is the customer's purchase order reference (may be labeled "Customer PO", "PO Number", or "Customer Purchase Order").
-        - CustomerNumber is the vendor-assigned customer account identifier (may be labeled "Customer Number", "Customer Account", or "Account #").
-        - OrderAccount is the account the specific order was placed under (may be labeled "Order Account" or "Account Number"); it is often the same value as CustomerNumber.
-        - Terms is the payment terms printed on the invoice (may be labeled "Terms" or "Terms of Payment"), e.g. "Net60".
-        - Match fields by meaning, not by exact label text - vendors phrase these labels differently and that phrasing isn't controlled.
-        - Dates should be returned exactly as printed on the document.
-        - If a field is missing, keep empty string, and 0 for Total.
-        - Total must be numeric only.
-
-        Document:
-        {{documentText}}
-        """;
+    /// <summary>Kept in step with <c>CK_ExtractionPrompt_Placeholder</c>, which enforces its presence.</summary>
+    internal const string ExtractionPromptPlaceholder = "{{DocumentText}}";
 }
