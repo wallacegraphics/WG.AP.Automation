@@ -1,0 +1,34 @@
+{
+  "_README": [
+    "Copy this file to appsettings.Development.local.json (drop the .template suffix) and fill in the",
+    "real values. That file is gitignored via the appsettings.*.local.json rule, so it is where every",
+    "secret-bearing developer setting belongs - connection strings with a SQL login, the Graph client",
+    "secret, anything else that must not reach git.",
+    "",
+    "Program.cs loads it last, and only when DOTNET_ENVIRONMENT=Development, so it overrides",
+    "appsettings.json and appsettings.Development.json. It is optional: CI and the server do not have",
+    "it and must not need it.",
+    "",
+    "The committed appsettings*.json files keep only shared, non-secret settings and should stay that",
+    "way - leave their Database:ConnectionString as an empty string rather than filling it in.",
+    "",
+    "Mailbox is listed below for when Graph is configured; delete the section until then, since the",
+    "empty strings would override appsettings.Development.json with nothing and change no outcome."
+  ],
+
+  "Database": {
+    "ConnectionString": "Data Source=<server>;Initial Catalog=<database>;User ID=<user>;Password=<password>;Encrypt=True;TrustServerCertificate=True;Connect Timeout=60"
+  },
+
+  "FileStorage": {
+    "RootDirectory": "C:\\ProgramData\\WG.AP.Automation\\Attachments"
+  },
+
+  "Mailbox": {
+    "TenantId": "<tenant guid>",
+    "ClientId": "<app registration client id>",
+    "ClientSecret": "<client secret>",
+    "MailboxUser": "<mailbox address>",
+    "MailboxId": "<mailbox Entra object id>"
+  }
+}

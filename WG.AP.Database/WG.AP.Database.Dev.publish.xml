@@ -4,21 +4,49 @@
 
   TargetConnectionString is intentionally left with a placeholder server name: it is
   developer- and environment-specific, and a real one committed here would be published
-  over by whoever cloned the repo next. Set it once in Visual Studio's Publish dialog and
-  it is remembered locally.
+  over by whoever cloned the repo next. Override it on the sqlpackage command line:
+
+    dotnet build WG.AP.Database\WG.AP.Database.sqlproj -c Debug
+    sqlpackage /Action:Publish ^
+      /SourceFile:"WG.AP.Database\bin\Debug\WG.AP.Database.dacpac" ^
+      /Profile:"WG.AP.Database\WG.AP.Database.Dev.publish.xml" ^
+      /TargetConnectionString:"Data Source=<server>;Initial Catalog=WGAccountPayableDev;Integrated Security=True;Encrypt=True;TrustServerCertificate=True"
+
+  Do NOT publish from Visual Studio's Publish dialog. On 2026-09-02 it deployed a model
+  containing no objects at all - the generated script had zero CREATE TABLE statements and
+  the deployment report listed no user actions - so the post-deployment seed was the first
+  statement to touch a table and failed with Msg 208 on lkup.Status. Against a fresh
+  database that is merely a failed publish. Against a populated one, DropObjectsNotInSource
+  below would have dropped every table. Build the dacpac from the CLI and publish that.
 -->
 <Project ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <PropertyGroup>
-    <TargetDatabaseName>WG_AP_Dev</TargetDatabaseName>
-    <TargetConnectionString>Data Source=SET-ME;Initial Catalog=WG_AP_Dev;Integrated Security=True;Encrypt=True;TrustServerCertificate=True</TargetConnectionString>
+    <TargetDatabaseName>WGAccountPayableDev</TargetDatabaseName>
+    <TargetConnectionString>Data Source=SET-ME;Initial Catalog=WGAccountPayableDev;Integrated Security=True;Encrypt=True;TrustServerCertificate=True</TargetConnectionString>
     <ProfileVersionNumber>1</ProfileVersionNumber>
     <DeployScriptFileName>WG.AP.Database.Dev.sql</DeployScriptFileName>
 
     <!-- Seeds are MERGE/IF NOT EXISTS, so re-publishing is the normal case. -->
     <ScriptDatabaseOptions>True</ScriptDatabaseOptions>
     <BlockOnPossibleDataLoss>True</BlockOnPossibleDataLoss>
-    <!-- Dev is allowed to converge to the project: an object removed from source goes. -->
-    <DropObjectsNotInSource>True</DropObjectsNotInSource>
+    <!-- False, matching Prod, even though Dev could otherwise converge to the project.
+
+         This project models no security principals, so DropObjectsNotInSource=True treats every
+         user and role in the target as "not in source" and drops it. The dev server is shared:
+         Azure Arc adds NT AUTHORITY\SYSTEM, NT Service\SqlServerExtension and
+         SQLArcExtensionUserRole to every database for monitoring, and the first publish on
+         2026-09-02 dropped all three. Other databases on that instance carry real user logins.
+
+         The natural fix - ExcludeObjectTypes / DoNotDropObjectTypes - CANNOT be used here:
+         sqlpackage 170.5.76 silently ignores collection-valued properties that come from a
+         publish profile. Semicolon string, <string> list and ItemGroup forms were all tested and
+         all still planned the drop; the same value as /p:ExcludeObjectTypes on the command line
+         produces zero operations. So the protection cannot live in this file, and a profile that
+         depends on remembering a command-line flag is a footgun on a shared instance.
+
+         Consequence: a renamed or deleted object lingers in dev. Converge by dropping and
+         re-creating the database, then publishing - it takes about ten seconds. -->
+    <DropObjectsNotInSource>False</DropObjectsNotInSource>
     <DropPermissionsNotInSource>False</DropPermissionsNotInSource>
     <DropRoleMembersNotInSource>False</DropRoleMembersNotInSource>
     <IgnorePermissions>True</IgnorePermissions>
