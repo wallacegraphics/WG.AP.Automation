@@ -1,4 +1,5 @@
 using Azure.Identity;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -12,7 +13,27 @@ using WG.AP.Invoice.AI;
 using WG.AP.Processor;
 using WG.AP.Processor.Logging;
 
-var builder = Host.CreateApplicationBuilder(args);
+// The content root is what the appsettings providers resolve their paths against, and it defaults
+// to the current working directory - which is wrong for both ways this app actually runs. A CLI
+// `dotnet run` from the repo root reads no appsettings file at all, and a scheduled task with no
+// "Start in" field set runs from C:\Windows\System32. Neither looks like a path problem: both
+// surface as "required config is missing" on a process nobody is watching, for values that are
+// sitting correctly in a file that was never opened. The appsettings files are copied next to the
+// executable, so anchor there rather than to wherever the process happened to be launched from.
+var builder = Host.CreateApplicationBuilder(new HostApplicationBuilderSettings
+{
+    Args = args,
+    ContentRootPath = AppContext.BaseDirectory,
+});
+
+// Developer-local overrides, layered last so they win. The dev connection string carries a SQL
+// login and password, and every appsettings*.json is tracked by git, so the secret-bearing values
+// live here instead. Optional and gitignored - absent on CI and on the server, where configuration
+// arrives by other means.
+if (builder.Environment.IsDevelopment())
+{
+    builder.Configuration.AddJsonFile("appsettings.Development.local.json", optional: true, reloadOnChange: false);
+}
 
 builder.Services
     .AddOptions<MailboxOptions>()
@@ -38,11 +59,15 @@ builder.Services
     .Validate(options => options.MaxAttempts >= 1, $"{DatabaseOptions.SectionName}:MaxAttempts must be 1 or greater.")
     .ValidateOnStart();
 
+// FileStorageOptionsValidator replaces the usual inline .Validate() lambda: "not empty" is not the
+// guarantee that matters for a UNC share. It checks the root exists and is genuinely writable, which
+// needs real I/O and distinct messages per failure, so it lives beside the options class instead.
 builder.Services
     .AddOptions<FileStorageOptions>()
     .Bind(builder.Configuration.GetSection(FileStorageOptions.SectionName))
-    .Validate(options => !string.IsNullOrWhiteSpace(options.RootDirectory), $"{FileStorageOptions.SectionName}:RootDirectory is required — invoice attachments are kept for 7 years and the database only stores paths relative to it.")
     .ValidateOnStart();
+
+builder.Services.AddSingleton<IValidateOptions<FileStorageOptions>, FileStorageOptionsValidator>();
 
 builder.Services
     .AddOptions<SqlLoggerOptions>()
@@ -123,6 +148,17 @@ try
 {
     using var host = builder.Build();
     logger = host.Services.GetRequiredService<ILoggerFactory>().CreateLogger("WG.AP.Processing");
+
+    // This looks redundant next to the .ValidateOnStart() calls above, and is not: ValidateOnStart
+    // registers a hosted service that runs the validators from host.StartAsync(), and this host is
+    // never started - it resolves APProcessor and awaits it directly. Without this line only
+    // MailboxOptions is ever checked, and only by accident, because the Development log block below
+    // reads its .Value. Everything else validated lazily on first resolution, so a typo in
+    // Database:ConnectionString surfaced only after auth, folder creation and a delta fetch had
+    // already happened. IStartupValidator is the service ValidateOnStart registers, so calling it
+    // here covers all seven options types and any added later, with no list to keep in sync.
+    // Placed after the logger exists so a failure is written to the file and database sinks.
+    host.Services.GetRequiredService<IStartupValidator>().Validate();
 
     var environment = host.Services.GetRequiredService<IHostEnvironment>();
     var mailboxOptions = host.Services.GetRequiredService<IOptions<MailboxOptions>>().Value;

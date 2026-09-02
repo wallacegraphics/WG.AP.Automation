@@ -370,3 +370,9 @@ FodyWeavers.xsd
 
 # Real invoice PDFs for local-only integration testing - never commit real invoice data
 WG.AP.Tests/Invoice/Fixtures.local/
+
+# Developer-local configuration overrides - never commit real credentials.
+# The committed appsettings*.json files hold only shared, non-secret settings; anything carrying a
+# connection string with a login, or the Graph client secret, goes in one of these instead.
+# appsettings.Development.local.json.template is committed and shows the expected shape.
+appsettings.*.local.json

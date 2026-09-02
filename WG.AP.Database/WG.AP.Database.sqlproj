@@ -1,9 +1,16 @@
 <!-- Microsoft.Build.Sql 2.2.0 or later is required: 1.x imports NuGet.Build.Tasks.Pack
      from a path the .NET 10 SDK no longer uses, so it cannot restore here. -->
-<Project Sdk="Microsoft.Build.Sql/2.2.0">
+<!-- TreatAsLocalProperty is what makes the SSDTPath / SqlServerRedistPath override below actually
+     take effect. Visual Studio passes both as *global* properties, and a global property cannot be
+     overridden by a PropertyGroup - the assignment is silently ignored, which is why an earlier
+     attempt to set them changed nothing in the IDE while working fine from the CLI. Listing them
+     here demotes them to normal properties for this project only. -->
+<Project Sdk="Microsoft.Build.Sql/2.2.0" TreatAsLocalProperty="SSDTPath;SqlServerRedistPath">
   <PropertyGroup>
     <Name>WG.AP.Database</Name>
-    <DSP>Microsoft.Data.Tools.Schema.Sql.Sql160DatabaseSchemaProvider</DSP>
+    <!-- Sql150 (SQL Server 2019) matches the IT dev server. Both publish profiles set
+         AllowIncompatiblePlatform=False, so a Sql160 dacpac would be refused outright. -->
+    <DSP>Microsoft.Data.Tools.Schema.Sql.Sql150DatabaseSchemaProvider</DSP>
     <ModelCollation>1033, CI</ModelCollation>
     <!-- Reporting SELECTs must never block the single writer. -->
     <ReadCommittedSnapshot>True</ReadCommittedSnapshot>
@@ -11,6 +18,57 @@
     <QuotedIdentifierOn>True</QuotedIdentifierOn>
     <TargetDatabaseSet>True</TargetDatabaseSet>
     <ProjectGuid>{5c74f562-4ba4-9b84-2e2d-a39d637e4ced}</ProjectGuid>
+  </PropertyGroup>
+
+  <!-- Makes Visual Studio build this project with the DacFx this SDK ships rather than the older one
+       bundled in the IDE.
+
+       Visual Studio builds with BuildFromSSDT set, which makes Sdk.props leave SSDTPath empty (its
+       condition requires BuildFromSSDT == 'false'). Sdk.targets then imports VS's own copy of
+       Microsoft.Data.Tools.Schema.SqlTasks.targets, where an empty SSDTPath falls through to
+       SqlServerRedistPath = $(VsIdePath)\Extensions\Microsoft\SQLDB\DAC. In VS 18 that is DacFx
+       170.4.53.0, while this SDK ships 170.4.83.3 and passes AutomaticIndexCompaction to
+       SqlBuildTask - a parameter the older task does not have, so the build fails to initialise it
+       (SQL04063 / SQL04064).
+
+       SqlServerRedistPath is the property that actually selects the assembly, and it is set here
+       rather than only via SSDTPath because that is the one assignment nothing downstream undoes.
+       In the targets file the order is:
+           SqlServerRedistPath = $(SSDTPath)                    when SSDTPath is non-empty
+           SqlServerRedistPath = $(VsIdePath)\...\SQLDB\DAC     when SqlServerRedistPath is empty
+       Setting it here satisfies the second condition, so the IDE fallback never runs; and when
+       SSDTPath is non-empty (the `dotnet build` case) the first line re-assigns it to the same
+       folder anyway. Both are set so the two stay consistent, and neither is conditioned on being
+       empty - an earlier attempt guarded on '$(SSDTPath)' == '' and did nothing in the IDE, because
+       Visual Studio supplies that property itself.
+
+       Use SdkBinariesPath, not NETFrameworkTargetsPath: the latter looks right in Sdk.props but is
+       overwritten later by MSBuild's own common targets and ends up pointing at
+       Microsoft.NETFramework.CurrentVersion.targets - a file, not this SDK's tools\net472 folder.
+
+       The path is built from NuGetPackageRoot and the SDK version pinned in the Sdk attribute above,
+       rather than from $(SdkBinariesPath), so it does not depend on how the IDE happens to evaluate
+       the SDK's own properties - and it is guarded by Exists() on the actual DLL, so a wrong guess
+       here leaves the SDK's default behaviour alone instead of pointing the build at nothing. Bump
+       the version in both places together.
+
+       No-op for `dotnet build`, which already resolves to exactly this folder. -->
+  <!-- Redirecting SSDTPath/SqlServerRedistPath (above) is not sufficient on its own: the SDK's
+       targets only put SqlBuildTask in an isolated process (TaskFactory="TaskHostFactory") when
+       NetCoreBuild == true, i.e. for `dotnet build`. For a VS build the task loads in-process, inside
+       devenv.exe itself - and devenv.exe already has VS's own (older) Microsoft.Data.Tools.Schema.Tasks.Sql.dll
+       loaded from its SSDT/SQL Object Explorer tooling. Microsoft keeps that assembly's AssemblyVersion
+       fixed at 170.0.0.0 across every DacFx point release (both the old and new DLL report identical
+       Version=170.0.0.0), so .NET Framework's binder treats the copy already resident in devenv.exe as
+       satisfying any later load request for "that same assembly" and reuses it - regardless of which
+       file path SqlServerRedistPath points at. Forcing UseTaskHostFactory=true here makes SqlBuildTask
+       run in an isolated out-of-process host instead of inside devenv.exe, so it loads fresh from our
+       SqlServerRedistPath with nothing already resident to collide with. -->
+  <PropertyGroup Condition="'$(NetCoreBuild)' != 'true'">
+    <_WgApSdkDacDir>$(NuGetPackageRoot)microsoft.build.sql\2.2.0\tools\net472</_WgApSdkDacDir>
+    <SSDTPath Condition="Exists('$(_WgApSdkDacDir)\Microsoft.Data.Tools.Schema.Tasks.Sql.dll')">$(_WgApSdkDacDir)</SSDTPath>
+    <SqlServerRedistPath Condition="Exists('$(_WgApSdkDacDir)\Microsoft.Data.Tools.Schema.Tasks.Sql.dll')">$(_WgApSdkDacDir)</SqlServerRedistPath>
+    <UseTaskHostFactory Condition="Exists('$(_WgApSdkDacDir)\Microsoft.Data.Tools.Schema.Tasks.Sql.dll')">true</UseTaskHostFactory>
   </PropertyGroup>
   <ItemGroup>
     <!-- The SDK globs every .sql file under the project as a schema object, so anything
@@ -20,6 +78,16 @@
          Left in Build, either would fail with SQL71006 (one statement per batch). -->
     <Build Remove="Scripts\**\*.sql" />
     <Build Remove="Tests\**\*.sql" />
+    <!-- Directory.Build.props gives each toolchain its own obj\ subfolder, and the SDK's default
+         glob only excludes the BaseIntermediateOutputPath of the build that is running - so a
+         `dotnet` build would otherwise pick up obj\vs\Debug\postdeploy.sql as a schema object, and
+         a VS build would pick up obj\dotnet\Debug\postdeploy.sql. That generated file is full of
+         multi-statement batches, so it fails with SQL71006 exactly like the seed scripts above.
+         Exclude both trees outright rather than relying on whichever one is current. -->
+    <Build Remove="obj\**\*.sql" />
+    <Build Remove="bin\**\*.sql" />
+    <None Remove="obj\**\*.sql" />
+    <None Remove="bin\**\*.sql" />
     <PostDeploy Include="Scripts\PostDeployment.sql" />
     <None Include="Scripts\Seed\*.sql" />
     <None Include="Tests\*.sql" />

@@ -1,0 +1,28 @@
+<!--
+  Gives `dotnet build` and Visual Studio separate intermediate folders for this project only.
+
+  Microsoft.Build.Sql picks its target framework from the MSBuild runtime: netstandard2.1 under
+  `dotnet` (.NET Core MSBuild), net472 under Visual Studio (.NET Framework MSBuild). Both wrote to
+  the same obj\, so whichever restored last won and the other failed with
+
+      Assets file '...\obj\project.assets.json' doesn't have a target for 'net472'
+      (or for 'netstandard2.1')
+
+  which is a restore mismatch wearing the costume of a project misconfiguration. Cleaning the
+  solution and rebuilding flipped it back and forth. Splitting the path means each toolchain
+  restores into its own folder and neither invalidates the other.
+
+  BaseIntermediateOutputPath has to be set before Microsoft.Common.props reads it, which is exactly
+  what Directory.Build.props is for - setting it inside the .sqlproj is too late.
+
+  bin\ is deliberately NOT split: the dacpac stays at the documented
+  WG.AP.Database\bin\Debug\WG.AP.Database.dacpac that the sqlpackage publish commands reference.
+
+  This is the only Directory.Build.props in the repository, so nothing above is being shadowed.
+-->
+<Project>
+  <PropertyGroup>
+    <BaseIntermediateOutputPath Condition="'$(MSBuildRuntimeType)' == 'Core'">$(MSBuildThisFileDirectory)obj\dotnet\</BaseIntermediateOutputPath>
+    <BaseIntermediateOutputPath Condition="'$(MSBuildRuntimeType)' != 'Core'">$(MSBuildThisFileDirectory)obj\vs\</BaseIntermediateOutputPath>
+  </PropertyGroup>
+</Project>

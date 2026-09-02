@@ -29,6 +29,11 @@
     <DropPermissionsNotInSource>False</DropPermissionsNotInSource>
     <DropRoleMembersNotInSource>False</DropRoleMembersNotInSource>
     <GenerateSmartDefaults>False</GenerateSmartDefaults>
+    <!-- Note for anyone tempted to add ExcludeObjectTypes or DoNotDropObjectTypes here: sqlpackage
+         170.5.76 silently ignores collection-valued properties supplied by a publish profile (all
+         of the semicolon, <string>-list and ItemGroup forms were tested). They work only as /p: on
+         the command line. DropObjectsNotInSource=False above is what actually protects security
+         principals in this environment. -->
     <IgnorePermissions>True</IgnorePermissions>
     <IgnoreUserSettingsObjects>True</IgnoreUserSettingsObjects>
     <IgnoreLoginSids>True</IgnoreLoginSids>
