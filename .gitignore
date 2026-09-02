@@ -370,3 +370,7 @@ FodyWeavers.xsd
 
 # Real invoice PDFs for local-only integration testing - never commit real invoice data
 WG.AP.Tests/Invoice/Fixtures.local/
+
+# Developer-local secret overrides (SQL login/password, Graph client secret, etc.) - see
+# WG.AP.Processing/appsettings.Development.local.json.template for the documented shape.
+appsettings.*.local.json
