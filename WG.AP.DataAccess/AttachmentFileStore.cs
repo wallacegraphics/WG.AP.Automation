@@ -21,6 +21,87 @@ public sealed class FileStorageOptions
 }
 
 /// <summary>
+/// Startup validation for <see cref="FileStorageOptions"/>: the root must exist and be writable.
+/// </summary>
+/// <remarks>
+/// A non-empty string is not the guarantee that matters. The real failure modes are a UNC share that
+/// is unreachable or has not been provisioned yet, and a path the service account can read but not
+/// write — neither of which a string check sees. Without this the first symptom is a mid-run
+/// exception from <see cref="AttachmentFileStore.SaveAsync"/> after mail has already been fetched.
+/// <para>
+/// The root is deliberately <b>not</b> created on demand, unlike the <c>yyyy\MM</c> folders beneath
+/// it. Invoice attachments carry a 7-year retention requirement, so a mistyped path must fail loudly
+/// rather than quietly produce a new empty folder that nobody is backing up — and on a UNC share,
+/// provisioning is IT's to do, not this process's.
+/// </para>
+/// <para>
+/// Writability is checked by actually writing, because permissions, share-level rights and
+/// read-only mounts cannot be inferred from the path. Note this costs a round trip to the share at
+/// startup, and an unreachable UNC path will block for the OS timeout before failing.
+/// </para>
+/// </remarks>
+public sealed class FileStorageOptionsValidator : IValidateOptions<FileStorageOptions>
+{
+    public ValidateOptionsResult Validate(string? name, FileStorageOptions options)
+    {
+        var root = options.RootDirectory;
+
+        if (string.IsNullOrWhiteSpace(root))
+        {
+            return ValidateOptionsResult.Fail(
+                $"{FileStorageOptions.SectionName}:RootDirectory is required — invoice attachments are kept for " +
+                "7 years and the database only stores paths relative to it.");
+        }
+
+        try
+        {
+            if (!Directory.Exists(root))
+            {
+                return ValidateOptionsResult.Fail(
+                    $"{FileStorageOptions.SectionName}:RootDirectory '{root}' does not exist or is unreachable. " +
+                    "It is not created on demand: attachments are kept for 7 years, so a mistyped or offline path " +
+                    "must fail here rather than silently write invoice data somewhere unmonitored. Create the " +
+                    "directory, or correct the setting.");
+            }
+        }
+        catch (Exception exception)
+        {
+            return ValidateOptionsResult.Fail(
+                $"{FileStorageOptions.SectionName}:RootDirectory '{root}' could not be read: {exception.Message}");
+        }
+
+        // Create-and-write, not just create: a zero-byte file can succeed where an actual write fails.
+        var probePath = Path.Combine(root, $".wgap-writecheck-{Guid.NewGuid():N}.tmp");
+
+        try
+        {
+            File.WriteAllBytes(probePath, [0x57, 0x47]);
+        }
+        catch (Exception exception)
+        {
+            return ValidateOptionsResult.Fail(
+                $"{FileStorageOptions.SectionName}:RootDirectory '{root}' exists but is not writable by this " +
+                $"account: {exception.Message}");
+        }
+        finally
+        {
+            // Best effort. A probe file left behind is harmless clutter, and failing startup over it would
+            // turn a missing delete permission into an outage - retention deletes are a separate concern.
+            try
+            {
+                File.Delete(probePath);
+            }
+            catch
+            {
+                // Intentionally ignored.
+            }
+        }
+
+        return ValidateOptionsResult.Success;
+    }
+}
+
+/// <summary>
 /// Writes attachment bytes to the file share and returns the relative path and hash to record.
 /// </summary>
 public sealed class AttachmentFileStore(
