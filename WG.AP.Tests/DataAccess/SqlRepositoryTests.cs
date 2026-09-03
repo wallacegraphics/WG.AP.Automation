@@ -280,8 +280,13 @@ public class SqlRepositoryTests
         Assert.Equal("NeedsReview", folders[ApStatus.MailNeedsReview]);
         Assert.Equal("Errors", folders[ApStatus.MailError]);
 
-        // The one that matters: skipped mail has no destination, so it stays in the Inbox.
-        Assert.Null(folders[ApStatus.MailSkipped]);
+        // Skipped mail (no PDF attachment) is routed to NeedsReview so a human still sees it,
+        // rather than being left invisible in the Inbox.
+        Assert.Equal("NeedsReview", folders[ApStatus.MailSkipped]);
+
+        // MailDeleted has no destination — the mailbox has already removed the message — so it's
+        // the one that actually stays wherever it is.
+        Assert.Null(folders[ApStatus.MailDeleted]);
     }
 
     [SkippableFact]

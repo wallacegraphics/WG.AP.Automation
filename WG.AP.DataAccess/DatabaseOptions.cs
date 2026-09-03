@@ -26,4 +26,11 @@ public sealed class DatabaseOptions
 
     /// <summary>Seconds to allow a single database command. 0 uses the provider default.</summary>
     public int CommandTimeoutSeconds { get; init; } = 30;
+
+    /// <summary>
+    /// Identifies this application in CreatedBy/ModifiedBy, in place of SUSER_SNAME(). The SQL
+    /// login this app connects with carries no per-actor meaning, so the app stamps its own
+    /// identity explicitly instead of letting the column default pick up the login name.
+    /// </summary>
+    public string AppIdentity { get; init; } = "AP.Processor";
 }

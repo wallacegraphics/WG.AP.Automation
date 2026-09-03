@@ -19,10 +19,10 @@ public sealed class ProcessingRunRepository(
 
             return await connection.QuerySingleAsync<long>(new CommandDefinition(
                 """
-                INSERT INTO [dbo].[ProcessingRun] ([MailboxId]) VALUES (@MailboxId);
+                INSERT INTO [dbo].[ProcessingRun] ([MailboxId], [CreatedBy]) VALUES (@MailboxId, @AppIdentity);
                 SELECT CONVERT(BIGINT, SCOPE_IDENTITY());
                 """,
-                new { mailbox.MailboxId },
+                new { mailbox.MailboxId, AppIdentity = connectionFactory.AppIdentity },
                 commandTimeout: connectionFactory.CommandTimeoutSeconds,
                 cancellationToken: cancellationToken));
         }
@@ -65,7 +65,7 @@ public sealed class ProcessingRunRepository(
                        [InvoiceCount] = @InvoiceCount,
                        [IsSuccessful] = @IsSuccessful,
                        [ErrorMessage] = @ErrorMessage,
-                       [ModifiedBy]   = SUSER_SNAME(),
+                       [ModifiedBy]   = @AppIdentity,
                        [ModifiedOn]   = SYSUTCDATETIME()
                  WHERE [ProcessingRunId] = @ProcessingRunId;
                 """,
@@ -75,7 +75,8 @@ public sealed class ProcessingRunRepository(
                     MessageCount = messageCount,
                     InvoiceCount = invoiceCount,
                     IsSuccessful = isSuccessful,
-                    ErrorMessage = MailMessageRepository.Truncate(errorMessage, 1000)
+                    ErrorMessage = MailMessageRepository.Truncate(errorMessage, 1000),
+                    AppIdentity = connectionFactory.AppIdentity
                 },
                 commandTimeout: connectionFactory.CommandTimeoutSeconds,
                 cancellationToken: cancellationToken));

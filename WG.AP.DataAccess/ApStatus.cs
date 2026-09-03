@@ -30,7 +30,7 @@ public enum ApStatus
     /// <summary>A PDF could not be parsed, or a total was null, zero or negative.</summary>
     MailError = 13,
 
-    /// <summary>No PDF attachments at all — which now includes Excel-only mail. Left in the Inbox.</summary>
+    /// <summary>No PDF attachments at all — which now includes Excel-only mail. Routed to NeedsReview.</summary>
     MailSkipped = 14,
 
     /// <summary>The same email seen again under a new Graph id.</summary>

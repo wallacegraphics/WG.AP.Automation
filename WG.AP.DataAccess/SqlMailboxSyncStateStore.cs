@@ -54,13 +54,13 @@ public sealed class SqlMailboxSyncStateStore(
                 WHEN MATCHED THEN
                     UPDATE SET target.[MailboxUser] = @MailboxUser,
                                target.[DeltaLink]   = @DeltaLink,
-                               target.[ModifiedBy]  = SUSER_SNAME(),
+                               target.[ModifiedBy]  = @AppIdentity,
                                target.[ModifiedOn]  = SYSUTCDATETIME()
                 WHEN NOT MATCHED THEN
-                    INSERT ([MailboxId], [MailboxUser], [DeltaLink])
-                    VALUES (@MailboxId, @MailboxUser, @DeltaLink);
+                    INSERT ([MailboxId], [MailboxUser], [DeltaLink], [CreatedBy])
+                    VALUES (@MailboxId, @MailboxUser, @DeltaLink, @AppIdentity);
                 """,
-                new { mailbox.MailboxId, mailbox.MailboxUser, DeltaLink = deltaLink },
+                new { mailbox.MailboxId, mailbox.MailboxUser, DeltaLink = deltaLink, AppIdentity = connectionFactory.AppIdentity },
                 commandTimeout: connectionFactory.CommandTimeoutSeconds,
                 cancellationToken: cancellationToken));
         }

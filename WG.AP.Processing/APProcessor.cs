@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using WG.AP.Core.Abstractions;
@@ -149,7 +150,7 @@ public sealed class APProcessor(
     /// <remarks>
     /// The routing rules, in the order they are applied:
     /// <list type="bullet">
-    /// <item>no PDF attachments — including Excel-only mail — is <c>MailSkipped</c>, left in the Inbox</item>
+    /// <item>no PDF attachments — including Excel-only mail — is <c>MailSkipped</c>, routed to NeedsReview</item>
     /// <item>a PDF that cannot be parsed, or a total that is null, zero or negative, is <c>MailError</c></item>
     /// <item>a missing required field, an unresolved client, or a duplicate number is <c>MailNeedsReview</c></item>
     /// <item>everything present and readable is <c>MailProcessed</c></item>
@@ -172,7 +173,7 @@ public sealed class APProcessor(
         if (pdfs.Count == 0)
         {
             logger.LogInformation(
-                "Message {MessageId} has no PDF attachment(s); leaving it in the Inbox.", message.Id);
+                "Message {MessageId} has no PDF attachment(s); routing to NeedsReview.", message.Id);
             return new MessageOutcome(ApStatus.MailSkipped, null, InvoiceCount: 0);
         }
 
@@ -360,6 +361,7 @@ public sealed class APProcessor(
                 Terms = fields?.Terms,
                 ClientNameAsRead = fields?.ClientName,
                 RawText = fields?.RawText,
+                FieldsJson = fields is null ? null : JsonSerializer.Serialize(fields),
                 ExtractionMethod = extraction?.Method,
                 ExtractionPromptId = extraction?.ExtractionPromptId,
                 Status = status,

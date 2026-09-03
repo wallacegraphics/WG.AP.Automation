@@ -16,6 +16,8 @@ public sealed class SqlConnectionFactory(IOptions<DatabaseOptions> options)
 
     public int CommandTimeoutSeconds => options.Value.CommandTimeoutSeconds;
 
+    public string AppIdentity => options.Value.AppIdentity;
+
     public async Task<SqlConnection> OpenAsync(CancellationToken cancellationToken)
     {
         var connection = new SqlConnection(options.Value.ConnectionString);
