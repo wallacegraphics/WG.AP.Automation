@@ -1,3 +1,4 @@
+using System.Globalization;
 using WG.AP.Invoice.AI;
 
 namespace WG.AP.Tests.Invoice;
@@ -66,7 +67,10 @@ public class InvoiceFieldsJsonParserTests
 
         var fields = InvoiceFieldsJsonParser.Parse(json);
 
-        Assert.Equal(decimal.Parse(totalText), fields.Total);
+        // InvariantCulture, matching InvoiceFieldsJsonParser.GetAmount exactly - decimal.Parse(totalText)
+        // alone would use the test runner's current culture, which can disagree with "." as the decimal
+        // separator on a non-en-US locale and fail this assertion even when production code is correct.
+        Assert.Equal(decimal.Parse(totalText, CultureInfo.InvariantCulture), fields.Total);
     }
 
     [Fact]

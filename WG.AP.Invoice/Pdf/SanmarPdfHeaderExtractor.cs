@@ -37,12 +37,14 @@ public static class SanmarPdfHeaderExtractor
     // the document is the grand total (confirmed against real invoices - it prints once more, alone,
     // near the end of the page, after the "Total <count> cases" / subtotal block).
     //
-    // The amount group allows comma thousands-separators (e.g. "1,320.00") - a plain \d+ silently
-    // fails to match any total >= $1,000 at all (not a wrong parse, zero matches), which sent every
-    // such invoice to Ollama misclassified as "layout not recognized" rather than a bad total read.
-    // decimal.Parse below needs no change: CultureInfo.InvariantCulture's default NumberStyles.Number
-    // already accepts comma-grouped digits.
-    private static readonly Regex TotalRegex = new(@"\bTotal\b\s+(?<amount>\d{1,3}(?:,\d{3})*\.\d{2})\b(?!\s+[Cc]ases)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    // The amount group must ALLOW comma thousands-separators (e.g. "1,320.00") without REQUIRING
+    // them: a plain \d+ silently failed to match any total >= $1,000 at all (not a wrong parse, zero
+    // matches), which sent every such invoice to Ollama misclassified as "layout not recognized"
+    // rather than a bad total read. The two alternatives are both needed - \d{1,3}(?:,\d{3})*
+    // alone would reject an ungrouped 4+-digit total like "1320.00" just as badly as \d+ alone
+    // rejected the comma-grouped form, merely in the opposite direction. decimal.Parse below needs
+    // no change either way: CultureInfo.InvariantCulture's default NumberStyles.Number accepts both.
+    private static readonly Regex TotalRegex = new(@"\bTotal\b\s+(?<amount>\d{1,3}(?:,\d{3})*\.\d{2}|\d+\.\d{2})\b(?!\s+[Cc]ases)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     public static InvoiceFields? TryExtract(string naturalOrderText)
     {

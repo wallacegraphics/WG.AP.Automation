@@ -288,8 +288,8 @@ public sealed class APProcessor(
     /// Decides an invoice's status from its extracted fields.
     /// </summary>
     /// <remarks>
-    /// The five required fields are client, invoice date, invoice number, customer PO and total. A
-    /// total's sign or magnitude is not evaluated here: zero and negative totals are valid,
+    /// The required fields checked here are client, invoice date, invoice number, and customer PO.
+    /// Total's sign or magnitude is not evaluated here: zero and negative totals are valid,
     /// correctly-extracted data (e.g. a credit memo prints a negative total by design) and must not
     /// be converted to a positive value or treated as an error anywhere in this pipeline.
     /// <para>

@@ -134,6 +134,23 @@ public class SanmarPdfHeaderExtractorTests
     }
 
     [Fact]
+    public void TryExtract_TotalWithFourDigitsAndNoThousandsSeparator_ReturnsCorrectTotal()
+    {
+        // The comma-tolerance fix must ADD the comma-grouped form as an alternative, not REPLACE the
+        // original unrestricted-digit-count form with it - a regex requiring \d{1,3}(?:,\d{3})* alone
+        // would reject an ungrouped 4+-digit total ("1320.00") just as badly as plain \d+ once rejected
+        // the comma-grouped form, merely in the opposite direction.
+        var text = "Invoice Number: INV-1 Sales Order: SO-1 Invoice Date: 1/1/2026 Due Date: 2/1/2026 " +
+            "Customer Number: ACCT-1 Terms: Net30 Customer PO: PO-1 Order Account: ORDERACCT-1 " +
+            "Total 2.00 cases Sales subtotal amount 1320.00 Total 1320.00";
+
+        var fields = SanmarPdfHeaderExtractor.TryExtract(text);
+
+        Assert.NotNull(fields);
+        Assert.Equal(1320.00m, fields!.Total);
+    }
+
+    [Fact]
     public void TryExtract_TotalWithThousandsSeparator_ReturnsCorrectTotal()
     {
         // Real shape from INV-163576177.pdf: a 4-digit grand total is printed with a comma
