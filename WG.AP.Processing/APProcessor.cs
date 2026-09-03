@@ -361,7 +361,22 @@ public sealed class APProcessor(
                 Terms = fields?.Terms,
                 ClientNameAsRead = fields?.ClientName,
                 RawText = fields?.RawText,
-                FieldsJson = fields is null ? null : JsonSerializer.Serialize(fields),
+                // RawText is excluded here — it's already stored verbatim in the RawText column,
+                // and duplicating it into every FieldsJson row would bloat the structured payload
+                // with the same large document text FieldsJson exists to be distinct from.
+                FieldsJson = fields is null ? null : JsonSerializer.Serialize(new
+                {
+                    fields.InvoiceNumber,
+                    fields.SalesOrder,
+                    fields.InvoiceDate,
+                    fields.DueDate,
+                    fields.Total,
+                    fields.ClientName,
+                    fields.CustomerPO,
+                    fields.CustomerNumber,
+                    fields.OrderAccount,
+                    fields.Terms
+                }),
                 ExtractionMethod = extraction?.Method,
                 ExtractionPromptId = extraction?.ExtractionPromptId,
                 Status = status,
