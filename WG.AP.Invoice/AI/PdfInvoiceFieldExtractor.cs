@@ -51,7 +51,7 @@ public sealed class PdfInvoiceFieldExtractor(OllamaClient ollamaClient, ILogger<
                     + "Seed dbo.ExtractionPrompt for the format, or check that the client resolved to one.");
             }
 
-            var prompt = BuildPrompt(request.PromptTemplate, auditText);
+            var prompt = BuildPrompt(request.PromptTemplate, BuildOllamaDocumentText(auditText, naturalOrderText));
 
             // The schema is stored as text and forwarded as parsed JSON, so what reaches Ollama is what
             // was reviewed in the seed script rather than a re-serialisation of it.
@@ -97,6 +97,32 @@ public sealed class PdfInvoiceFieldExtractor(OllamaClient ollamaClient, ILogger<
 
         return (naturalOrderText, auditText);
     }
+
+    /// <summary>
+    /// Builds the text sent to Ollama as <c>{{DocumentText}}</c>, distinct from <c>auditText</c> alone.
+    /// </summary>
+    /// <remarks>
+    /// <c>auditText</c> (<see cref="ContentOrderTextExtractor"/>'s Y-position line reconstruction) can
+    /// scramble a multi-field label/value block on some layouts - confirmed against a real SanMar
+    /// invoice where a group of three values printed before their three labels, so a label was
+    /// immediately followed by the start of the NEXT field rather than its own value, and Ollama
+    /// reported the field missing even though it was printed on the document. <c>naturalOrderText</c>
+    /// (content-stream draw order) happens to preserve correct label/value adjacency for that same
+    /// group - which is exactly why <see cref="SanmarPdfHeaderExtractor"/> is built on it - though
+    /// that is a documented property of SanMar's specific template, not a general guarantee for every
+    /// vendor's PDF. Appending it as a second copy, rather than replacing <c>auditText</c> with it,
+    /// keeps the readable reading-order text as the primary view (v2 of the seeded prompt tells the
+    /// model to check both when a field seems missing) without betting the whole extraction on
+    /// content-stream order being correct for an unknown layout.
+    /// <para>
+    /// <c>dbo.Invoice.RawText</c> (<c>auditText</c> alone) is intentionally unaffected - it is the
+    /// audit trail a human reads back, not the model's literal input.
+    /// </para>
+    /// </remarks>
+    internal static string BuildOllamaDocumentText(string auditText, string naturalOrderText) =>
+        $"{auditText}{Environment.NewLine}{Environment.NewLine}"
+        + $"=== Same document, raw order (a value separated from its label above may appear here instead) ==={Environment.NewLine}"
+        + naturalOrderText;
 
     /// <summary>
     /// Substitutes the document text into the stored prompt template.

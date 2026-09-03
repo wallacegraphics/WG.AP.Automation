@@ -151,7 +151,7 @@ public sealed class APProcessor(
     /// The routing rules, in the order they are applied:
     /// <list type="bullet">
     /// <item>no PDF attachments — including Excel-only mail — is <c>MailSkipped</c>, routed to NeedsReview</item>
-    /// <item>a PDF that cannot be parsed, or a total that is null, zero or negative, is <c>MailError</c></item>
+    /// <item>a PDF that cannot be parsed at all is <c>MailError</c></item>
     /// <item>a missing required field, an unresolved client, or a duplicate number is <c>MailNeedsReview</c></item>
     /// <item>everything present and readable is <c>MailProcessed</c></item>
     /// </list>
@@ -288,13 +288,17 @@ public sealed class APProcessor(
     /// Decides an invoice's status from its extracted fields.
     /// </summary>
     /// <remarks>
-    /// The five required fields are client, invoice date, invoice number, customer PO and total.
-    /// A total that is null, zero or negative is an <em>error</em> rather than a review, because that
-    /// is not a low-confidence read of a real number — it is a wrong one.
+    /// The required fields checked here are client, invoice date, invoice number, and customer PO.
+    /// Total's sign or magnitude is not evaluated here: zero and negative totals are valid,
+    /// correctly-extracted data (e.g. a credit memo prints a negative total by design) and must not
+    /// be converted to a positive value or treated as an error anywhere in this pipeline.
     /// <para>
-    /// <c>CK_Invoice_ExtractedIsComplete</c> enforces the same rule in the database, so the two cannot
-    /// drift into disagreement: were this method to mark an incomplete row as extracted, the insert
-    /// would fail rather than quietly storing something that claims to be complete.
+    /// <c>CK_Invoice_ExtractedIsComplete</c> only requires <c>Total IS NOT NULL</c>, not <c>&gt; 0</c>,
+    /// so the two still cannot drift into disagreement: were this method to mark an incomplete row as
+    /// extracted, the insert would fail rather than quietly storing something that claims to be
+    /// complete. A NULL total can still only reach the database via the separate "extraction threw
+    /// before producing any <see cref="InvoiceFields"/>" path, which records <c>InvoiceError</c>
+    /// directly without going through this method at all.
     /// </para>
     /// </remarks>
     internal static (ApStatus InvoiceStatus, ApStatus MailStatus, string? Reason) Classify(
@@ -302,11 +306,6 @@ public sealed class APProcessor(
         InvoiceFields fields,
         string fileName)
     {
-        if (fields.Total <= 0m)
-        {
-            return (ApStatus.InvoiceError, ApStatus.MailError, $"'{fileName}': total read as {fields.Total}.");
-        }
-
         var missing = new List<string>();
 
         if (!client.IsKnown)
