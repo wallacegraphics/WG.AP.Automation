@@ -352,6 +352,24 @@ BEGIN CATCH
                 ELSE CONCAT('FAIL - expected 547, got ', ERROR_NUMBER()) END;
 END CATCH
 
+-- FieldsJson must be well-formed JSON when present.
+INSERT INTO dbo.MailAttachment (MailMessageId, GraphAttachmentId, FileName, SizeInBytes)
+VALUES (@MsgId, N'att-badjson', N'badjson.pdf', 512);
+DECLARE @BadJsonAtt BIGINT = SCOPE_IDENTITY();
+
+BEGIN TRY
+    INSERT INTO dbo.Invoice (MailMessageId, MailAttachmentId, ClientId, InvoiceNumber, StatusId, FieldsJson)
+    VALUES (@MsgId, @BadJsonAtt, 1, N'E-BADJSON', 20, N'not json');
+    INSERT INTO @Result (Area, TestName, Outcome)
+    VALUES ('Invoice', 'malformed FieldsJson rejected', 'FAIL - the insert succeeded');
+END TRY
+BEGIN CATCH
+    INSERT INTO @Result (Area, TestName, Outcome)
+    SELECT 'Invoice', 'malformed FieldsJson rejected',
+           CASE WHEN ERROR_NUMBER() = 547 THEN 'PASS'
+                ELSE CONCAT('FAIL - expected 547, got ', ERROR_NUMBER()) END;
+END CATCH
+
 -------------------------------------------------------------------------------
 -- Client and prompt configuration
 -------------------------------------------------------------------------------

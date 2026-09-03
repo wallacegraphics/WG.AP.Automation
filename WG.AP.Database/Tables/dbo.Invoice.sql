@@ -71,6 +71,12 @@ CREATE TABLE [dbo].[Invoice]
     [ClientNameAsRead]   NVARCHAR(200) NULL,   -- what the PDF/model said, before mapping to ClientId
     [RawText]            NVARCHAR(MAX) NULL,   -- InvoiceFields.RawText: the audit copy and prompt input
 
+    -- InvoiceFields serialized to JSON (System.Text.Json), verbatim as it will be sent to
+    -- WG.AP.Integrations.Pace. Distinct from RawText: RawText is the plain extracted document
+    -- text fed *into* extraction; FieldsJson is the structured result that comes *out* of it.
+    -- NULL when extraction never produced an InvoiceFields (e.g. InvoiceError before extraction ran).
+    [FieldsJson]         NVARCHAR(MAX) NULL,
+
     [ExtractionMethod]   VARCHAR(10)   NULL,   -- Regex | Ollama
     [ExtractionPromptId] INT           NULL,   -- which prompt version, when Ollama
     [StatusId]           INT           NOT NULL,
@@ -101,6 +107,8 @@ CREATE TABLE [dbo].[Invoice]
     CONSTRAINT [CK_Invoice_Method]     CHECK ([ExtractionMethod] IS NULL
                                               OR ([ExtractionMethod] = 'Ollama'
                                                   OR [ExtractionMethod] = 'Regex')),
+
+    CONSTRAINT [CK_Invoice_FieldsJson] CHECK ([FieldsJson] IS NULL OR ISJSON([FieldsJson]) = 1),
 
     -- InvoiceExtracted (21) cannot mean anything looser than "all five required fields
     -- present". Client, InvoiceDate, InvoiceNumber and CustomerPO missing is a review; a

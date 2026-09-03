@@ -82,8 +82,11 @@ invoice numbers the same invoice".
 | failed | `MailError` | `IsFinal = 1` |
 | deleted | `MailDeleted` | Not reachable yet — see *Known gaps* |
 
-**`MailSkipped` is why this table has to exist.** Skipped mail is left in the Inbox, so no folder move
-records the decision. The row is the only thing stopping it being re-classified on every run.
+**`MailDeleted` is why this table has to exist.** A message the mailbox has already removed is left
+where it is — there's nothing to move it into — so no folder move records the decision. The row is the
+only thing stopping it being re-classified on every run. (`MailSkipped` used to be the example here; it
+now routes to `NeedsReview` like everything else that needs a human look, so it no longer stays in the
+Inbox.)
 
 All of it depends on Graph immutable ids (`Prefer: IdType="ImmutableId"`, applied by
 `GraphMailboxProcessor.ApplyImmutableId`). Without that header a message's id changes when it is moved

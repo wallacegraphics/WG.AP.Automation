@@ -28,14 +28,27 @@ public sealed class ApplicationLogRepository(SqlConnectionFactory connectionFact
 
         await using var connection = await connectionFactory.OpenAsync(cancellationToken);
 
+        var appIdentity = connectionFactory.AppIdentity;
+        var parameters = entries.Select(entry => new
+        {
+            entry.LoggedOn,
+            entry.LogLevel,
+            entry.Category,
+            entry.Message,
+            entry.Exception,
+            entry.ProcessingRunId,
+            entry.MailMessageId,
+            CreatedBy = appIdentity
+        });
+
         await connection.ExecuteAsync(new CommandDefinition(
             """
             INSERT INTO [dbo].[ApplicationLog]
-                ([LoggedOn], [LogLevel], [Category], [Message], [Exception], [ProcessingRunId], [MailMessageId])
+                ([LoggedOn], [LogLevel], [Category], [Message], [Exception], [ProcessingRunId], [MailMessageId], [CreatedBy])
             VALUES
-                (@LoggedOn, @LogLevel, @Category, @Message, @Exception, @ProcessingRunId, @MailMessageId);
+                (@LoggedOn, @LogLevel, @Category, @Message, @Exception, @ProcessingRunId, @MailMessageId, @CreatedBy);
             """,
-            entries,
+            parameters,
             commandTimeout: connectionFactory.CommandTimeoutSeconds,
             cancellationToken: cancellationToken));
     }

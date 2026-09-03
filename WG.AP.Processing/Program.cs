@@ -57,6 +57,7 @@ builder.Services
     .Bind(builder.Configuration.GetSection(DatabaseOptions.SectionName))
     .Validate(options => !string.IsNullOrWhiteSpace(options.ConnectionString), $"{DatabaseOptions.SectionName}:ConnectionString is required.")
     .Validate(options => options.MaxAttempts >= 1, $"{DatabaseOptions.SectionName}:MaxAttempts must be 1 or greater.")
+    .Validate(options => !string.IsNullOrWhiteSpace(options.AppIdentity), $"{DatabaseOptions.SectionName}:AppIdentity is required.")
     .ValidateOnStart();
 
 // FileStorageOptionsValidator replaces the usual inline .Validate() lambda: "not empty" is not the

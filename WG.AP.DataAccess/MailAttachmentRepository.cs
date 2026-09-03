@@ -44,8 +44,8 @@ public sealed class MailAttachmentRepository(
                 var mailAttachmentId = await connection.QuerySingleAsync<long>(new CommandDefinition(
                     """
                     INSERT INTO [dbo].[MailAttachment]
-                        ([MailMessageId], [GraphAttachmentId], [FileName], [ContentType], [SizeInBytes])
-                    SELECT @MailMessageId, @GraphAttachmentId, @FileName, @ContentType, @SizeInBytes
+                        ([MailMessageId], [GraphAttachmentId], [FileName], [ContentType], [SizeInBytes], [CreatedBy])
+                    SELECT @MailMessageId, @GraphAttachmentId, @FileName, @ContentType, @SizeInBytes, @AppIdentity
                      WHERE NOT EXISTS (SELECT 1 FROM [dbo].[MailAttachment] WITH (UPDLOCK, HOLDLOCK)
                                         WHERE [MailMessageId] = @MailMessageId
                                           AND [GraphAttachmentId] = @GraphAttachmentId);
@@ -61,7 +61,8 @@ public sealed class MailAttachmentRepository(
                         GraphAttachmentId = attachment.Id,
                         FileName = MailMessageRepository.Truncate(attachment.Name, 400),
                         ContentType = MailMessageRepository.Truncate(attachment.ContentType, 200),
-                        SizeInBytes = attachment.SizeInBytes
+                        SizeInBytes = attachment.SizeInBytes,
+                        AppIdentity = connectionFactory.AppIdentity
                     },
                     commandTimeout: connectionFactory.CommandTimeoutSeconds,
                     cancellationToken: cancellationToken));
@@ -99,7 +100,7 @@ public sealed class MailAttachmentRepository(
                 UPDATE [dbo].[MailAttachment]
                    SET [StoredPath]    = @StoredPath,
                        [ContentSha256] = @ContentSha256,
-                       [ModifiedBy]    = SUSER_SNAME(),
+                       [ModifiedBy]    = @AppIdentity,
                        [ModifiedOn]    = SYSUTCDATETIME()
                  WHERE [MailAttachmentId] = @MailAttachmentId;
                 """,
@@ -107,7 +108,8 @@ public sealed class MailAttachmentRepository(
                 {
                     MailAttachmentId = mailAttachmentId,
                     StoredPath = storedPath,
-                    ContentSha256 = contentSha256
+                    ContentSha256 = contentSha256,
+                    AppIdentity = connectionFactory.AppIdentity
                 },
                 commandTimeout: connectionFactory.CommandTimeoutSeconds,
                 cancellationToken: cancellationToken));

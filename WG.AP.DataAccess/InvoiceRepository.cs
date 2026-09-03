@@ -44,13 +44,13 @@ public sealed class InvoiceRepository(
                 INSERT INTO [dbo].[Invoice]
                     ([MailMessageId], [MailAttachmentId], [ClientId], [InvoiceFormatId],
                      [InvoiceNumber], [InvoiceDate], [DueDate], [Total], [SalesOrder], [CustomerPO],
-                     [CustomerNumber], [OrderAccount], [Terms], [ClientNameAsRead], [RawText],
-                     [ExtractionMethod], [ExtractionPromptId], [StatusId], [ErrorMessage])
+                     [CustomerNumber], [OrderAccount], [Terms], [ClientNameAsRead], [RawText], [FieldsJson],
+                     [ExtractionMethod], [ExtractionPromptId], [StatusId], [ErrorMessage], [CreatedBy])
                 VALUES
                     (@MailMessageId, @MailAttachmentId, @ClientId, @InvoiceFormatId,
                      @InvoiceNumber, @InvoiceDate, @DueDate, @Total, @SalesOrder, @CustomerPO,
-                     @CustomerNumber, @OrderAccount, @Terms, @ClientNameAsRead, @RawText,
-                     @ExtractionMethod, @ExtractionPromptId, @StatusId, @ErrorMessage);
+                     @CustomerNumber, @OrderAccount, @Terms, @ClientNameAsRead, @RawText, @FieldsJson,
+                     @ExtractionMethod, @ExtractionPromptId, @StatusId, @ErrorMessage, @CreatedBy);
 
                 SELECT CONVERT(BIGINT, SCOPE_IDENTITY());
                 """,
@@ -71,10 +71,12 @@ public sealed class InvoiceRepository(
                     Terms = MailMessageRepository.Truncate(invoice.Terms, 100),
                     ClientNameAsRead = MailMessageRepository.Truncate(invoice.ClientNameAsRead, 200),
                     invoice.RawText,
+                    invoice.FieldsJson,
                     invoice.ExtractionMethod,
                     invoice.ExtractionPromptId,
                     StatusId = (int)invoice.Status,
-                    ErrorMessage = MailMessageRepository.Truncate(invoice.ErrorMessage, 1000)
+                    ErrorMessage = MailMessageRepository.Truncate(invoice.ErrorMessage, 1000),
+                    CreatedBy = connectionFactory.AppIdentity
                 },
                 commandTimeout: connectionFactory.CommandTimeoutSeconds,
                 cancellationToken: cancellationToken));

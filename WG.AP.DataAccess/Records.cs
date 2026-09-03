@@ -66,6 +66,7 @@ public sealed record InvoiceRecord
     public string? Terms { get; init; }
     public string? ClientNameAsRead { get; init; }
     public string? RawText { get; init; }
+    public string? FieldsJson { get; init; }
     public string? ExtractionMethod { get; init; }
     public int? ExtractionPromptId { get; init; }
     public required ApStatus Status { get; init; }

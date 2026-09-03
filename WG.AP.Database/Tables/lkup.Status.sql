@@ -13,9 +13,10 @@
 -- code change.
 --
 -- MailFolder is the destination folder for a message that reaches this status, and NULL
--- means "leave it in the Inbox" (which is how MailSkipped works). Folder display names
--- are the MailDestinationFolder enum member names by contract - GraphMailboxProcessor
--- .EnsureFoldersExistAsync creates them with destination.ToString().
+-- means "leave it in the Inbox" (which is how MailDeleted works, since the mailbox has
+-- already removed the message). Folder display names are the MailDestinationFolder enum
+-- member names by contract - GraphMailboxProcessor.EnsureFoldersExistAsync creates them
+-- with destination.ToString().
 CREATE TABLE [lkup].[Status]
 (
     [StatusId]   INT           NOT NULL,

@@ -5,14 +5,15 @@
     dbo.MailMessage / dbo.Invoice constrain themselves to their band. Never renumber.
 
     Mail statuses map 1:1 onto the routing tree in APProcessor:
-        no PDF attachments (incl. Excel-only mail)   -> MailSkipped     (left in Inbox)
+        no PDF attachments (incl. Excel-only mail)   -> MailSkipped     -> NeedsReview
         PDF unparseable, or Total <= 0               -> MailError
         Client/InvoiceDate/InvoiceNumber/CustomerPO
             missing, duplicate number, 3rd attempt   -> MailNeedsReview
         all five required fields present             -> MailProcessed
 
     IsFinal = 1 means the claim UPDATE will never pick the row up again.
-    MailFolder NULL means "leave it in the Inbox".
+    MailFolder NULL means "leave it in the Inbox" (e.g. MailDeleted, which the mailbox has
+    already removed the message from).
 */
 SET NOCOUNT ON;
 
@@ -32,7 +33,7 @@ VALUES
     (11, 'MailProcessed',      N'Processed',               1, N'Processed'),
     (12, 'MailNeedsReview',    N'Needs review',            1, N'NeedsReview'),
     (13, 'MailError',          N'Error',                   1, N'Errors'),
-    (14, 'MailSkipped',        N'Skipped - not an invoice', 1, NULL),
+    (14, 'MailSkipped',        N'Skipped - not an invoice', 1, N'NeedsReview'),
     (15, 'MailDuplicate',      N'Duplicate email',         1, N'Errors'),
     (16, 'MailDeleted',        N'Deleted in mailbox',      1, NULL),
     -- Invoice: 20-29

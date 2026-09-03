@@ -57,8 +57,8 @@ public sealed class MailMessageRepository(
                     CONCAT(CONVERT(CHAR(36), @MailboxId), N'|', @GraphMessageId)));
 
                 INSERT INTO [dbo].[MailMessage]
-                    ([ProcessingRunId], [MailboxId], [GraphMessageId], [SenderAddress], [Subject], [ReceivedOn], [StatusId])
-                SELECT @ProcessingRunId, @MailboxId, @GraphMessageId, @SenderAddress, @Subject, @ReceivedOn, @NewStatusId
+                    ([ProcessingRunId], [MailboxId], [GraphMessageId], [SenderAddress], [Subject], [ReceivedOn], [StatusId], [CreatedBy])
+                SELECT @ProcessingRunId, @MailboxId, @GraphMessageId, @SenderAddress, @Subject, @ReceivedOn, @NewStatusId, @AppIdentity
                  WHERE NOT EXISTS (SELECT 1 FROM [dbo].[MailMessage] WITH (UPDLOCK, HOLDLOCK)
                                     WHERE [MessageKeyHash] = @Hash);
 
@@ -66,7 +66,7 @@ public sealed class MailMessageRepository(
                    SET [AttemptCount]    = m.[AttemptCount] + 1,
                        [LastAttemptOn]   = SYSUTCDATETIME(),
                        [ProcessingRunId] = @ProcessingRunId,
-                       [ModifiedBy]      = SUSER_SNAME(),
+                       [ModifiedBy]      = @AppIdentity,
                        [ModifiedOn]      = SYSUTCDATETIME()
                   FROM [dbo].[MailMessage] AS m
                   JOIN [lkup].[Status]     AS s ON s.[StatusId] = m.[StatusId]
@@ -87,7 +87,8 @@ public sealed class MailMessageRepository(
                     SenderAddress = message.SenderAddress,
                     Subject = Truncate(message.Subject, 500),
                     ReceivedOn = message.ReceivedDateTime,
-                    NewStatusId = (int)ApStatus.MailNew
+                    NewStatusId = (int)ApStatus.MailNew,
+                    AppIdentity = connectionFactory.AppIdentity
                 },
                 commandTimeout: connectionFactory.CommandTimeoutSeconds,
                 cancellationToken: cancellationToken));
@@ -115,7 +116,7 @@ public sealed class MailMessageRepository(
                 UPDATE [dbo].[MailMessage]
                    SET [StatusId]     = @StatusId,
                        [ErrorMessage] = @ErrorMessage,
-                       [ModifiedBy]   = SUSER_SNAME(),
+                       [ModifiedBy]   = @AppIdentity,
                        [ModifiedOn]   = SYSUTCDATETIME()
                  WHERE [MailMessageId] = @MailMessageId;
                 """,
@@ -123,7 +124,8 @@ public sealed class MailMessageRepository(
                 {
                     MailMessageId = mailMessageId,
                     StatusId = (int)status,
-                    ErrorMessage = Truncate(errorMessage, 1000)
+                    ErrorMessage = Truncate(errorMessage, 1000),
+                    AppIdentity = connectionFactory.AppIdentity
                 },
                 commandTimeout: connectionFactory.CommandTimeoutSeconds,
                 cancellationToken: cancellationToken));
@@ -139,7 +141,7 @@ public sealed class MailMessageRepository(
     /// Loads which mail folder each status routes to. Null means "leave the message in the Inbox".
     /// </summary>
     /// <remarks>
-    /// Read from <c>lkup.Status.MailFolder</c> rather than switched on in C#, so "MailSkipped stays in
+    /// Read from <c>lkup.Status.MailFolder</c> rather than switched on in C#, so "MailDeleted stays in
     /// the Inbox" is data — which is also what lets a fourth folder be introduced later by updating
     /// one lookup row. Loaded once per run rather than per message: it cannot change mid-run, and a
     /// round trip per message would buy nothing.
