@@ -110,3 +110,85 @@ BEGIN
     -- historical invoices point at, so this is a no-op rather than an UPDATE.
     PRINT CONCAT('dbo.ExtractionPrompt: ', @FormatCode, ' v', @Version, ' already present; left unchanged.');
 END
+
+-------------------------------------------------------------------------------
+-- Version 2: adds a rule about non-adjacent labels/values.
+--
+-- ContentOrderTextExtractor (the Y-position line reconstruction PdfInvoiceFieldExtractor
+-- feeds to Ollama as {{DocumentText}}) can scramble a multi-field label/value block on some
+-- layouts - e.g. three values printing before their three labels, so a label is immediately
+-- followed by the START OF THE NEXT field rather than its own value. Confirmed against a
+-- real SanMar invoice where this caused CustomerPO to be reported missing even though it was
+-- printed on the document. PdfInvoiceFieldExtractor now also appends the PDF's raw
+-- content-stream-order text (naturalOrderText) after the reading-order text for exactly this
+-- reason - this version's added rule tells the model to actually use that second copy rather
+-- than stopping at the first.
+-------------------------------------------------------------------------------
+DECLARE @VersionV2 INT = 2;
+
+DECLARE @PromptTemplateV2 NVARCHAR(MAX) = N'Extract fields from this invoice text.
+
+Return only valid JSON with exactly these keys:
+{
+  "InvoiceNumber": "",
+  "SalesOrder": "",
+  "InvoiceDate": "",
+  "DueDate": "",
+  "Total": 0,
+  "VendorName": "",
+  "CustomerPO": "",
+  "CustomerNumber": "",
+  "OrderAccount": "",
+  "Terms": ""
+}
+
+Rules:
+- InvoiceNumber is the invoice/voucher number the vendor assigned (example: INV-162393962 or CR-005662167).
+- VendorName is the supplier/company shown in the logo/header.
+- Total is the invoice''s printed total amount due (may be labeled "Total", "Total Due", or "Subtotal amount"). Report it exactly as printed, including a negative sign if the document shows one (e.g. a credit memo) - never convert it to a positive number.
+- CustomerPO is the customer''s purchase order reference (may be labeled "Customer PO", "PO Number", or "Customer Purchase Order").
+- CustomerNumber is the vendor-assigned customer account identifier (may be labeled "Customer Number", "Customer Account", or "Account #").
+- OrderAccount is the account the specific order was placed under (may be labeled "Order Account" or "Account Number"); it is often the same value as CustomerNumber.
+- Terms is the payment terms printed on the invoice (may be labeled "Terms" or "Terms of Payment"), e.g. "Net60".
+- Match fields by meaning, not by exact label text - vendors phrase these labels differently and that phrasing isn''t controlled.
+- A label and its value are not always adjacent in the text below - some layouts print a group of labels together and their values together elsewhere, in the same relative order. The document text may be provided twice, in two different word orders, specifically so a value separated from its label in one copy can still be found in the other. Check the entire document, including both copies if present, before concluding a field is missing.
+- Dates should be returned exactly as printed on the document.
+- If a field is missing, keep empty string, and 0 for Total.
+- Total must be numeric only.
+
+Document:
+{{DocumentText}}';
+
+SET @PromptTemplateV2 = REPLACE(REPLACE(@PromptTemplateV2, CHAR(13) + CHAR(10), CHAR(10)),
+                                CHAR(10), CHAR(13) + CHAR(10));
+
+IF NOT EXISTS (SELECT 1 FROM [dbo].[ExtractionPrompt]
+                WHERE [InvoiceFormatId] = @InvoiceFormatId AND [Version] = @VersionV2)
+BEGIN
+    -- Deactivate the previous version FIRST. UQ_ExtractionPrompt_OneActive allows only one
+    -- IsActive=1 row per format at any instant - inserting v2 as active before v1 is
+    -- deactivated makes both rows active simultaneously and the INSERT itself violates the
+    -- index (confirmed: this is not a hypothetical, it happened on the first publish attempt
+    -- and left v1 deactivated with no active row at all, because the failed INSERT aborted
+    -- but the batch continued to this UPDATE regardless). This UPDATE is a no-op, not an
+    -- error, if v1 is already inactive - e.g. on a retry after that exact failure.
+    UPDATE [dbo].[ExtractionPrompt]
+       SET [IsActive] = 0
+     WHERE [InvoiceFormatId] = @InvoiceFormatId AND [Version] = @Version AND [IsActive] = 1;
+
+    INSERT INTO [dbo].[ExtractionPrompt]
+        ([InvoiceFormatId], [Version], [PromptTemplate], [ResponseSchemaJson],
+         [ModelName], [IsActive], [Notes])
+    VALUES
+        (@InvoiceFormatId, @VersionV2, @PromptTemplateV2, @ResponseSchemaJson,
+         @ModelName, 1,
+         N'Adds: Total must preserve a negative sign rather than being converted to positive; '
+         + N'and a rule telling the model that labels/values may be non-adjacent and the document '
+         + N'text may be provided twice in different word orders.');
+
+    PRINT CONCAT('dbo.ExtractionPrompt: inserted ', @FormatCode, ' v', @VersionV2, ' (active); deactivated v', @Version, '.');
+END
+ELSE
+BEGIN
+    PRINT CONCAT('dbo.ExtractionPrompt: ', @FormatCode, ' v', @VersionV2, ' already present; left unchanged.');
+END

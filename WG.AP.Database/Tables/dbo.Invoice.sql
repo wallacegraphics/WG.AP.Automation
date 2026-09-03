@@ -111,22 +111,22 @@ CREATE TABLE [dbo].[Invoice]
     CONSTRAINT [CK_Invoice_FieldsJson] CHECK ([FieldsJson] IS NULL OR ISJSON([FieldsJson]) = 1),
 
     -- InvoiceExtracted (21) cannot mean anything looser than "all five required fields
-    -- present". Client, InvoiceDate, InvoiceNumber and CustomerPO missing is a review; a
-    -- Total that is null, zero or negative is an error, because that is not a
-    -- low-confidence read, it is a wrong one.
+    -- present". Client, InvoiceDate, InvoiceNumber and CustomerPO missing is a review.
+    -- Total's sign/magnitude is NOT part of "complete": a zero or negative total (e.g. a
+    -- credit memo) is valid, correctly-extracted data, not a low-confidence read - only its
+    -- presence is required. Do not add a positivity check back here; APProcessor.Classify
+    -- makes the matching call on the C# side, and the two must not drift apart.
     --
-    -- Total needs BOTH the IS NOT NULL and the > 0. A CHECK constraint rejects only on
-    -- FALSE, and NULL > 0 evaluates to UNKNOWN, so `[Total] > 0` on its own lets a null
-    -- Total through - which is the one value most likely to appear when extraction quietly
-    -- failed. Tests\constraints.sql covers this case for exactly that reason.
+    -- Total still needs the IS NOT NULL: a NULL total can only reach this table via the
+    -- separate "extraction threw before producing any InvoiceFields" path in APProcessor,
+    -- which is exactly when extraction quietly failed. Tests\constraints.sql covers this.
     CONSTRAINT [CK_Invoice_ExtractedIsComplete] CHECK (
         [StatusId] <> 21
         OR ([ClientId] > 0
             AND [InvoiceNumber] IS NOT NULL
             AND [InvoiceDate]   IS NOT NULL
             AND [CustomerPO]    IS NOT NULL
-            AND [Total]         IS NOT NULL
-            AND [Total] > 0))
+            AND [Total]         IS NOT NULL))
 );
 GO
 

@@ -22,18 +22,34 @@ internal static class SeededPrompt
 
     internal static bool SeedScriptExists => File.Exists(FixturePaths.ExtractionPromptSeedScript());
 
+    // Matches @PromptTemplate, @PromptTemplateV2, @PromptTemplateV3, etc. The seed script's own
+    // documented convention (see its header comment) is to APPEND a new "@PromptTemplateVN ... = N'...'"
+    // block per version and deactivate the previous one in the same run - never to edit a version's
+    // literal in place. So the LAST such declaration in the file is always the current one, by
+    // construction of that convention, regardless of how many versions have accumulated.
+    private static readonly Regex PromptTemplateDeclaration =
+        new(@"@PromptTemplate\w*\s+NVARCHAR\(MAX\)\s*=\s*", RegexOptions.Compiled);
+
     private static (string Template, string ResponseSchemaJson) Load()
     {
         var script = File.ReadAllText(FixturePaths.ExtractionPromptSeedScript());
 
+        var templateMatches = PromptTemplateDeclaration.Matches(script);
+
+        if (templateMatches.Count == 0)
+        {
+            throw new InvalidOperationException(
+                "Could not find any '@PromptTemplate... NVARCHAR(MAX) = ' declaration in the seed script. "
+                + "If the seed was restructured, update SeededPrompt.");
+        }
+
+        var lastTemplateMatch = templateMatches[^1];
+
         return (
-            ExtractSqlStringLiteral(script, "@PromptTemplate NVARCHAR(MAX) = "),
+            ExtractSqlStringLiteral(script, lastTemplateMatch.Index + lastTemplateMatch.Length),
             ExtractSqlStringLiteral(script, "@ResponseSchemaJson NVARCHAR(MAX) = "));
     }
 
-    /// <summary>
-    /// Pulls one <c>N'...'</c> literal out of the seed script and undoes T-SQL's quote doubling.
-    /// </summary>
     private static string ExtractSqlStringLiteral(string script, string declarationPrefix)
     {
         var declarationIndex = script.IndexOf(declarationPrefix, StringComparison.Ordinal);
@@ -44,11 +60,20 @@ internal static class SeededPrompt
                 $"Could not find '{declarationPrefix}' in the seed script. If the seed was restructured, update SeededPrompt.");
         }
 
-        var openQuote = script.IndexOf('\'', declarationIndex + declarationPrefix.Length);
+        return ExtractSqlStringLiteral(script, declarationIndex + declarationPrefix.Length);
+    }
+
+    /// <summary>
+    /// Pulls one <c>N'...'</c> literal out of the seed script (starting the search at
+    /// <paramref name="searchFrom"/>) and undoes T-SQL's quote doubling.
+    /// </summary>
+    private static string ExtractSqlStringLiteral(string script, int searchFrom)
+    {
+        var openQuote = script.IndexOf('\'', searchFrom);
 
         if (openQuote < 0)
         {
-            throw new InvalidOperationException($"No opening quote after '{declarationPrefix}'.");
+            throw new InvalidOperationException($"No opening quote found after position {searchFrom}.");
         }
 
         // Walk to the closing quote, treating '' as an escaped single quote rather than a terminator.
@@ -73,7 +98,7 @@ internal static class SeededPrompt
 
         if (index >= script.Length)
         {
-            throw new InvalidOperationException($"Unterminated string literal after '{declarationPrefix}'.");
+            throw new InvalidOperationException($"Unterminated string literal starting at position {openQuote}.");
         }
 
         var raw = script[(openQuote + 1)..index].Replace("''", "'");

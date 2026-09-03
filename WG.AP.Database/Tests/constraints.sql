@@ -282,12 +282,12 @@ END CATCH
 -------------------------------------------------------------------------------
 DECLARE @Cases TABLE (Ord INT IDENTITY(1,1), Label VARCHAR(80), ClientId INT,
                       Num NVARCHAR(100), Dt DATE, PO NVARCHAR(200), Total DECIMAL(19,4));
+-- Total's sign/magnitude is NOT part of "complete" (see dbo.Invoice.sql /
+-- APProcessor.Classify) - a zero or negative total is valid data, only NULL is rejected.
 INSERT INTO @Cases (Label, ClientId, Num, Dt, PO, Total) VALUES
     ('missing CustomerPO',   1, N'E-1', '2026-09-01', NULL,    100.00),
     ('missing InvoiceDate',  1, N'E-2', NULL,         N'PO-1', 100.00),
     ('missing InvoiceNumber',1, NULL,   '2026-09-01', N'PO-1', 100.00),
-    ('Total = 0',            1, N'E-4', '2026-09-01', N'PO-1', 0.00),
-    ('Total negative',       1, N'E-5', '2026-09-01', N'PO-1', -5.00),
     ('Total NULL',           1, N'E-6', '2026-09-01', N'PO-1', NULL),
     ('client unresolved',    0, N'E-7', '2026-09-01', N'PO-1', 100.00);
 
@@ -336,6 +336,43 @@ END TRY
 BEGIN CATCH
     INSERT INTO @Result (Area, TestName, Outcome)
     SELECT 'Invoice', 'Extracted accepts a complete row',
+           CONCAT('FAIL - rejected with ', ERROR_NUMBER(), ': ', ERROR_MESSAGE());
+END CATCH
+
+-- A zero or negative total (e.g. a credit memo) must be ACCEPTED as a complete, extracted
+-- row - explicit regression coverage in this direction too, not just an absence of a
+-- rejection test. See dbo.Invoice.sql's CK_Invoice_ExtractedIsComplete comment.
+INSERT INTO dbo.MailAttachment (MailMessageId, GraphAttachmentId, FileName, SizeInBytes)
+VALUES (@MsgId, N'att-zero-total', N'zero-total.pdf', 512);
+DECLARE @ZeroTotalAtt BIGINT = SCOPE_IDENTITY();
+
+BEGIN TRY
+    INSERT INTO dbo.Invoice (MailMessageId, MailAttachmentId, ClientId, InvoiceNumber,
+                             InvoiceDate, CustomerPO, Total, StatusId, ExtractionMethod)
+    VALUES (@MsgId, @ZeroTotalAtt, 1, N'E-ZERO', '2026-09-01', N'PO-1', 0.00, 21, 'Regex');
+    INSERT INTO @Result (Area, TestName, Outcome)
+    VALUES ('Invoice', 'Extracted accepts a zero total', 'PASS');
+END TRY
+BEGIN CATCH
+    INSERT INTO @Result (Area, TestName, Outcome)
+    SELECT 'Invoice', 'Extracted accepts a zero total',
+           CONCAT('FAIL - rejected with ', ERROR_NUMBER(), ': ', ERROR_MESSAGE());
+END CATCH
+
+INSERT INTO dbo.MailAttachment (MailMessageId, GraphAttachmentId, FileName, SizeInBytes)
+VALUES (@MsgId, N'att-negative-total', N'negative-total.pdf', 512);
+DECLARE @NegativeTotalAtt BIGINT = SCOPE_IDENTITY();
+
+BEGIN TRY
+    INSERT INTO dbo.Invoice (MailMessageId, MailAttachmentId, ClientId, InvoiceNumber,
+                             InvoiceDate, CustomerPO, Total, StatusId, ExtractionMethod)
+    VALUES (@MsgId, @NegativeTotalAtt, 1, N'E-NEG', '2026-09-01', N'PO-1', -5.00, 21, 'Regex');
+    INSERT INTO @Result (Area, TestName, Outcome)
+    VALUES ('Invoice', 'Extracted accepts a negative total', 'PASS');
+END TRY
+BEGIN CATCH
+    INSERT INTO @Result (Area, TestName, Outcome)
+    SELECT 'Invoice', 'Extracted accepts a negative total',
            CONCAT('FAIL - rejected with ', ERROR_NUMBER(), ': ', ERROR_MESSAGE());
 END CATCH
 

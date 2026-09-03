@@ -36,7 +36,13 @@ public static class SanmarPdfHeaderExtractor
     // negative lookahead skips the line-item case-count line ("Total 1.00 cases"). The last match in
     // the document is the grand total (confirmed against real invoices - it prints once more, alone,
     // near the end of the page, after the "Total <count> cases" / subtotal block).
-    private static readonly Regex TotalRegex = new(@"\bTotal\b\s+(?<amount>\d+\.\d{2})\b(?!\s+[Cc]ases)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    //
+    // The amount group allows comma thousands-separators (e.g. "1,320.00") - a plain \d+ silently
+    // fails to match any total >= $1,000 at all (not a wrong parse, zero matches), which sent every
+    // such invoice to Ollama misclassified as "layout not recognized" rather than a bad total read.
+    // decimal.Parse below needs no change: CultureInfo.InvariantCulture's default NumberStyles.Number
+    // already accepts comma-grouped digits.
+    private static readonly Regex TotalRegex = new(@"\bTotal\b\s+(?<amount>\d{1,3}(?:,\d{3})*\.\d{2})\b(?!\s+[Cc]ases)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     public static InvoiceFields? TryExtract(string naturalOrderText)
     {

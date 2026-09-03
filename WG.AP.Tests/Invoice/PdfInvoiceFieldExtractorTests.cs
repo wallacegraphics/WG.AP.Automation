@@ -78,6 +78,25 @@ public class PdfInvoiceFieldExtractorTests
     }
 
     [Fact]
+    public void BuildOllamaDocumentText_IncludesBothAuditTextAndNaturalOrderText()
+    {
+        // ContentOrderTextExtractor's Y-position reconstruction (auditText) can scramble a label/value
+        // block that content-stream order (naturalOrderText) gets right - see the method's own remarks.
+        // Regression coverage: this must not silently regress back to auditText alone, which is what
+        // caused a real CustomerPO to be reported missing despite being present on the document.
+        const string auditText = "Customer PO:\nOrder Account: 76274-0000";
+        const string naturalOrderText = "2513-2494 Customer PO: Order Account: 76274-0000";
+
+        var combined = PdfInvoiceFieldExtractor.BuildOllamaDocumentText(auditText, naturalOrderText);
+
+        Assert.Contains(auditText, combined, StringComparison.Ordinal);
+        Assert.Contains(naturalOrderText, combined, StringComparison.Ordinal);
+        Assert.True(combined.IndexOf(auditText, StringComparison.Ordinal)
+                    < combined.IndexOf(naturalOrderText, StringComparison.Ordinal),
+            "auditText should remain the primary (first) view, with naturalOrderText appended as a supplementary copy.");
+    }
+
+    [Fact]
     public async Task ExtractAsync_WithAPromptConfigured_ReachesOllamaRatherThanReportingAConfigurationGap()
     {
         // The counterpart that makes the test above mean something: with a prompt present, the same

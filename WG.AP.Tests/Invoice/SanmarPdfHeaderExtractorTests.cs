@@ -134,6 +134,23 @@ public class SanmarPdfHeaderExtractorTests
     }
 
     [Fact]
+    public void TryExtract_TotalWithThousandsSeparator_ReturnsCorrectTotal()
+    {
+        // Real shape from INV-163576177.pdf: a 4-digit grand total is printed with a comma
+        // thousands-separator. \d+\.\d{2} previously matched this zero times (not a wrong parse -
+        // no match at all), so FindTotal returned null and the whole document fell back to Ollama
+        // as if its layout were unrecognized.
+        var text = "Invoice Number: INV-1 Sales Order: SO-1 Invoice Date: 1/1/2026 Due Date: 2/1/2026 " +
+            "Customer Number: ACCT-1 Terms: Net30 Customer PO: PO-1 Order Account: ORDERACCT-1 " +
+            "Total 2.00 cases Sales subtotal amount 1,320.00 Total 1,320.00";
+
+        var fields = SanmarPdfHeaderExtractor.TryExtract(text);
+
+        Assert.NotNull(fields);
+        Assert.Equal(1320.00m, fields!.Total);
+    }
+
+    [Fact]
     public void TryExtract_SubtotalLinePresent_DoesNotMatchAsTotal()
     {
         var text = "Invoice Number: INV-1 Sales Order: SO-1 Invoice Date: 1/1/2026 Due Date: 2/1/2026 " +

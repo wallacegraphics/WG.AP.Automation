@@ -57,15 +57,16 @@ public class ProcessorTests
     [InlineData(0)]
     [InlineData(-0.01)]
     [InlineData(-500)]
-    public void Classify_WithATotalThatIsNotPositive_IsAnError(decimal total)
+    public void Classify_WithAZeroOrNegativeTotal_IsExtractedAndProcessed(decimal total)
     {
-        // An error rather than a review, deliberately: a zero or negative total is not a
-        // low-confidence read of a real number, it is a wrong one.
+        // Not an error, deliberately: a zero or negative total (e.g. a credit memo) is valid,
+        // correctly-extracted data - it must never be treated as a review/error signal or converted
+        // to a positive value anywhere in this pipeline.
         var (invoiceStatus, mailStatus, reason) = APProcessor.Classify(KnownClient, Complete(total: total), "INV-1.pdf");
 
-        Assert.Equal(ApStatus.InvoiceError, invoiceStatus);
-        Assert.Equal(ApStatus.MailError, mailStatus);
-        Assert.Contains("total", reason!, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(ApStatus.InvoiceExtracted, invoiceStatus);
+        Assert.Equal(ApStatus.MailProcessed, mailStatus);
+        Assert.Null(reason);
     }
 
     [Fact]
@@ -120,17 +121,6 @@ public class ProcessorTests
         Assert.Contains(nameof(InvoiceFields.InvoiceNumber), reason!);
         Assert.Contains(nameof(InvoiceFields.InvoiceDate), reason!);
         Assert.Contains(nameof(InvoiceFields.CustomerPO), reason!);
-    }
-
-    [Fact]
-    public void Classify_ChecksTheTotalBeforeMissingFields()
-    {
-        // A document with a bad total AND missing fields is an error, not a review: the total is the
-        // stronger signal that the read is wrong rather than merely incomplete.
-        var fields = Complete(invoiceNumber: "", total: 0m);
-        var (invoiceStatus, _, _) = APProcessor.Classify(ClientResolution.Unknown, fields, "INV-1.pdf");
-
-        Assert.Equal(ApStatus.InvoiceError, invoiceStatus);
     }
 
     [Theory]

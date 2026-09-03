@@ -54,9 +54,18 @@ public sealed class OllamaClient
 
             var response = await httpResponse.Content.ReadFromJsonAsync<OllamaGenerateResponse>(cancellationToken);
 
-            return response?.Response is { Length: > 0 } text
-                ? text
-                : throw new InvalidOperationException("Ollama response did not include a non-empty 'response' field.");
+            if (response?.Response is not { Length: > 0 } text)
+            {
+                throw new InvalidOperationException("Ollama response did not include a non-empty 'response' field.");
+            }
+
+            // A 200 OK with a well-formed but WRONG answer (e.g. a hallucinated field, a sign error)
+            // previously left no trace anywhere - only an HTTP failure was ever logged. Debug rather
+            // than Information: this is routine per-call detail, not a run-level event, and it can be
+            // large.
+            _logger.LogDebug("Ollama generate call against {BaseUrl} using model {Model} returned: {Response}", _httpClient.BaseAddress, effectiveModel, text);
+
+            return text;
         }
         catch (Exception exception)
         {

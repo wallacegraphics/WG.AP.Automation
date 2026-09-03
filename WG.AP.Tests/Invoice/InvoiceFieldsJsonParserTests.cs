@@ -55,6 +55,30 @@ public class InvoiceFieldsJsonParserTests
         Assert.Equal(438.90m, fields.Total);
     }
 
+    [Theory]
+    [InlineData("-39.11")]
+    [InlineData("0")]
+    public void Parse_NegativeOrZeroAmountAsString_ParsesThroughUnchanged(string totalText)
+    {
+        // A negative total (e.g. a credit memo) is valid data and must never be converted to a
+        // positive/absolute value by this parser - it is a plain numeric parse, not a business rule.
+        var json = $$"""{"InvoiceNumber": "INV-1", "Total": "{{totalText}}"}""";
+
+        var fields = InvoiceFieldsJsonParser.Parse(json);
+
+        Assert.Equal(decimal.Parse(totalText), fields.Total);
+    }
+
+    [Fact]
+    public void Parse_NegativeAmountAsNumber_ParsesThroughUnchanged()
+    {
+        const string json = """{"InvoiceNumber": "INV-1", "Total": -39.11}""";
+
+        var fields = InvoiceFieldsJsonParser.Parse(json);
+
+        Assert.Equal(-39.11m, fields.Total);
+    }
+
     [Fact]
     public void Parse_MissingOptionalFields_AreNull()
     {
