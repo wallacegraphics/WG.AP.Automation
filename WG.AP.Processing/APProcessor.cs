@@ -102,8 +102,18 @@ public sealed class APProcessor(
                     invoiceCount += result.InvoiceCount;
                     outcomes[result.Status] = outcomes.GetValueOrDefault(result.Status) + 1;
 
-                    await mailMessageRepository.SetStatusAsync(claim.MailMessageId, result.Status, result.ErrorMessage, cancellationToken);
-                    await MoveIfRoutedAsync(message.Id, result.Status, mailFolders, cancellationToken);
+                    if (result.Status == ApStatus.MailNew)
+                    {
+                        // Not a verdict - an unresolved-client message left exactly as claimed (see
+                        // ProcessMessageAsync). Nothing to persist or move: the message stays visible in
+                        // the Inbox, and being the one non-final mail status, remains claimable again
+                        // later if Graph ever resurfaces it once the client is configured.
+                    }
+                    else
+                    {
+                        await mailMessageRepository.SetStatusAsync(claim.MailMessageId, result.Status, result.ErrorMessage, cancellationToken);
+                        await MoveIfRoutedAsync(message.Id, result.Status, mailFolders, cancellationToken);
+                    }
                 }
                 finally
                 {
@@ -151,11 +161,16 @@ public sealed class APProcessor(
     /// The routing rules, in the order they are applied:
     /// <list type="bullet">
     /// <item>no PDF attachments — including Excel-only mail — is <c>MailSkipped</c>, routed to NeedsReview</item>
+    /// <item>an unresolved client is left as <c>MailNew</c> - not our client yet, so no extraction is
+    /// attempted and no Invoice row is created; the message is left untouched in the Inbox for the team
+    /// to handle manually</item>
     /// <item>a PDF that cannot be parsed at all is <c>MailError</c></item>
-    /// <item>a missing required field, an unresolved client, or a duplicate number is <c>MailNeedsReview</c></item>
+    /// <item>a missing required field or a duplicate number is <c>MailNeedsReview</c></item>
     /// <item>everything present and readable is <c>MailProcessed</c></item>
     /// </list>
-    /// Where one email yields several PDFs with different verdicts, the worst wins.
+    /// Where one email yields several PDFs with different verdicts, the worst wins for routing -
+    /// but the recorded reason (see <see cref="BuildMessageErrorSummary"/>) still names every problem
+    /// PDF individually and notes how many others in the same message were processed successfully.
     /// </remarks>
     private async Task<MessageOutcome> ProcessMessageAsync(
         MailboxRef mailbox,
@@ -191,15 +206,20 @@ public sealed class APProcessor(
 
         if (!client.IsKnown)
         {
-            logger.LogWarning(
-                "Message {MessageId} is from {Sender}, which matches no enabled client; its invoices will need review.",
+            // Not our client yet - nothing to extract against (no format, no prompt, no deterministic
+            // extractor key), so don't attempt it. Left as MailNew rather than classified: the message
+            // stays untouched in the Inbox for the team to handle manually once/if this sender is
+            // onboarded, instead of recording an all-null Invoice row for every one of its PDFs.
+            logger.LogInformation(
+                "Message {MessageId} is from {Sender}, which matches no configured client; leaving it in the Inbox for manual handling.",
                 message.Id, message.SenderAddress ?? "unknown");
+            return new MessageOutcome(ApStatus.MailNew, null, InvoiceCount: 0);
         }
 
         var request = BuildExtractionRequest(client, prompts);
         var worst = ApStatus.MailProcessed;
-        string? errorMessage = null;
         var invoiceCount = 0;
+        var pdfOutcomes = new List<(string FileName, ApStatus MailStatus, string? Reason)>();
 
         foreach (var pdf in pdfs)
         {
@@ -207,11 +227,11 @@ public sealed class APProcessor(
                 mailbox, claim, message, pdf, client, request, cancellationToken);
 
             invoiceCount++;
+            pdfOutcomes.Add((pdf.Attachment.Name, mailStatus, reason));
 
             if (Severity(mailStatus) > Severity(worst))
             {
                 worst = mailStatus;
-                errorMessage = reason;
             }
 
             logger.LogInformation(
@@ -219,7 +239,41 @@ public sealed class APProcessor(
                 message.Id, pdf.Attachment.Name, invoiceStatus);
         }
 
+        // Every problem PDF's own reason, not just the single worst one - so a message that moves to
+        // Errors/NeedsReview because one of several PDFs failed still says which PDF, what went wrong,
+        // and that the others were fine, instead of silently dropping that context.
+        var errorMessage = worst == ApStatus.MailProcessed ? null : BuildMessageErrorSummary(pdfOutcomes);
+
         return new MessageOutcome(worst, errorMessage, invoiceCount);
+    }
+
+    /// <summary>
+    /// Builds the <c>dbo.MailMessage.ErrorMessage</c> text for a message with at least one
+    /// non-successful PDF: every problem PDF's own reason, followed by how many other PDFs in the same
+    /// message were processed successfully (and which). For the common case of a single failing PDF
+    /// with nothing else in the message, this is byte-identical to that PDF's own reason string.
+    /// </summary>
+    internal static string BuildMessageErrorSummary(
+        IReadOnlyList<(string FileName, ApStatus MailStatus, string? Reason)> pdfOutcomes)
+    {
+        var problems = pdfOutcomes
+            .Where(pdf => pdf.MailStatus != ApStatus.MailProcessed)
+            .Select(pdf => pdf.Reason ?? $"'{pdf.FileName}': {pdf.MailStatus}.")
+            .ToList();
+
+        var succeeded = pdfOutcomes
+            .Where(pdf => pdf.MailStatus == ApStatus.MailProcessed)
+            .Select(pdf => pdf.FileName)
+            .ToList();
+
+        var summary = string.Join(" ", problems);
+
+        // Problems first, success note last: MailMessageRepository.SetStatusAsync truncates this to
+        // 1000 chars, so if it ever has to cut, the actual errors survive and only this trailing note
+        // is what gets clipped.
+        return succeeded.Count > 0
+            ? $"{summary} {succeeded.Count} other PDF(s) processed successfully: {string.Join(", ", succeeded)}."
+            : summary;
     }
 
     private async Task<(ApStatus InvoiceStatus, ApStatus MailStatus, string? Reason)> ProcessPdfAsync(
@@ -278,7 +332,7 @@ public sealed class APProcessor(
             // rejected, so the duplicate is visible through the message status and the log rather than
             // as a second ledger row - which is the point of the constraint.
             return (ApStatus.InvoiceDuplicate, ApStatus.MailNeedsReview,
-                $"Invoice number '{extraction.Fields.InvoiceNumber}' is already recorded for this client.");
+                $"'{pdf.Attachment.Name}': invoice number '{extraction.Fields.InvoiceNumber}' is already recorded for this client.");
         }
 
         return (invoiceStatus, mailStatus, reason);
