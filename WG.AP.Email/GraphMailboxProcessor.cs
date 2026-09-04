@@ -260,57 +260,80 @@ public sealed class GraphMailboxProcessor : IMailSource, IMailSender
         }
     }
 
+    // A dropped TLS connection reading a large attachment is a transport blip, not a reason to fail
+    // the whole message (and, since ProcessPdfAsync deliberately doesn't catch this, the whole run's
+    // remaining batch along with it - see APProcessor.ProcessPdfAsync's comment on why this call isn't
+    // wrapped there). A couple of quick retries here absorbs that without changing what still-genuine
+    // failures do further up.
+    private const int MaxAttachmentFetchAttempts = 3;
+    private static readonly TimeSpan AttachmentFetchRetryDelay = TimeSpan.FromSeconds(1);
+
     public async Task<byte[]> GetAttachmentContentAsync(string messageId, string attachmentId, CancellationToken cancellationToken)
     {
-        try
+        for (var attempt = 1; ; attempt++)
         {
-            var attachment = await _graphClient.Users[_options.MailboxUser].Messages[messageId].Attachments[attachmentId].GetAsync(
-                requestConfiguration => ApplyImmutableId(requestConfiguration.Headers),
-                cancellationToken);
-
-            if (attachment is not FileAttachment fileAttachment)
+            try
             {
-                throw CreateInvalidOperation($"Attachment {attachmentId} on message {messageId} is not a file attachment.");
-            }
+                var attachment = await _graphClient.Users[_options.MailboxUser].Messages[messageId].Attachments[attachmentId].GetAsync(
+                    requestConfiguration => ApplyImmutableId(requestConfiguration.Headers),
+                    cancellationToken);
 
-            if (fileAttachment.Size is { } size && size > _options.MaxAttachmentSizeBytes)
+                if (attachment is not FileAttachment fileAttachment)
+                {
+                    throw CreateInvalidOperation($"Attachment {attachmentId} on message {messageId} is not a file attachment.");
+                }
+
+                if (fileAttachment.Size is { } size && size > _options.MaxAttachmentSizeBytes)
+                {
+                    throw CreateInvalidOperation(
+                        $"Attachment {attachmentId} on message {messageId} is {size} bytes, exceeding the configured limit of {_options.MaxAttachmentSizeBytes} bytes.");
+                }
+
+                if (fileAttachment.ContentBytes is { Length: > 0 } contentBytes)
+                {
+                    return contentBytes;
+                }
+
+                // Graph only inlines contentBytes up to ~3MB (base64/JSON overhead caps it there);
+                // anything larger comes back with no inline bytes and must be streamed via $value.
+                // The Graph SDK has no strongly-typed builder for this segment, so the request is built
+                // from the normal attachment request and sent as a raw/primitive stream request instead.
+                _logger.LogInformation(
+                    "Attachment {AttachmentId} on message {MessageId} returned no inline content bytes; streaming via $value.",
+                    attachmentId,
+                    messageId);
+
+                var requestInformation = _graphClient.Users[_options.MailboxUser].Messages[messageId].Attachments[attachmentId]
+                    .ToGetRequestInformation(requestConfiguration => ApplyImmutableId(requestConfiguration.Headers));
+                requestInformation.UrlTemplate += "/$value";
+
+                var stream = await _graphClient.RequestAdapter.SendPrimitiveAsync<Stream>(requestInformation, cancellationToken: cancellationToken)
+                    ?? throw CreateInvalidOperation($"Attachment {attachmentId} on message {messageId} returned no content via $value.");
+
+                await using (stream)
+                {
+                    using var memoryStream = new MemoryStream();
+                    await stream.CopyToAsync(memoryStream, cancellationToken);
+                    return memoryStream.ToArray();
+                }
+            }
+            // Same transient set APProcessor.ProcessPdfAsync already treats as infrastructure rather
+            // than an invoice verdict. Anything else (not-a-file-attachment, over the size limit, no
+            // content via $value) is a real answer from Graph, not a blip - retrying it can't help.
+            catch (Exception exception) when (attempt < MaxAttachmentFetchAttempts && exception is HttpRequestException or TaskCanceledException)
             {
-                throw CreateInvalidOperation(
-                    $"Attachment {attachmentId} on message {messageId} is {size} bytes, exceeding the configured limit of {_options.MaxAttachmentSizeBytes} bytes.");
-            }
+                _logger.LogWarning(
+                    exception,
+                    "Attempt {Attempt}/{MaxAttempts} to fetch attachment {AttachmentId} on message {MessageId} failed; retrying.",
+                    attempt, MaxAttachmentFetchAttempts, attachmentId, messageId);
 
-            if (fileAttachment.ContentBytes is { Length: > 0 } contentBytes)
+                await Task.Delay(AttachmentFetchRetryDelay, cancellationToken);
+            }
+            catch (Exception exception)
             {
-                return contentBytes;
+                _logger.LogError(exception, "Failed to fetch attachment {AttachmentId} on message {MessageId} for {MailboxUser}.", attachmentId, messageId, _options.MailboxUser);
+                throw;
             }
-
-            // Graph only inlines contentBytes up to ~3MB (base64/JSON overhead caps it there);
-            // anything larger comes back with no inline bytes and must be streamed via $value.
-            // The Graph SDK has no strongly-typed builder for this segment, so the request is built
-            // from the normal attachment request and sent as a raw/primitive stream request instead.
-            _logger.LogInformation(
-                "Attachment {AttachmentId} on message {MessageId} returned no inline content bytes; streaming via $value.",
-                attachmentId,
-                messageId);
-
-            var requestInformation = _graphClient.Users[_options.MailboxUser].Messages[messageId].Attachments[attachmentId]
-                .ToGetRequestInformation(requestConfiguration => ApplyImmutableId(requestConfiguration.Headers));
-            requestInformation.UrlTemplate += "/$value";
-
-            var stream = await _graphClient.RequestAdapter.SendPrimitiveAsync<Stream>(requestInformation, cancellationToken: cancellationToken)
-                ?? throw CreateInvalidOperation($"Attachment {attachmentId} on message {messageId} returned no content via $value.");
-
-            await using (stream)
-            {
-                using var memoryStream = new MemoryStream();
-                await stream.CopyToAsync(memoryStream, cancellationToken);
-                return memoryStream.ToArray();
-            }
-        }
-        catch (Exception exception)
-        {
-            _logger.LogError(exception, "Failed to fetch attachment {AttachmentId} on message {MessageId} for {MailboxUser}.", attachmentId, messageId, _options.MailboxUser);
-            throw;
         }
     }
 

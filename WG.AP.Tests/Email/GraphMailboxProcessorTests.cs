@@ -229,6 +229,44 @@ public class GraphMailboxProcessorTests
     }
 
     [Fact]
+    public async Task GetAttachmentContentAsync_RetriesOnTransientFailure_ThenSucceeds()
+    {
+        var (processor, handler) = CreateProcessor();
+        var expectedBytes = Encoding.UTF8.GetBytes("Hello World");
+        var contentBase64 = Convert.ToBase64String(expectedBytes);
+
+        handler.OnFlaky(
+            r => r.Method == HttpMethod.Get && r.RequestUri!.AbsolutePath.EndsWith("/messages/AAMk-1/attachments/attach-1"),
+            failures: 1,
+            new HttpRequestException("Simulated transient network failure."),
+            $$"""{"@odata.type":"#microsoft.graph.fileAttachment","id":"attach-1","name":"invoice.pdf","contentType":"application/pdf","size":{{expectedBytes.Length}},"contentBytes":"{{contentBase64}}"}""");
+
+        var content = await processor.GetAttachmentContentAsync("AAMk-1", "attach-1", CancellationToken.None);
+
+        Assert.Equal(expectedBytes, content);
+    }
+
+    [Fact]
+    public async Task GetAttachmentContentAsync_GivesUpAfterMaxAttempts_ThenThrowsAndLogs()
+    {
+        var logger = new CapturingLogger();
+        var (processor, handler) = CreateProcessor(logger);
+
+        // More failures than the retry budget covers, so it never recovers.
+        handler.OnFlaky(
+            r => r.Method == HttpMethod.Get && r.RequestUri!.AbsolutePath.EndsWith("/messages/AAMk-1/attachments/attach-1"),
+            failures: 10,
+            new HttpRequestException("Simulated persistent network failure."),
+            jsonResponse: "{}");
+
+        await Assert.ThrowsAsync<HttpRequestException>(() =>
+            processor.GetAttachmentContentAsync("AAMk-1", "attach-1", CancellationToken.None));
+
+        Assert.Equal(3, handler.Requests.Count(r => r.RequestUri!.AbsolutePath.EndsWith("/attachments/attach-1")));
+        Assert.Contains(logger.Entries, e => e.Level == LogLevel.Error && e.Exception is not null && e.Message.Contains("attach-1"));
+    }
+
+    [Fact]
     public async Task EnsureFoldersExistAsync_CreatesAllThreeFolders_WhenMailboxHasNone()
     {
         var (processor, handler) = CreateProcessor();

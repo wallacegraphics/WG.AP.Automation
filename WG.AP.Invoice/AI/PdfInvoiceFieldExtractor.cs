@@ -31,7 +31,7 @@ public sealed class PdfInvoiceFieldExtractor(OllamaClient ollamaClient, ILogger<
             // silent wrong read - see ExtractionRequest.ExtractorKey.
             if (request.ExtractorKey == ExtractionRequest.SanmarPdfHeaderExtractorKey)
             {
-                var deterministic = SanmarPdfHeaderExtractor.TryExtract(naturalOrderText);
+                var deterministic = SanmarPdfHeaderExtractor.TryExtract(naturalOrderText, out var failureReason);
 
                 if (deterministic is not null)
                 {
@@ -39,7 +39,7 @@ public sealed class PdfInvoiceFieldExtractor(OllamaClient ollamaClient, ILogger<
                     return new ExtractionResult(deterministic with { RawText = auditText }, ExtractionResult.RegexMethod, ExtractionPromptId: null);
                 }
 
-                logger.LogInformation("PDF header layout not recognized for deterministic extraction; falling back to Ollama.");
+                logger.LogInformation("PDF header layout not recognized for deterministic extraction; falling back to Ollama. Reason: {FailureReason}", failureReason);
             }
 
             if (request.PromptTemplate is null || request.ResponseSchemaJson is null)
