@@ -133,4 +133,51 @@ public class ProcessorTests
         // clean invoice filing an email that also contained an unparseable one.
         Assert.True(APProcessor.Severity(worse) > APProcessor.Severity(better));
     }
+
+    [Fact]
+    public void BuildMessageErrorSummary_AllPdfsFail_ListsEachReason()
+    {
+        var outcomes = new (string FileName, ApStatus MailStatus, string? Reason)[]
+        {
+            ("INV-1.pdf", ApStatus.MailError, "'INV-1.pdf' could not be parsed."),
+            ("INV-2.pdf", ApStatus.MailNeedsReview, "'INV-2.pdf': missing InvoiceDate."),
+        };
+
+        var summary = APProcessor.BuildMessageErrorSummary(outcomes);
+
+        Assert.Contains("'INV-1.pdf' could not be parsed.", summary);
+        Assert.Contains("'INV-2.pdf': missing InvoiceDate.", summary);
+        Assert.DoesNotContain("processed successfully", summary);
+    }
+
+    [Fact]
+    public void BuildMessageErrorSummary_MixedOutcome_ListsFailuresAndNamesSuccesses()
+    {
+        var outcomes = new (string FileName, ApStatus MailStatus, string? Reason)[]
+        {
+            ("Bad.pdf", ApStatus.MailError, "'Bad.pdf' could not be parsed."),
+            ("Good1.pdf", ApStatus.MailProcessed, null),
+            ("Good2.pdf", ApStatus.MailProcessed, null),
+        };
+
+        var summary = APProcessor.BuildMessageErrorSummary(outcomes);
+
+        Assert.Contains("'Bad.pdf' could not be parsed.", summary);
+        Assert.Contains("2 other PDF(s) processed successfully:", summary);
+        Assert.Contains("Good1.pdf", summary);
+        Assert.Contains("Good2.pdf", summary);
+    }
+
+    [Fact]
+    public void BuildMessageErrorSummary_SinglePdfFails_MatchesReasonExactly()
+    {
+        var outcomes = new (string FileName, ApStatus MailStatus, string? Reason)[]
+        {
+            ("INV-1.pdf", ApStatus.MailError, "'INV-1.pdf' could not be parsed."),
+        };
+
+        var summary = APProcessor.BuildMessageErrorSummary(outcomes);
+
+        Assert.Equal("'INV-1.pdf' could not be parsed.", summary);
+    }
 }

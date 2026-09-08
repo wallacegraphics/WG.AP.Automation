@@ -33,6 +33,29 @@ internal sealed class FakeGraphHandler : HttpMessageHandler
         return this;
     }
 
+    /// <summary>
+    /// Simulates a transient failure: throws <paramref name="exception"/> for the first
+    /// <paramref name="failures"/> matching requests, then serves <paramref name="jsonResponse"/>
+    /// normally - for testing a caller's retry logic against something like a dropped connection.
+    /// </summary>
+    public FakeGraphHandler OnFlaky(Func<HttpRequestMessage, bool> matches, int failures, Exception exception, string jsonResponse)
+    {
+        var remaining = failures;
+
+        _routes.Add((matches, _ =>
+        {
+            if (remaining > 0)
+            {
+                remaining--;
+                throw exception;
+            }
+
+            return new StringContent(jsonResponse, Encoding.UTF8, "application/json");
+        }));
+
+        return this;
+    }
+
     protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
         Requests.Add(request);
@@ -46,11 +69,20 @@ internal sealed class FakeGraphHandler : HttpMessageHandler
             });
         }
 
-        var response = new HttpResponseMessage(HttpStatusCode.OK)
+        try
         {
-            Content = route.Respond(request)
-        };
+            var response = new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = route.Respond(request)
+            };
 
-        return Task.FromResult(response);
+            return Task.FromResult(response);
+        }
+        catch (Exception exception)
+        {
+            // Faulted task, not a synchronous throw - matches how a real transport failure actually
+            // surfaces to an awaiting caller (e.g. OnFlaky simulating a dropped connection).
+            return Task.FromException<HttpResponseMessage>(exception);
+        }
     }
 }

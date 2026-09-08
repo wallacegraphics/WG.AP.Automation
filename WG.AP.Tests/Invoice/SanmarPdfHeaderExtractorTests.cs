@@ -28,6 +28,23 @@ public class SanmarPdfHeaderExtractorTests
         "Total Sales subtotal 2.00 438.90 cases amount Sales tax Shipping, handling & other fees " +
         "Cincinnati, OH Dallas, TX Richmond, VA Total 438.90 Starting in June, you must have a valid exemption.";
 
+    // Verbatim capture from CR-005784363.pdf - a credit memo (negative Total, "CR-" invoice number,
+    // an extra "REMIT TO: This is a CREDIT..." block that the regular-invoice fixtures above don't
+    // have). Every label/value pair is correctly adjacent in this layout too, same as the regular
+    // invoices - the only thing that made this document fall back to Ollama was TotalRegex not
+    // allowing the leading "-" on "-39.11".
+    private const string RealInvoiceCR005784363 =
+        "REMIT TO: INVOICE This is a CREDIT. Invoice Number: CR-005784363 Please DO NOT pay. Thank you for your " +
+        "Sales Order: SO-164296239 business. Invoice Date: 8/25/2026 Customer Sales & Service Credit Department " +
+        "Due Date: 10/24/2026 Toll Free: (800) 346-3369 Toll Free: (800) 426-6399 Customer Number: 76274-0000 " +
+        "Email: creditinquiries@sanmar.com www.sanmar.com Terms: Net60 Customer PO: CS2393 Order Account: 76274-0000 " +
+        "Office ID: To make a payment, visit your My SanMar account dashboard on sanmar.com and click 'View and Pay Invoices'. " +
+        "MAILING: WALLACE GRAPHICS INC FL-INV SHIP TO: 11455 Lakefield Dr Attn to: STE 200 10940 New Kings Road " +
+        "Johns Creek GA 30097-2097 Jacksonville FL 32219 US US Item Warehouse Description Color Size Quantity Unit Price " +
+        "Amount Number DC-FL J714 PA C-Free Rain Jacket Deep Black L -1.00 39.11 -39.11 Total Sales subtotal -39.11 " +
+        "cases amount Sales tax Shipping, handling & other fees Total -39.11 Page 1 of 1 Cincinnati, OH Dallas, TX " +
+        "Jacksonville, FL Phoenix, AZ Minneapolis, MN Reno, NV Robbinsville, NJ Seattle, WA Richmond, VA";
+
     [Fact]
     public void TryExtract_RealInvoiceWithSingleTokenCustomerPO_ReturnsExpectedFields()
     {
@@ -60,6 +77,23 @@ public class SanmarPdfHeaderExtractorTests
     }
 
     [Fact]
+    public void TryExtract_RealCreditMemoWithNegativeTotal_ReturnsExpectedFields()
+    {
+        var fields = SanmarPdfHeaderExtractor.TryExtract(RealInvoiceCR005784363);
+
+        Assert.NotNull(fields);
+        Assert.Equal("CR-005784363", fields!.InvoiceNumber);
+        Assert.Equal("SO-164296239", fields.SalesOrder);
+        Assert.Equal(new DateOnly(2026, 8, 25), fields.InvoiceDate);
+        Assert.Equal(new DateOnly(2026, 10, 24), fields.DueDate);
+        Assert.Equal("76274-0000", fields.CustomerNumber);
+        Assert.Equal("Net60", fields.Terms);
+        Assert.Equal("CS2393", fields.CustomerPO);
+        Assert.Equal("76274-0000", fields.OrderAccount);
+        Assert.Equal(-39.11m, fields.Total);
+    }
+
+    [Fact]
     public void TryExtract_BlankCustomerPO_ReturnsNullCustomerPO()
     {
         var text = "Invoice Number: INV-1 Sales Order: SO-1 Invoice Date: 1/1/2026 Due Date: 2/1/2026 " +
@@ -82,42 +116,54 @@ public class SanmarPdfHeaderExtractorTests
     }
 
     [Fact]
-    public void TryExtract_MissingSalesOrderLabel_ReturnsNull()
+    public void TryExtract_MissingSalesOrderLabel_ReturnsNullWithReason()
     {
         var text = "Invoice Number: INV-1 Invoice Date: 1/1/2026 Due Date: 2/1/2026 " +
             "Customer Number: ACCT-1 Terms: Net30 Customer PO: PO-1 Order Account: ORDERACCT-1 " +
             "Total 79.27";
 
-        Assert.Null(SanmarPdfHeaderExtractor.TryExtract(text));
+        var fields = SanmarPdfHeaderExtractor.TryExtract(text, out var reason);
+
+        Assert.Null(fields);
+        Assert.Equal("SalesOrder not found", reason);
     }
 
     [Fact]
-    public void TryExtract_InvoiceDateInvalid_ReturnsNull()
+    public void TryExtract_InvoiceDateInvalid_ReturnsNullWithReason()
     {
         var text = "Invoice Number: INV-1 Sales Order: SO-1 Invoice Date: 13/45/2026 Due Date: 2/1/2026 " +
             "Customer Number: ACCT-1 Terms: Net30 Customer PO: PO-1 Order Account: ORDERACCT-1 " +
             "Total 79.27";
 
-        Assert.Null(SanmarPdfHeaderExtractor.TryExtract(text));
+        var fields = SanmarPdfHeaderExtractor.TryExtract(text, out var reason);
+
+        Assert.Null(fields);
+        Assert.Equal("InvoiceDate not found or not a valid M/d/yyyy date", reason);
     }
 
     [Fact]
-    public void TryExtract_DueDateInvalid_ReturnsNull()
+    public void TryExtract_DueDateInvalid_ReturnsNullWithReason()
     {
         var text = "Invoice Number: INV-1 Sales Order: SO-1 Invoice Date: 1/1/2026 Due Date: 13/45/2026 " +
             "Customer Number: ACCT-1 Terms: Net30 Customer PO: PO-1 Order Account: ORDERACCT-1 " +
             "Total 79.27";
 
-        Assert.Null(SanmarPdfHeaderExtractor.TryExtract(text));
+        var fields = SanmarPdfHeaderExtractor.TryExtract(text, out var reason);
+
+        Assert.Null(fields);
+        Assert.Equal("DueDate not found or not a valid M/d/yyyy date", reason);
     }
 
     [Fact]
-    public void TryExtract_NoTotalFound_ReturnsNull()
+    public void TryExtract_NoTotalFound_ReturnsNullWithReason()
     {
         var text = "Invoice Number: INV-1 Sales Order: SO-1 Invoice Date: 1/1/2026 Due Date: 2/1/2026 " +
             "Customer Number: ACCT-1 Terms: Net30 Customer PO: PO-1 Order Account: ORDERACCT-1";
 
-        Assert.Null(SanmarPdfHeaderExtractor.TryExtract(text));
+        var fields = SanmarPdfHeaderExtractor.TryExtract(text, out var reason);
+
+        Assert.Null(fields);
+        Assert.Equal("Total not found", reason);
     }
 
     [Fact]

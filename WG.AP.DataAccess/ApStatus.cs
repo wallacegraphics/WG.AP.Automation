@@ -17,17 +17,19 @@ namespace WG.AP.DataAccess;
 /// </remarks>
 public enum ApStatus
 {
-    /// <summary>Recorded at discovery, not yet decided. The only non-final mail status.</summary>
+    /// <summary>Recorded at discovery, not yet decided. The only non-final mail status. Also the
+    /// resting state for a message whose sender matches no configured client - left untouched rather
+    /// than classified, since there's nothing to extract against.</summary>
     MailNew = 10,
 
     /// <summary>Every PDF extracted with all five required fields.</summary>
     MailProcessed = 11,
 
-    /// <summary>A required field was missing, the client was unresolved, the invoice number was a
-    /// duplicate, or the attempt cap was reached.</summary>
+    /// <summary>A required field was missing, the invoice number was a duplicate, or the attempt cap
+    /// was reached.</summary>
     MailNeedsReview = 12,
 
-    /// <summary>A PDF could not be parsed, or a total was null, zero or negative.</summary>
+    /// <summary>A PDF could not be parsed (extraction failed before producing any fields).</summary>
     MailError = 13,
 
     /// <summary>No PDF attachments at all — which now includes Excel-only mail. Routed to NeedsReview.</summary>

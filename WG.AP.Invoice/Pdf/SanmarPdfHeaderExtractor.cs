@@ -44,12 +44,31 @@ public static class SanmarPdfHeaderExtractor
     // alone would reject an ungrouped 4+-digit total like "1320.00" just as badly as \d+ alone
     // rejected the comma-grouped form, merely in the opposite direction. decimal.Parse below needs
     // no change either way: CultureInfo.InvariantCulture's default NumberStyles.Number accepts both.
-    private static readonly Regex TotalRegex = new(@"\bTotal\b\s+(?<amount>\d{1,3}(?:,\d{3})*\.\d{2}|\d+\.\d{2})\b(?!\s+[Cc]ases)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    //
+    // The leading "-?" covers SanMar credit memos, which print the grand total with a leading minus
+    // (e.g. "-39.11") - Total <= 0 is a valid extracted value now (see APProcessor.Classify /
+    // CK_Invoice_ExtractedIsComplete), so this must match rather than fall back to Ollama. Confirmed
+    // against a real credit memo (CR-005784363.pdf): every other field is correctly adjacent to its
+    // own label in this document's actual content-stream order, and this was the only regex blocking
+    // TryExtract. decimal.Parse below needs no change: NumberStyles.Number already allows a leading
+    // sign.
+    private static readonly Regex TotalRegex = new(@"\bTotal\b\s+(?<amount>-?\d{1,3}(?:,\d{3})*\.\d{2}|-?\d+\.\d{2})\b(?!\s+[Cc]ases)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
-    public static InvoiceFields? TryExtract(string naturalOrderText)
+    public static InvoiceFields? TryExtract(string naturalOrderText) => TryExtract(naturalOrderText, out _);
+
+    /// <summary>
+    /// Same as <see cref="TryExtract(string)"/>, but also reports which check failed when the layout
+    /// isn't recognized. A caller's "falling back to Ollama" log can then say why, rather than
+    /// leaving the next unrecognized layout to be diagnosed by hand the way CR-005784363.pdf's
+    /// missing-InvoiceDate report was - that took pulling the PDF and re-running every regex by hand
+    /// to find that the actual cause (TotalRegex rejecting a negative amount) had nothing to do with
+    /// InvoiceDate at all.
+    /// </summary>
+    internal static InvoiceFields? TryExtract(string naturalOrderText, out string? failureReason)
     {
         if (string.IsNullOrWhiteSpace(naturalOrderText))
         {
+            failureReason = "document text was empty";
             return null;
         }
 
@@ -59,14 +78,29 @@ public static class SanmarPdfHeaderExtractor
         var terms = MatchValue(TermsRegex, naturalOrderText);
         var orderAccount = MatchValue(OrderAccountRegex, naturalOrderText);
 
-        if (invoiceNumber is null || salesOrder is null || customerNumber is null || terms is null || orderAccount is null)
+        var notFound = new List<string>();
+
+        if (invoiceNumber is null) notFound.Add(nameof(InvoiceFields.InvoiceNumber));
+        if (salesOrder is null) notFound.Add(nameof(InvoiceFields.SalesOrder));
+        if (customerNumber is null) notFound.Add(nameof(InvoiceFields.CustomerNumber));
+        if (terms is null) notFound.Add(nameof(InvoiceFields.Terms));
+        if (orderAccount is null) notFound.Add(nameof(InvoiceFields.OrderAccount));
+
+        if (notFound.Count > 0)
         {
+            failureReason = $"{string.Join(", ", notFound)} not found";
             return null;
         }
 
-        if (!TryMatchDate(InvoiceDateRegex, naturalOrderText, out var invoiceDate)
-            || !TryMatchDate(DueDateRegex, naturalOrderText, out var dueDate))
+        if (!TryMatchDate(InvoiceDateRegex, naturalOrderText, out var invoiceDate))
         {
+            failureReason = $"{nameof(InvoiceFields.InvoiceDate)} not found or not a valid M/d/yyyy date";
+            return null;
+        }
+
+        if (!TryMatchDate(DueDateRegex, naturalOrderText, out var dueDate))
+        {
+            failureReason = $"{nameof(InvoiceFields.DueDate)} not found or not a valid M/d/yyyy date";
             return null;
         }
 
@@ -74,6 +108,7 @@ public static class SanmarPdfHeaderExtractor
 
         if (!customerPOMatch.Success)
         {
+            failureReason = $"{nameof(InvoiceFields.CustomerPO)}/{nameof(InvoiceFields.OrderAccount)} label pair not found";
             return null;
         }
 
@@ -84,11 +119,14 @@ public static class SanmarPdfHeaderExtractor
 
         if (total is null)
         {
+            failureReason = $"{nameof(InvoiceFields.Total)} not found";
             return null;
         }
 
+        failureReason = null;
+
         return new InvoiceFields(
-            invoiceNumber,
+            invoiceNumber!,
             salesOrder,
             invoiceDate,
             dueDate,
