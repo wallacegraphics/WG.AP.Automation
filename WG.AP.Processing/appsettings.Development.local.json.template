@@ -32,6 +32,6 @@
     "MailboxId": "<mailbox Entra object id>"
   },
   "Alert": {
-    "Recipients": [ "user email" ]
+    "Recipients": [ "galina.zezetko@wallacegraphics.com" ]
   }
 }
