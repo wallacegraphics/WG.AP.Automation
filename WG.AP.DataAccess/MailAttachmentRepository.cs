@@ -145,7 +145,7 @@ public sealed class MailAttachmentRepository(
                   FROM [dbo].[MailAttachment]
                  WHERE [ContentSha256] = @ContentSha256
                    AND [MailAttachmentId] <> @MailAttachmentId
-                 ORDER BY [CreatedOn];
+                 ORDER BY [CreatedOn], [MailAttachmentId];
                 """,
                 new
                 {
