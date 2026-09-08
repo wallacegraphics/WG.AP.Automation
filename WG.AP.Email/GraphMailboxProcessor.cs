@@ -356,7 +356,13 @@ public sealed class GraphMailboxProcessor : IMailSource, IMailSender
                 requestConfiguration => ApplyImmutableId(requestConfiguration.Headers),
                 cancellationToken);
 
-            return moved?.Id ?? throw CreateInvalidOperation("Move operation did not return a message id.");
+            var movedId = moved?.Id ?? throw CreateInvalidOperation("Move operation did not return a message id.");
+
+            _logger.LogInformation(
+                "Moved message {MessageId} to {Destination} for {MailboxUser}; new id {NewMessageId}.",
+                messageId, destination, _options.MailboxUser, movedId);
+
+            return movedId;
         }
         catch (Exception exception)
         {
@@ -409,7 +415,7 @@ public sealed class GraphMailboxProcessor : IMailSource, IMailSender
             {
                 attachmentPage = await _graphClient.Users[_options.MailboxUser].Messages[message.Id!].Attachments.GetAsync(requestConfiguration =>
                 {
-                    requestConfiguration.QueryParameters.Select = ["id", "name", "size", "contentType"];
+                    requestConfiguration.QueryParameters.Select = ["id", "name", "size", "contentType", "isInline"];
                     ApplyImmutableId(requestConfiguration.Headers);
                 }, cancellationToken);
             }
@@ -425,7 +431,8 @@ public sealed class GraphMailboxProcessor : IMailSource, IMailSender
                     attachment.Id!,
                     attachment.Name ?? "unnamed",
                     attachment.Size ?? 0,
-                    attachment.ContentType ?? "application/octet-stream")));
+                    attachment.ContentType ?? "application/octet-stream",
+                    attachment.IsInline ?? false)));
         }
 
         return new MailMessageSummary(

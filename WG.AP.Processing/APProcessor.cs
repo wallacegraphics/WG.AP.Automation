@@ -96,7 +96,7 @@ public sealed class APProcessor(
                     logger.LogInformation(
                         "Message {MessageId} from {Sender} received {ReceivedAt}: {AttachmentCount} attachment(s), attempt {AttemptCount}.",
                         message.Id, message.SenderAddress ?? "unknown", message.ReceivedDateTime,
-                        message.Attachments.Count, claim.AttemptCount);
+                        message.Attachments.Count(a => !a.IsInline), claim.AttemptCount);
 
                     var result = await ProcessMessageAsync(mailbox, claim, message, clientCatalog, prompts, cancellationToken);
 
@@ -246,6 +246,12 @@ public sealed class APProcessor(
                 "Message {MessageId} attachment '{FileName}': {InvoiceStatus}.",
                 message.Id, pdf.Attachment.Name, invoiceStatus);
         }
+
+        var pdfSuccessCount = pdfOutcomes.Count(o => o.MailStatus == ApStatus.MailProcessed);
+        logger.LogInformation(
+            "Message {MessageId} \"{Subject}\" from {Sender} received {ReceivedAt}: {AttachmentCount} attachment(s), {PdfCount} PDF(s), {SuccessCount} processed successfully, {FailedCount} failed.",
+            message.Id, message.Subject ?? "(no subject)", message.SenderAddress ?? "unknown", message.ReceivedDateTime,
+            recorded.Count(item => !item.Attachment.IsInline), pdfs.Count, pdfSuccessCount, pdfs.Count - pdfSuccessCount);
 
         // Every problem PDF's own reason, not just the single worst one - so a message that moves to
         // Errors/NeedsReview because one of several PDFs failed still says which PDF, what went wrong,
