@@ -52,5 +52,10 @@ public enum ApStatus
     InvoiceError = 23,
 
     /// <summary>A duplicate invoice number for the client, as decided by <c>UQ_Invoice_ClientNumber</c>.</summary>
-    InvoiceDuplicate = 24
+    InvoiceDuplicate = 24,
+
+    /// <summary>The PDF's bytes are identical to an attachment already recorded on another message, as
+    /// decided by <c>IX_MailAttachment_Sha256</c>. Distinct from <see cref="InvoiceDuplicate"/>, which is
+    /// a duplicate invoice number rather than a duplicate file.</summary>
+    InvoicePdfDuplicate = 25
 }

@@ -164,6 +164,43 @@ public class SqlRepositoryTests
     }
 
     [SkippableFact]
+    public async Task FindDuplicateByHash_FindsAnEarlierAttachment_WithTheSameContent()
+    {
+        SkipUnlessConfigured();
+
+        var factory = CreateFactory();
+        var runs = new ProcessingRunRepository(factory, NullLogger<ProcessingRunRepository>.Instance);
+        var messages = new MailMessageRepository(factory, NullLogger<MailMessageRepository>.Instance);
+        var attachments = new MailAttachmentRepository(factory, NullLogger<MailAttachmentRepository>.Instance);
+
+        var mailbox = new MailboxRef(Guid.NewGuid(), "sql-test@wallacegraphics.com");
+        var runId = await runs.StartAsync(mailbox, CancellationToken.None);
+
+        var firstSummary = new MailAttachmentSummary($"att-{Guid.NewGuid():N}", "INV-1.pdf", 1024, "application/pdf");
+        var firstMessage = new MailMessageSummary($"immutable-{Guid.NewGuid():N}", DateTimeOffset.UtcNow, "billing@sanmar.com", "Invoice", [firstSummary]);
+        var firstClaim = await messages.DiscoverAndClaimAsync(mailbox, runId, firstMessage, CancellationToken.None);
+        var firstRecorded = (await attachments.RecordAsync(firstClaim.MailMessageId, [firstSummary], CancellationToken.None))[0];
+
+        var sharedHash = System.Security.Cryptography.SHA256.HashData(Guid.NewGuid().ToByteArray());
+
+        // Nothing has this hash yet - the very first sighting of a PDF is never a duplicate of itself.
+        Assert.Null(await attachments.FindDuplicateByHashAsync(firstRecorded.MailAttachmentId, sharedHash, CancellationToken.None));
+
+        await attachments.SetStoredAsync(firstRecorded.MailAttachmentId, @"2026\09\1-INV-1.pdf", sharedHash, CancellationToken.None);
+
+        var secondSummary = new MailAttachmentSummary($"att-{Guid.NewGuid():N}", "INV-1 (resent).pdf", 1024, "application/pdf");
+        var secondMessage = new MailMessageSummary($"immutable-{Guid.NewGuid():N}", DateTimeOffset.UtcNow, "billing@sanmar.com", "Invoice", [secondSummary]);
+        var secondClaim = await messages.DiscoverAndClaimAsync(mailbox, runId, secondMessage, CancellationToken.None);
+        var secondRecorded = (await attachments.RecordAsync(secondClaim.MailMessageId, [secondSummary], CancellationToken.None))[0];
+
+        // A different email, byte-identical PDF: must be found even though the filename differs.
+        var duplicate = await attachments.FindDuplicateByHashAsync(secondRecorded.MailAttachmentId, sharedHash, CancellationToken.None);
+        Assert.NotNull(duplicate);
+        Assert.Equal(firstRecorded.MailAttachmentId, duplicate.MailAttachmentId);
+        Assert.Equal(firstClaim.MailMessageId, duplicate.MailMessageId);
+    }
+
+    [SkippableFact]
     public async Task RecordInvoice_ReportsADuplicateNumber_RatherThanThrowing()
     {
         SkipUnlessConfigured();

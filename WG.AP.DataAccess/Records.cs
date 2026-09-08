@@ -15,6 +15,12 @@ public sealed record MailMessageClaim(long MailMessageId, bool Claimed, int Stat
 /// <summary>A stored attachment, as recorded.</summary>
 public sealed record RecordedAttachment(long MailAttachmentId, MailAttachmentSummary Attachment);
 
+/// <summary>
+/// An earlier attachment whose bytes are identical to the one just stored, as found via
+/// <c>IX_MailAttachment_Sha256</c>.
+/// </summary>
+public sealed record DuplicateAttachmentMatch(long MailAttachmentId, long MailMessageId);
+
 /// <summary>The client an incoming email resolved to.</summary>
 /// <param name="ClientId">0 when the sender domain matched no enabled client.</param>
 /// <param name="InvoiceFormatId">Null when the client has no enabled format.</param>
