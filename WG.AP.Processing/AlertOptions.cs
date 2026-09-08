@@ -4,5 +4,5 @@ public sealed class AlertOptions
 {
     public const string SectionName = "Alert";
 
-    public required IReadOnlyList<string> Recipients { get; init; }
+    public IReadOnlyList<string> Recipients { get; init; } = Array.Empty<string>();
 }

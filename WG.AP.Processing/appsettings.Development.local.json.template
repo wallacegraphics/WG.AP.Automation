@@ -30,5 +30,8 @@
     "ClientSecret": "<client secret>",
     "MailboxUser": "<mailbox address>",
     "MailboxId": "<mailbox Entra object id>"
+  },
+  "Alert": {
+    "Recipients": [ "user email" ]
   }
 }

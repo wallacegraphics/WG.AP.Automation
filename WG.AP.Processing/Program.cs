@@ -92,7 +92,7 @@ builder.Services
     .AddOptions<AlertOptions>()
     .Bind(builder.Configuration.GetSection(AlertOptions.SectionName))
     .Validate(options => options.Recipients.Count > 0, $"{AlertOptions.SectionName}:Recipients must have at least one address.")
-    .Validate(options => options.Recipients.All(recipient => recipient.Contains('@')), $"{AlertOptions.SectionName}:Recipients must all look like email addresses.")
+    .Validate(options => options.Recipients.All(recipient => !string.IsNullOrWhiteSpace(recipient) && recipient.Contains('@')), $"{AlertOptions.SectionName}:Recipients must all look like email addresses.")
     .ValidateOnStart();
 
 builder.Services.AddSingleton(serviceProvider =>
