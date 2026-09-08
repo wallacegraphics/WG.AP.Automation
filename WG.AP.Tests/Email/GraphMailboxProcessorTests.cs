@@ -267,6 +267,30 @@ public class GraphMailboxProcessorTests
     }
 
     [Fact]
+    public async Task GetAttachmentContentAsync_DoesNotRetry_WhenTaskCanceledByTheCallersOwnToken()
+    {
+        var logger = new CapturingLogger();
+        var (processor, handler) = CreateProcessor(logger);
+
+        // Retry budget would otherwise cover this, but the token being already cancelled means
+        // this TaskCanceledException is a real cancellation, not a Graph-side timeout to retry.
+        handler.OnFlaky(
+            r => r.Method == HttpMethod.Get && r.RequestUri!.AbsolutePath.EndsWith("/messages/AAMk-1/attachments/attach-1"),
+            failures: 1,
+            new TaskCanceledException("Simulated cancellation."),
+            jsonResponse: "{}");
+
+        using var cancellationTokenSource = new CancellationTokenSource();
+        cancellationTokenSource.Cancel();
+
+        await Assert.ThrowsAsync<TaskCanceledException>(() =>
+            processor.GetAttachmentContentAsync("AAMk-1", "attach-1", cancellationTokenSource.Token));
+
+        Assert.Equal(1, handler.Requests.Count(r => r.RequestUri!.AbsolutePath.EndsWith("/attachments/attach-1")));
+        Assert.DoesNotContain(logger.Entries, e => e.Level == LogLevel.Warning && e.Message.Contains("retrying"));
+    }
+
+    [Fact]
     public async Task EnsureFoldersExistAsync_CreatesAllThreeFolders_WhenMailboxHasNone()
     {
         var (processor, handler) = CreateProcessor();

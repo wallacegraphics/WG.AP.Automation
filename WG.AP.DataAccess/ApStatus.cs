@@ -29,7 +29,7 @@ public enum ApStatus
     /// was reached.</summary>
     MailNeedsReview = 12,
 
-    /// <summary>A PDF could not be parsed, or a total was null, zero or negative.</summary>
+    /// <summary>A PDF could not be parsed (extraction failed before producing any fields).</summary>
     MailError = 13,
 
     /// <summary>No PDF attachments at all — which now includes Excel-only mail. Routed to NeedsReview.</summary>

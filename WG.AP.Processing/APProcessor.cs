@@ -43,6 +43,7 @@ public sealed class APProcessor(
     ClientRepository clientRepository,
     ExtractionPromptRepository extractionPromptRepository,
     AttachmentFileStore attachmentFileStore,
+    ErrorNotifier errorNotifier,
     IOptions<MailboxOptions> mailboxOptions,
     IOptions<DatabaseOptions> databaseOptions,
     ILogger<APProcessor> logger)
@@ -137,6 +138,13 @@ public sealed class APProcessor(
         catch (Exception exception)
         {
             logger.LogError(exception, "Mailbox processing failed.");
+
+            // Sent first, before FinishAsync: the team should still hear about the failure even if
+            // recording it against dbo.ProcessingRun also fails (e.g. the database is what's down).
+            await errorNotifier.NotifyAsync(
+                "AP Automation - Mailbox processing failed",
+                $"{exception.Message}\n\nProcessed {messageCount} message(s), {invoiceCount} invoice(s) before failing.",
+                cancellationToken);
 
             if (processingRunId is not null)
             {

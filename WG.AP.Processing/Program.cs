@@ -88,6 +88,13 @@ builder.Services
     .Validate(options => !string.IsNullOrWhiteSpace(options.Model), $"{OllamaOptions.SectionName}:Model is required.")
     .ValidateOnStart();
 
+builder.Services
+    .AddOptions<AlertOptions>()
+    .Bind(builder.Configuration.GetSection(AlertOptions.SectionName))
+    .Validate(options => options.Recipients.Count > 0, $"{AlertOptions.SectionName}:Recipients must have at least one address.")
+    .Validate(options => options.Recipients.All(recipient => recipient.Contains('@')), $"{AlertOptions.SectionName}:Recipients must all look like email addresses.")
+    .ValidateOnStart();
+
 builder.Services.AddSingleton(serviceProvider =>
 {
     var mailboxOptions = serviceProvider.GetRequiredService<IOptions<MailboxOptions>>().Value;
@@ -126,6 +133,7 @@ builder.Services.AddHttpClient<OllamaClient>((serviceProvider, httpClient) =>
 });
 builder.Services.AddSingleton<IInvoiceFieldExtractor, PdfInvoiceFieldExtractor>();
 
+builder.Services.AddSingleton<ErrorNotifier>();
 builder.Services.AddSingleton<APProcessor>();
 
 builder.Logging.ClearProviders();

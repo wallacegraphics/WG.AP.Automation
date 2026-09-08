@@ -320,7 +320,12 @@ public sealed class GraphMailboxProcessor : IMailSource, IMailSender
             // Same transient set APProcessor.ProcessPdfAsync already treats as infrastructure rather
             // than an invoice verdict. Anything else (not-a-file-attachment, over the size limit, no
             // content via $value) is a real answer from Graph, not a blip - retrying it can't help.
-            catch (Exception exception) when (attempt < MaxAttachmentFetchAttempts && exception is HttpRequestException or TaskCanceledException)
+            // TaskCanceledException is excluded from retry when the caller's own cancellationToken
+            // caused it - that's a real cancellation, not a Graph-side timeout, and should propagate
+            // immediately rather than being logged as "retrying" and delayed another second first.
+            // HttpRequestException has no such ambiguity, so it always stays eligible for retry.
+            catch (Exception exception) when (attempt < MaxAttachmentFetchAttempts &&
+                (exception is HttpRequestException || (exception is TaskCanceledException && !cancellationToken.IsCancellationRequested)))
             {
                 _logger.LogWarning(
                     exception,
