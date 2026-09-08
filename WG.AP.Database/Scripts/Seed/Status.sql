@@ -41,7 +41,8 @@ VALUES
     (21, 'InvoiceExtracted',   N'Extracted',               1, NULL),
     (22, 'InvoiceNeedsReview', N'Needs review',            1, NULL),
     (23, 'InvoiceError',       N'Error',                   1, NULL),
-    (24, 'InvoiceDuplicate',   N'Duplicate invoice number', 1, NULL);
+    (24, 'InvoiceDuplicate',   N'Duplicate invoice number', 1, NULL),
+    (25, 'InvoicePdfDuplicate', N'Duplicate PDF content',  1, NULL);
 
 MERGE [lkup].[Status] AS target
 USING @Status AS source

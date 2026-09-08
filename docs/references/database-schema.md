@@ -79,8 +79,15 @@ invoice numbers the same invoice".
 | already processed | `MailProcessed`, and `MailSkipped` / `MailNeedsReview` | `IsFinal = 1` + the claim gate |
 | duplicate (same email) | `MailDuplicate` | `UQ_MailMessage_MessageKeyHash` |
 | duplicate (same number) | `InvoiceDuplicate` | `UQ_Invoice_ClientNumber` |
+| duplicate (same PDF bytes) | `InvoicePdfDuplicate` | `IX_MailAttachment_Sha256`, queried by `MailAttachmentRepository.FindDuplicateByHashAsync` |
 | failed | `MailError` | `IsFinal = 1` |
 | deleted | `MailDeleted` | Not reachable yet — see *Known gaps* |
+
+`InvoicePdfDuplicate` differs from the row above it: `IX_MailAttachment_Sha256` is deliberately **not**
+unique — a legitimate client resend really is the same bytes, so it has to be findable rather than
+rejected outright. `APProcessor.ProcessPdfAsync` queries it before extraction runs (skipping the Ollama/
+regex call entirely on a hit) and routes the message to `NeedsReview`, the same folder
+`InvoiceDuplicate` uses; only the enforcement differs, not the destination.
 
 **`MailDeleted` is why this table has to exist.** A message the mailbox has already removed is left
 where it is — there's nothing to move it into — so no folder move records the decision. The row is the

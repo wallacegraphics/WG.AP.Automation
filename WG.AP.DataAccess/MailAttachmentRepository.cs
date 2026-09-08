@@ -120,4 +120,45 @@ public sealed class MailAttachmentRepository(
             throw;
         }
     }
+
+    /// <summary>
+    /// The earliest other attachment whose content hash matches this one, or null if these bytes have
+    /// not been seen before.
+    /// </summary>
+    /// <remarks>
+    /// Reads <c>IX_MailAttachment_Sha256</c>, which exists specifically for this: a legitimate resend is
+    /// the same bytes, so it must be findable rather than rejected outright — the caller decides what to
+    /// do with a match (route to review), not this method.
+    /// </remarks>
+    public async Task<DuplicateAttachmentMatch?> FindDuplicateByHashAsync(
+        long mailAttachmentId,
+        byte[] contentSha256,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var connection = await connectionFactory.OpenAsync(cancellationToken);
+
+            return await connection.QuerySingleOrDefaultAsync<DuplicateAttachmentMatch?>(new CommandDefinition(
+                """
+                SELECT TOP (1) [MailAttachmentId], [MailMessageId]
+                 FROM [dbo].[MailAttachment]
+                WHERE [ContentSha256] = @ContentSha256
+                  AND [MailAttachmentId] < @MailAttachmentId
+                ORDER BY [CreatedOn], [MailAttachmentId];
+                """,
+                new
+                {
+                    MailAttachmentId = mailAttachmentId,
+                    ContentSha256 = contentSha256
+                },
+                commandTimeout: connectionFactory.CommandTimeoutSeconds,
+                cancellationToken: cancellationToken));
+        }
+        catch (Exception exception)
+        {
+            logger.LogError(exception, "Failed to check for a content-duplicate of attachment {MailAttachmentId}.", mailAttachmentId);
+            throw;
+        }
+    }
 }

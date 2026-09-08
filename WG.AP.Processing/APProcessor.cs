@@ -311,6 +311,24 @@ public sealed class APProcessor(
 
         await mailAttachmentRepository.SetStoredAsync(pdf.MailAttachmentId, storedPath, sha256, cancellationToken);
 
+        // Checked before extraction runs, not after: these are the exact same bytes as an attachment
+        // already accounted for, so there is nothing new to read out of them, and skipping the Ollama/
+        // regex call avoids re-deriving (and possibly mis-reading differently) data already on record.
+        var duplicate = await mailAttachmentRepository.FindDuplicateByHashAsync(pdf.MailAttachmentId, sha256, cancellationToken);
+
+        if (duplicate is not null)
+        {
+            logger.LogInformation(
+                "Message {MessageId}: PDF attachment '{FileName}' is byte-identical to attachment {ExistingAttachmentId} "
+                + "on mail message {ExistingMailMessageId}; routing to review without extracting.",
+                message.Id, pdf.Attachment.Name, duplicate.MailAttachmentId, duplicate.MailMessageId);
+
+            var duplicateReason = $"'{pdf.Attachment.Name}': identical PDF content already received on mail message {duplicate.MailMessageId}.";
+
+            await RecordInvoiceAsync(claim, pdf, client, fields: null, extraction: null, ApStatus.InvoicePdfDuplicate, duplicateReason, cancellationToken);
+            return (ApStatus.InvoicePdfDuplicate, ApStatus.MailNeedsReview, duplicateReason);
+        }
+
         try
         {
             extraction = await invoiceFieldExtractor.ExtractAsync(pdfBytes, request, cancellationToken);
