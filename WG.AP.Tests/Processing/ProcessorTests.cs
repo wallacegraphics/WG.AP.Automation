@@ -225,6 +225,7 @@ public class ProcessorTests
             [ApStatus.MailProcessed] = 2,
             [ApStatus.MailNeedsReview] = 1,
             [ApStatus.MailError] = 0,
+            [ApStatus.MailSkipped] = 3,
         };
 
         var body = APProcessor.BuildDigestBody(digestLines, outcomes);
@@ -235,5 +236,6 @@ public class ProcessorTests
         Assert.Contains("2 MailProcessed", body);
         Assert.Contains("1 MailNeedsReview", body);
         Assert.Contains("0 MailError", body);
+        Assert.Contains("3 MailSkipped", body);
     }
 }

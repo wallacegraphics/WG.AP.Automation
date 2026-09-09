@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Globalization;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using WG.AP.Core.Abstractions;
@@ -582,7 +583,7 @@ public sealed class APProcessor(
         TimeZoneInfo timeZone)
     {
         var receivedAt = message.ReceivedDateTime is { } utc
-            ? TimeZoneInfo.ConvertTime(utc, timeZone).ToString("MM/dd/yyyy HH:mm:ss zzz")
+            ? TimeZoneInfo.ConvertTime(utc, timeZone).ToString("MM'/'dd'/'yyyy HH':'mm':'ss zzz", CultureInfo.InvariantCulture)
             : "unknown time";
 
         var line = $"\"{message.Subject ?? "(no subject)"}\" from {message.SenderAddress ?? "unknown"} received {receivedAt}: "
@@ -603,7 +604,7 @@ public sealed class APProcessor(
     internal static string BuildDigestBody(IReadOnlyList<string> digestLines, IReadOnlyDictionary<ApStatus, int> outcomes)
     {
         var totals = string.Join(", ", outcomes
-            .Where(pair => pair.Key is ApStatus.MailProcessed or ApStatus.MailNeedsReview or ApStatus.MailError)
+            .Where(pair => pair.Key is ApStatus.MailProcessed or ApStatus.MailNeedsReview or ApStatus.MailError or ApStatus.MailSkipped)
             .Select(pair => $"{pair.Value} {pair.Key}"));
 
         return "This is a summary of the AP Automation mailbox run just completed. Please verify the "
