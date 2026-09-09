@@ -182,7 +182,8 @@ public class ProcessorTests
         Assert.Equal("'INV-1.pdf' could not be parsed.", summary);
     }
 
-    private static readonly TimeZoneInfo Eastern = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");
+    private static readonly TimeZoneInfo Eastern = TimeZoneInfo.FindSystemTimeZoneById(
+    OperatingSystem.IsWindows() ? "Eastern Standard Time" : "America/New_York");
 
     private static MailMessageSummary SanmarMessage(DateTimeOffset? receivedDateTime) =>
         new("msg-1", receivedDateTime, "ashleywhite@sanmar.com", "SanMar 76274 Week 8.22-8.28", Attachments: []);
