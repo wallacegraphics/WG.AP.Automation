@@ -60,13 +60,14 @@ public sealed class APProcessor(
     public async Task ProcessInvoicesAsync(CancellationToken cancellationToken)
     {
         var mailbox = mailboxOptions.Value.ToMailboxRef();
-        var timeZone = TimeZoneInfo.FindSystemTimeZoneById(alertOptions.Value.TimeZoneId);
         long? processingRunId = null;
         var messageCount = 0;
         var invoiceCount = 0;
 
         try
         {
+            var timeZone = TimeZoneInfo.FindSystemTimeZoneById(alertOptions.Value.TimeZoneId);
+
             await mailSource.ValidateAuthAsync(cancellationToken);
             await mailSource.EnsureFoldersExistAsync(cancellationToken);
 
