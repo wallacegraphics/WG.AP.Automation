@@ -1,3 +1,4 @@
+using WG.AP.Core.Abstractions;
 using WG.AP.DataAccess;
 using WG.AP.Invoice.Models;
 using WG.AP.Processor;
@@ -179,5 +180,59 @@ public class ProcessorTests
         var summary = APProcessor.BuildMessageErrorSummary(outcomes);
 
         Assert.Equal("'INV-1.pdf' could not be parsed.", summary);
+    }
+
+    private static readonly TimeZoneInfo Eastern = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");
+
+    private static MailMessageSummary SanmarMessage(DateTimeOffset? receivedDateTime) =>
+        new("msg-1", receivedDateTime, "ashleywhite@sanmar.com", "SanMar 76274 Week 8.22-8.28", Attachments: []);
+
+    [Fact]
+    public void BuildDigestLine_ConvertsUtcReceivedTimeToTheConfiguredZone()
+    {
+        // 16:05:58 UTC on Aug 28 falls in Eastern daylight time (UTC-4), so it must read as 12:05:58 -04:00,
+        // not the raw UTC value Graph returns.
+        var message = SanmarMessage(new DateTimeOffset(2026, 8, 28, 16, 5, 58, TimeSpan.Zero));
+        var result = new APProcessor.MessageOutcome(ApStatus.MailProcessed, null, InvoiceCount: 79, AttachmentCount: 80, PdfCount: 79, SuccessCount: 79);
+
+        var line = APProcessor.BuildDigestLine(message, result, MailDestinationFolder.Processed, Eastern);
+
+        Assert.Contains("08/28/2026 12:05:58 -04:00", line);
+        Assert.Contains("\"SanMar 76274 Week 8.22-8.28\" from ashleywhite@sanmar.com", line);
+        Assert.Contains("80 attachment(s), 79 PDF(s), 79 processed successfully, 0 failed.", line);
+        Assert.Contains("Routed to Processed.", line);
+    }
+
+    [Fact]
+    public void BuildDigestLine_WithNoReceivedTime_FallsBackInsteadOfThrowing()
+    {
+        var message = SanmarMessage(receivedDateTime: null);
+        var result = new APProcessor.MessageOutcome(ApStatus.MailError, "boom", InvoiceCount: 1, AttachmentCount: 1, PdfCount: 1, SuccessCount: 0);
+
+        var line = APProcessor.BuildDigestLine(message, result, MailDestinationFolder.Errors, Eastern);
+
+        Assert.Contains("unknown time", line);
+        Assert.Contains("Routed to Errors.", line);
+    }
+
+    [Fact]
+    public void BuildDigestBody_IncludesIntroLinesAndTotals()
+    {
+        var digestLines = new[] { "line one.", "line two." };
+        var outcomes = new Dictionary<ApStatus, int>
+        {
+            [ApStatus.MailProcessed] = 2,
+            [ApStatus.MailNeedsReview] = 1,
+            [ApStatus.MailError] = 0,
+        };
+
+        var body = APProcessor.BuildDigestBody(digestLines, outcomes);
+
+        Assert.Contains("verify the", body, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("line one.", body);
+        Assert.Contains("line two.", body);
+        Assert.Contains("2 MailProcessed", body);
+        Assert.Contains("1 MailNeedsReview", body);
+        Assert.Contains("0 MailError", body);
     }
 }

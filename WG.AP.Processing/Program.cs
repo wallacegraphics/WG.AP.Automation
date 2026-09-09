@@ -93,6 +93,18 @@ builder.Services
     .Bind(builder.Configuration.GetSection(AlertOptions.SectionName))
     .Validate(options => options.Recipients.Count > 0, $"{AlertOptions.SectionName}:Recipients must have at least one address.")
     .Validate(options => options.Recipients.All(recipient => !string.IsNullOrWhiteSpace(recipient) && recipient.Contains('@')), $"{AlertOptions.SectionName}:Recipients must all look like email addresses.")
+    .Validate(options =>
+    {
+        try
+        {
+            TimeZoneInfo.FindSystemTimeZoneById(options.TimeZoneId);
+            return true;
+        }
+        catch (Exception exception) when (exception is TimeZoneNotFoundException or InvalidTimeZoneException)
+        {
+            return false;
+        }
+    }, $"{AlertOptions.SectionName}:TimeZoneId must be a valid Windows time zone id.")
     .ValidateOnStart();
 
 builder.Services.AddSingleton(serviceProvider =>

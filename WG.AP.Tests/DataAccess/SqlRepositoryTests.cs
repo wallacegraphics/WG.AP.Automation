@@ -198,6 +198,7 @@ public class SqlRepositoryTests
         Assert.NotNull(duplicate);
         Assert.Equal(firstRecorded.MailAttachmentId, duplicate.MailAttachmentId);
         Assert.Equal(firstClaim.MailMessageId, duplicate.MailMessageId);
+        Assert.Equal(firstMessage.Subject, duplicate.Subject);
     }
 
     [SkippableFact]

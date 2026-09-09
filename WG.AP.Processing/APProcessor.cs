@@ -30,6 +30,14 @@ namespace WG.AP.Processor;
 /// delta link is never committed and Graph re-delivers the batch next run. Everything else is a
 /// verdict on that message and is recorded as one.
 /// </item>
+/// <item>
+/// <b>Every message stands alone.</b> Graph's conversation/thread id is never read or stored, so a
+/// reply is judged purely on its own sender and its own attachments - never on what an earlier or
+/// later message in the same Outlook thread contained. A message with no way to reach a verdict
+/// (unresolved client, or nothing attached) is left as <c>MailNew</c> in the Inbox indefinitely rather
+/// than guessed at from thread context, which would mean trusting content an attacker controls
+/// (subject text, PDF content, or simply replying into an existing trusted thread).
+/// </item>
 /// </list>
 /// </remarks>
 public sealed class APProcessor(
@@ -46,11 +54,13 @@ public sealed class APProcessor(
     ErrorNotifier errorNotifier,
     IOptions<MailboxOptions> mailboxOptions,
     IOptions<DatabaseOptions> databaseOptions,
+    IOptions<AlertOptions> alertOptions,
     ILogger<APProcessor> logger)
 {
     public async Task ProcessInvoicesAsync(CancellationToken cancellationToken)
     {
         var mailbox = mailboxOptions.Value.ToMailboxRef();
+        var timeZone = TimeZoneInfo.FindSystemTimeZoneById(alertOptions.Value.TimeZoneId);
         long? processingRunId = null;
         var messageCount = 0;
         var invoiceCount = 0;
@@ -71,6 +81,7 @@ public sealed class APProcessor(
 
             var batch = await mailboxSyncProcessor.GetNewMessagesAsync(cancellationToken);
             var outcomes = new Dictionary<ApStatus, int>();
+            var digestLines = new List<string>();
             var skippedAsAlreadyFinal = 0;
 
             foreach (var message in batch.Messages)
@@ -113,7 +124,12 @@ public sealed class APProcessor(
                     else
                     {
                         await mailMessageRepository.SetStatusAsync(claim.MailMessageId, result.Status, result.ErrorMessage, cancellationToken);
-                        await MoveIfRoutedAsync(message.Id, result.Status, mailFolders, cancellationToken);
+                        var destination = await MoveIfRoutedAsync(message.Id, result.Status, mailFolders, cancellationToken);
+
+                        if (destination is not null)
+                        {
+                            digestLines.Add(BuildDigestLine(message, result, destination.Value, timeZone));
+                        }
                     }
                 }
                 finally
@@ -129,6 +145,14 @@ public sealed class APProcessor(
                 + "{AlreadyFinal} already final, {InvoiceCount} invoice(s). Outcomes: {Outcomes}.",
                 mailbox.MailboxUser, batch.Messages.Count, messageCount, skippedAsAlreadyFinal, invoiceCount,
                 string.Join(", ", outcomes.Select(pair => $"{pair.Key}={pair.Value}")));
+
+            if (digestLines.Count > 0)
+            {
+                await errorNotifier.NotifyAsync(
+                    $"AP Automation - Processing Summary ({mailbox.MailboxUser})",
+                    BuildDigestBody(digestLines, outcomes),
+                    cancellationToken);
+            }
 
             if (processingRunId is not null)
             {
@@ -159,7 +183,7 @@ public sealed class APProcessor(
         }
     }
 
-    private sealed record MessageOutcome(ApStatus Status, string? ErrorMessage, int InvoiceCount);
+    internal sealed record MessageOutcome(ApStatus Status, string? ErrorMessage, int InvoiceCount, int AttachmentCount, int PdfCount, int SuccessCount);
 
     /// <summary>
     /// Records a message's attachments, extracts an invoice from each PDF, and decides where the
@@ -168,10 +192,13 @@ public sealed class APProcessor(
     /// <remarks>
     /// The routing rules, in the order they are applied:
     /// <list type="bullet">
-    /// <item>no PDF attachments — including Excel-only mail — is <c>MailSkipped</c>, routed to NeedsReview</item>
-    /// <item>an unresolved client is left as <c>MailNew</c> - not our client yet, so no extraction is
-    /// attempted and no Invoice row is created; the message is left untouched in the Inbox for the team
-    /// to handle manually</item>
+    /// <item>an unresolved client is left as <c>MailNew</c> - not our client yet, so nothing is recorded
+    /// at all: no attachment rows, no extraction, no Invoice row. The message is left untouched in the
+    /// Inbox for the team to handle manually</item>
+    /// <item>a known client's message with no attachment at all (e.g. "sending it shortly") is also left
+    /// as <c>MailNew</c> in the Inbox - there is nothing to record or review yet</item>
+    /// <item>no PDF attachments but at least one non-PDF one — e.g. Excel-only mail — is
+    /// <c>MailSkipped</c>, routed to NeedsReview so the ignored manifest stays visible</item>
     /// <item>a PDF that cannot be parsed at all is <c>MailError</c></item>
     /// <item>a missing required field or a duplicate number is <c>MailNeedsReview</c></item>
     /// <item>everything present and readable is <c>MailProcessed</c></item>
@@ -188,16 +215,44 @@ public sealed class APProcessor(
         IReadOnlyDictionary<int, ExtractionPromptRecord> prompts,
         CancellationToken cancellationToken)
     {
+        // Client resolution comes first, before anything is written to the database: an unresolved
+        // sender must leave no trace beyond the claim row already made by DiscoverAndClaimAsync - not
+        // an attachment row, not a MailSkipped/NeedsReview verdict just because it also happens to have
+        // no PDF attached. Left as MailNew rather than classified: the message stays untouched in the
+        // Inbox for the team to handle manually once/if this sender is onboarded.
+        var client = ClientRepository.Resolve(clientCatalog, message.SenderAddress);
+
+        if (!client.IsKnown)
+        {
+            logger.LogInformation(
+                "Message {MessageId} is from {Sender}, which matches no configured client; leaving it in the Inbox for manual handling.",
+                message.Id, message.SenderAddress ?? "unknown");
+            return new MessageOutcome(ApStatus.MailNew, null, InvoiceCount: 0, AttachmentCount: 0, PdfCount: 0, SuccessCount: 0);
+        }
+
+        if (!message.Attachments.Any(a => !a.IsInline))
+        {
+            // A known client's reply with no attachment at all has nothing to record and nothing to
+            // review yet - left as MailNew, same as an unresolved client, so it stays in the Inbox
+            // instead of being pulled into NeedsReview for no reason.
+            logger.LogInformation(
+                "Message {MessageId} from {Sender} has no attachments; leaving it in the Inbox.",
+                message.Id, message.SenderAddress ?? "unknown");
+            return new MessageOutcome(ApStatus.MailNew, null, InvoiceCount: 0, AttachmentCount: 0, PdfCount: 0, SuccessCount: 0);
+        }
+
         // Every attachment is recorded, including the Excel ones nothing reads any more: a row with
         // Kind = 'Excel' is how "a manifest arrived and we ignored it" stays answerable later.
         var recorded = await mailAttachmentRepository.RecordAsync(claim.MailMessageId, message.Attachments, cancellationToken);
         var pdfs = recorded.Where(item => IsPdf(item.Attachment)).ToList();
+        var attachmentCount = recorded.Count(item => !item.Attachment.IsInline);
 
         if (pdfs.Count == 0)
         {
             logger.LogInformation(
                 "Message {MessageId} has no PDF attachment(s); routing to NeedsReview.", message.Id);
-            return new MessageOutcome(ApStatus.MailSkipped, null, InvoiceCount: 0);
+            var skipReason = $"No PDF attachment(s); {attachmentCount} non-PDF attachment(s) received.";
+            return new MessageOutcome(ApStatus.MailSkipped, skipReason, InvoiceCount: 0, attachmentCount, PdfCount: 0, SuccessCount: 0);
         }
 
         // The cap exists so a document that reliably breaks extraction stops consuming every run.
@@ -207,21 +262,7 @@ public sealed class APProcessor(
             logger.LogWarning(
                 "Message {MessageId} has been attempted {AttemptCount} times (cap {MaxAttempts}); routing to review.",
                 message.Id, claim.AttemptCount, databaseOptions.Value.MaxAttempts);
-            return new MessageOutcome(ApStatus.MailNeedsReview, $"Attempt cap of {databaseOptions.Value.MaxAttempts} reached.", InvoiceCount: 0);
-        }
-
-        var client = ClientRepository.Resolve(clientCatalog, message.SenderAddress);
-
-        if (!client.IsKnown)
-        {
-            // Not our client yet - nothing to extract against (no format, no prompt, no deterministic
-            // extractor key), so don't attempt it. Left as MailNew rather than classified: the message
-            // stays untouched in the Inbox for the team to handle manually once/if this sender is
-            // onboarded, instead of recording an all-null Invoice row for every one of its PDFs.
-            logger.LogInformation(
-                "Message {MessageId} is from {Sender}, which matches no configured client; leaving it in the Inbox for manual handling.",
-                message.Id, message.SenderAddress ?? "unknown");
-            return new MessageOutcome(ApStatus.MailNew, null, InvoiceCount: 0);
+            return new MessageOutcome(ApStatus.MailNeedsReview, $"Attempt cap of {databaseOptions.Value.MaxAttempts} reached.", InvoiceCount: 0, attachmentCount, pdfs.Count, SuccessCount: 0);
         }
 
         var request = BuildExtractionRequest(client, prompts);
@@ -251,14 +292,14 @@ public sealed class APProcessor(
         logger.LogInformation(
             "Message {MessageId} \"{Subject}\" from {Sender} received {ReceivedAt}: {AttachmentCount} attachment(s), {PdfCount} PDF(s), {SuccessCount} processed successfully, {FailedCount} failed.",
             message.Id, message.Subject ?? "(no subject)", message.SenderAddress ?? "unknown", message.ReceivedDateTime,
-            recorded.Count(item => !item.Attachment.IsInline), pdfs.Count, pdfSuccessCount, pdfs.Count - pdfSuccessCount);
+            attachmentCount, pdfs.Count, pdfSuccessCount, pdfs.Count - pdfSuccessCount);
 
         // Every problem PDF's own reason, not just the single worst one - so a message that moves to
         // Errors/NeedsReview because one of several PDFs failed still says which PDF, what went wrong,
         // and that the others were fine, instead of silently dropping that context.
         var errorMessage = worst == ApStatus.MailProcessed ? null : BuildMessageErrorSummary(pdfOutcomes);
 
-        return new MessageOutcome(worst, errorMessage, invoiceCount);
+        return new MessageOutcome(worst, errorMessage, invoiceCount, attachmentCount, pdfs.Count, pdfSuccessCount);
     }
 
     /// <summary>
@@ -329,9 +370,11 @@ public sealed class APProcessor(
                 + "on mail message {ExistingMailMessageId}; routing to review without extracting.",
                 message.Id, pdf.Attachment.Name, duplicate.MailAttachmentId, duplicate.MailMessageId);
 
-            var duplicateReason = $"'{pdf.Attachment.Name}': identical PDF content already received on mail message {duplicate.MailMessageId}.";
+            var duplicateReason = $"'{pdf.Attachment.Name}': Byte-identical PDF (same file content, e.g. a resend in the thread) - "
+                + $"identical content already received on \"{duplicate.Subject ?? "(no subject)"}\" (mail message {duplicate.MailMessageId}).";
 
-            await RecordInvoiceAsync(claim, pdf, client, fields: null, extraction: null, ApStatus.InvoicePdfDuplicate, duplicateReason, cancellationToken);
+            // No Invoice row for this one - identical bytes mean there is nothing new to record, and
+            // the verdict already lives on the mail message's own status/reason and the digest email.
             return (ApStatus.InvoicePdfDuplicate, ApStatus.MailNeedsReview, duplicateReason);
         }
 
@@ -364,7 +407,8 @@ public sealed class APProcessor(
             // rejected, so the duplicate is visible through the message status and the log rather than
             // as a second ledger row - which is the point of the constraint.
             return (ApStatus.InvoiceDuplicate, ApStatus.MailNeedsReview,
-                $"'{pdf.Attachment.Name}': invoice number '{extraction.Fields.InvoiceNumber}' is already recorded for this client.");
+                $"'{pdf.Attachment.Name}': Same invoice number for the same client, but different PDF bytes - "
+                + $"invoice number '{extraction.Fields.InvoiceNumber}' is already recorded for this client.");
         }
 
         return (invoiceStatus, mailStatus, reason);
@@ -499,7 +543,7 @@ public sealed class APProcessor(
     /// already final. The opposite order would leave a moved message with no recorded verdict, which
     /// is the state that causes double work.
     /// </remarks>
-    private async Task MoveIfRoutedAsync(
+    private async Task<MailDestinationFolder?> MoveIfRoutedAsync(
         string graphMessageId,
         ApStatus status,
         IReadOnlyDictionary<ApStatus, string?> mailFolders,
@@ -507,7 +551,7 @@ public sealed class APProcessor(
     {
         if (!mailFolders.TryGetValue(status, out var folderName) || folderName is null)
         {
-            return;
+            return null;
         }
 
         if (!Enum.TryParse<MailDestinationFolder>(folderName, ignoreCase: true, out var destination))
@@ -516,11 +560,55 @@ public sealed class APProcessor(
                 "lkup.Status routes {Status} to folder '{FolderName}', which is not a MailDestinationFolder member. "
                 + "The message was classified but not moved.",
                 status, folderName);
-            return;
+            return null;
         }
 
         await mailSource.MoveMessageAsync(graphMessageId, destination, cancellationToken);
         logger.LogInformation("Message {MessageId} routed to {Destination}.", graphMessageId, destination);
+        return destination;
+    }
+
+    /// <summary>
+    /// One line of the per-run summary email, mirroring <see cref="ProcessMessageAsync"/>'s completion
+    /// log line but with the received time converted from Graph's UTC into <paramref name="timeZone"/>
+    /// and the routed folder named, since the email's whole point is answering "what happened and where
+    /// did it go" without opening the log file.
+    /// </summary>
+    internal static string BuildDigestLine(
+        MailMessageSummary message,
+        MessageOutcome result,
+        MailDestinationFolder destination,
+        TimeZoneInfo timeZone)
+    {
+        var receivedAt = message.ReceivedDateTime is { } utc
+            ? TimeZoneInfo.ConvertTime(utc, timeZone).ToString("MM/dd/yyyy HH:mm:ss zzz")
+            : "unknown time";
+
+        var line = $"\"{message.Subject ?? "(no subject)"}\" from {message.SenderAddress ?? "unknown"} received {receivedAt}: "
+            + $"{result.AttachmentCount} attachment(s), {result.PdfCount} PDF(s), {result.SuccessCount} processed successfully, "
+            + $"{result.PdfCount - result.SuccessCount} failed. Routed to {destination}.";
+
+        // The reason is what makes NeedsReview/Errors lines actionable from the email alone - it names
+        // the specific problem PDF (and, for a duplicate, the earlier message it matches) rather than
+        // leaving the recipient to open the mailbox just to find out what went wrong.
+        return result.ErrorMessage is null ? line : $"{line} {result.ErrorMessage}";
+    }
+
+    /// <summary>
+    /// The full body of the per-run summary email: an intro asking the recipient to check the mailbox
+    /// folders, one <see cref="BuildDigestLine"/> per routed message, and a totals footer reusing the
+    /// same <c>outcomes</c> tally already logged in <see cref="ProcessInvoicesAsync"/>'s completion line.
+    /// </summary>
+    internal static string BuildDigestBody(IReadOnlyList<string> digestLines, IReadOnlyDictionary<ApStatus, int> outcomes)
+    {
+        var totals = string.Join(", ", outcomes
+            .Where(pair => pair.Key is ApStatus.MailProcessed or ApStatus.MailNeedsReview or ApStatus.MailError)
+            .Select(pair => $"{pair.Value} {pair.Key}"));
+
+        return "This is a summary of the AP Automation mailbox run just completed. Please verify the "
+            + "Processed, Errors, and NeedsReview folders as needed.\n\n"
+            + string.Join("\n", digestLines)
+            + $"\n\nTotals: {totals}.";
     }
 
     // Worst-wins ordering when one email yields several PDFs.
