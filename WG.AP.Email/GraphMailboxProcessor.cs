@@ -1,11 +1,12 @@
-using System.Runtime.CompilerServices;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Microsoft.Graph;
 using Microsoft.Graph.Models;
+using Microsoft.Graph.Models.ODataErrors;
 using Microsoft.Graph.Users.Item.Messages.Item.Move;
 using Microsoft.Graph.Users.Item.SendMail;
 using Microsoft.Kiota.Abstractions;
+using System.Runtime.CompilerServices;
 using WG.AP.Core.Abstractions;
 
 namespace WG.AP.Email;
@@ -359,7 +360,7 @@ public sealed class GraphMailboxProcessor : IMailSource, IMailSender
             var movedId = moved?.Id ?? throw CreateInvalidOperation("Move operation did not return a message id.");
 
             _logger.LogInformation(
-                "Moved message {MessageId} to {Destination} for {MailboxUser}; new id {NewMessageId}.",
+                "Moved message {MessageId} to {Destination} for {MailboxUser}; returned id {NewMessageId}.",
                 messageId, destination, _options.MailboxUser, movedId);
 
             return movedId;
@@ -395,6 +396,17 @@ public sealed class GraphMailboxProcessor : IMailSource, IMailSender
                     SaveToSentItems = true
                 },
                 cancellationToken: cancellationToken);
+        }
+        catch (ODataError exception)
+        {
+            _logger.LogError(
+                exception,
+                "Failed to send mail {Subject} from {MailboxUser}. GraphCode={GraphCode}; GraphMessage={GraphMessage}.",
+                request.Subject,
+                _options.MailboxUser,
+                exception.Error?.Code,
+                exception.Error?.Message);
+            throw;
         }
         catch (Exception exception)
         {

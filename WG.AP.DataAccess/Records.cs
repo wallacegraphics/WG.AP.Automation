@@ -19,7 +19,8 @@ public sealed record RecordedAttachment(long MailAttachmentId, MailAttachmentSum
 /// An earlier attachment whose bytes are identical to the one just stored, as found via
 /// <c>IX_MailAttachment_Sha256</c>.
 /// </summary>
-public sealed record DuplicateAttachmentMatch(long MailAttachmentId, long MailMessageId);
+/// <param name="Subject">The earlier message's subject, for naming it in a human-readable reason.</param>
+public sealed record DuplicateAttachmentMatch(long MailAttachmentId, long MailMessageId, string? Subject);
 
 /// <summary>The client an incoming email resolved to.</summary>
 /// <param name="ClientId">0 when the sender domain matched no enabled client.</param>

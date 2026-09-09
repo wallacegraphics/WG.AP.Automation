@@ -141,11 +141,12 @@ public sealed class MailAttachmentRepository(
 
             return await connection.QuerySingleOrDefaultAsync<DuplicateAttachmentMatch?>(new CommandDefinition(
                 """
-                SELECT TOP (1) [MailAttachmentId], [MailMessageId]
-                 FROM [dbo].[MailAttachment]
-                WHERE [ContentSha256] = @ContentSha256
-                  AND [MailAttachmentId] < @MailAttachmentId
-                ORDER BY [CreatedOn], [MailAttachmentId];
+                SELECT TOP (1) ma.[MailAttachmentId], ma.[MailMessageId], mm.[Subject]
+                 FROM [dbo].[MailAttachment] AS ma
+                 JOIN [dbo].[MailMessage] AS mm ON mm.[MailMessageId] = ma.[MailMessageId]
+                WHERE ma.[ContentSha256] = @ContentSha256
+                  AND ma.[MailAttachmentId] < @MailAttachmentId
+                ORDER BY ma.[CreatedOn], ma.[MailAttachmentId];
                 """,
                 new
                 {

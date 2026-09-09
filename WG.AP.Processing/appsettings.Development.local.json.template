@@ -32,6 +32,7 @@
     "MailboxId": "<mailbox Entra object id>"
   },
   "Alert": {
-    "Recipients": [ "galina.zezetko@wallacegraphics.com" ]
+    "Recipients": [ "galina.zezetko@wallacegraphics.com" ],
+    "TimeZoneId": "Eastern Standard Time"
   }
 }

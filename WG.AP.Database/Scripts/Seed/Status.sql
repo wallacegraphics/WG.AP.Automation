@@ -5,7 +5,10 @@
     dbo.MailMessage / dbo.Invoice constrain themselves to their band. Never renumber.
 
     Mail statuses map 1:1 onto the routing tree in APProcessor:
-        no PDF attachments (incl. Excel-only mail)   -> MailSkipped     -> NeedsReview
+        sender matches no configured client, or a
+            reply with no attachment at all          -> MailNew        -> left in Inbox
+        has an attachment but no PDF (incl.
+            Excel-only mail)                         -> MailSkipped     -> NeedsReview
         PDF unparseable, or Total <= 0               -> MailError
         Client/InvoiceDate/InvoiceNumber/CustomerPO
             missing, duplicate number, 3rd attempt   -> MailNeedsReview
