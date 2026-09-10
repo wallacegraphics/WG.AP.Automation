@@ -41,7 +41,7 @@ CREATE TABLE [dbo].[MailMessage]
     [StatusId]        INT               NOT NULL,
     [AttemptCount]    INT               NOT NULL CONSTRAINT [DF_MailMessage_AttemptCount] DEFAULT (0),
     [LastAttemptOn]   DATETIME2(3)      NULL,
-    [ErrorMessage]    NVARCHAR(1000)    NULL,
+    [ErrorMessage]    NVARCHAR(MAX)     NULL,
 
     [CreatedBy]       NVARCHAR(128) NOT NULL CONSTRAINT [DF_MailMessage_CreatedBy] DEFAULT (SUSER_SNAME()),
     [CreatedOn]       DATETIME2(3)  NOT NULL CONSTRAINT [DF_MailMessage_CreatedOn] DEFAULT (SYSUTCDATETIME()),

@@ -80,7 +80,7 @@ CREATE TABLE [dbo].[Invoice]
     [ExtractionMethod]   VARCHAR(10)   NULL,   -- Regex | Ollama
     [ExtractionPromptId] INT           NULL,   -- which prompt version, when Ollama
     [StatusId]           INT           NOT NULL,
-    [ErrorMessage]       NVARCHAR(1000) NULL,  -- also carries the review reason
+    [ErrorMessage]       NVARCHAR(MAX)  NULL,  -- also carries the review reason
 
     [CreatedBy]          NVARCHAR(128) NOT NULL CONSTRAINT [DF_Invoice_CreatedBy] DEFAULT (SUSER_SNAME()),
     [CreatedOn]          DATETIME2(3)  NOT NULL CONSTRAINT [DF_Invoice_CreatedOn] DEFAULT (SYSUTCDATETIME()),
