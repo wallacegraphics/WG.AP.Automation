@@ -166,6 +166,39 @@ public sealed class MailMessageRepository(
         }
     }
 
+    /// <summary>
+    /// Loads message rows from one run that carry a stored error reason.
+    /// </summary>
+    public async Task<IReadOnlyList<MailMessageErrorLogRow>> LoadErrorLogRowsForRunAsync(
+        long processingRunId,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var connection = await connectionFactory.OpenAsync(cancellationToken);
+
+            var rows = await connection.QueryAsync<MailMessageErrorLogRow>(new CommandDefinition(
+                """
+                SELECT [StatusId], [SenderAddress], [Subject], [ReceivedOn], [ErrorMessage]
+                  FROM [dbo].[MailMessage]
+                 WHERE [ProcessingRunId] = @ProcessingRunId
+                   AND [ErrorMessage] IS NOT NULL
+                   AND LEN(LTRIM(RTRIM([ErrorMessage]))) > 0
+                 ORDER BY [MailMessageId];
+                """,
+                new { ProcessingRunId = processingRunId },
+                commandTimeout: connectionFactory.CommandTimeoutSeconds,
+                cancellationToken: cancellationToken));
+
+            return rows.ToList();
+        }
+        catch (Exception exception)
+        {
+            logger.LogError(exception, "Failed to load mail-message error rows for processing run {ProcessingRunId}.", processingRunId);
+            throw;
+        }
+    }
+
     // Subject text is bounded in the schema but not at the source: Graph subjects can run long.
     // Truncating here keeps a long value from failing the write - losing the tail of a subject is
     // a far better outcome than losing the row.

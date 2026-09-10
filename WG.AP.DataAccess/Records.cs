@@ -12,6 +12,14 @@ namespace WG.AP.DataAccess;
 /// <param name="AttemptCount">Attempts including this one, for comparison against the cap.</param>
 public sealed record MailMessageClaim(long MailMessageId, bool Claimed, int StatusId, int AttemptCount);
 
+/// <summary>One MailMessage row with a stored error reason, for log output.</summary>
+public sealed record MailMessageErrorLogRow(
+    int StatusId,
+    string? SenderAddress,
+    string? Subject,
+    DateTimeOffset? ReceivedOn,
+    string ErrorMessage);
+
 /// <summary>A stored attachment, as recorded.</summary>
 public sealed record RecordedAttachment(long MailAttachmentId, MailAttachmentSummary Attachment);
 

@@ -148,6 +148,16 @@ public sealed class APProcessor(
                 mailbox.MailboxUser, batch.Messages.Count, messageCount, skippedAsAlreadyFinal, invoiceCount,
                 string.Join(", ", outcomes.Select(pair => $"{pair.Key}={pair.Value}")));
 
+            if (processingRunId is not null)
+            {
+                var errorRows = await mailMessageRepository.LoadErrorLogRowsForRunAsync(processingRunId.Value, cancellationToken);
+
+                foreach (var errorRow in errorRows)
+                {
+                    logger.LogInformation("{ErrorLine}", BuildErrorLogLine(errorRow));
+                }
+            }
+
             if (digestLines.Count > 0)
             {
                 await errorNotifier.NotifyAsync(
@@ -611,6 +621,22 @@ public sealed class APProcessor(
             + "Processed, Errors, and NeedsReview folders as needed.\n\n"
             + string.Join("\n", digestLines)
             + $"\n\nTotals: {totals}.";
+    }
+
+    /// <summary>
+    /// One log line for a persisted <c>dbo.MailMessage.ErrorMessage</c> entry.
+    /// </summary>
+    internal static string BuildErrorLogLine(MailMessageErrorLogRow row)
+    {
+        var receivedAt = row.ReceivedOn?.ToString("MM'/'dd'/'yyyy HH':'mm':'ss zzz", CultureInfo.InvariantCulture)
+            ?? "unknown time";
+
+        var status = Enum.IsDefined(typeof(ApStatus), row.StatusId)
+            ? ((ApStatus)row.StatusId).ToString()
+            : row.StatusId.ToString(CultureInfo.InvariantCulture);
+
+        return $"{status}: \"{row.Subject ?? "(no subject)"}\" from {row.SenderAddress ?? "unknown"} "
+            + $"received {receivedAt}. Reason: {row.ErrorMessage}";
     }
 
     // Worst-wins ordering when one email yields several PDFs.

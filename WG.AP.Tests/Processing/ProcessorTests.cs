@@ -217,6 +217,42 @@ public class ProcessorTests
     }
 
     [Fact]
+    public void BuildErrorLogLine_IncludesStatusMessageIdentityAndReason()
+    {
+        var row = new MailMessageErrorLogRow(
+            StatusId: (int)ApStatus.MailNeedsReview,
+            SenderAddress: "ashleywhite@sanmar.com",
+            Subject: "SanMar 76274 Week 7.18-7.24",
+            ReceivedOn: new DateTimeOffset(2026, 7, 24, 17, 16, 10, TimeSpan.Zero),
+            ErrorMessage: "'76274.pdf': missing InvoiceDate.");
+
+        var line = APProcessor.BuildErrorLogLine(row);
+
+        Assert.Contains("MailNeedsReview:", line);
+        Assert.Contains("\"SanMar 76274 Week 7.18-7.24\" from ashleywhite@sanmar.com", line);
+        Assert.Contains("received 07/24/2026 17:16:10 +00:00", line);
+        Assert.Contains("Reason: '76274.pdf': missing InvoiceDate.", line);
+    }
+
+    [Fact]
+    public void BuildErrorLogLine_WithNoReceivedTime_FallsBackInsteadOfThrowing()
+    {
+        var row = new MailMessageErrorLogRow(
+            StatusId: (int)ApStatus.MailError,
+            SenderAddress: null,
+            Subject: null,
+            ReceivedOn: null,
+            ErrorMessage: "boom");
+
+        var line = APProcessor.BuildErrorLogLine(row);
+
+        Assert.Contains("MailError:", line);
+        Assert.Contains("\"(no subject)\" from unknown", line);
+        Assert.Contains("received unknown time", line);
+        Assert.Contains("Reason: boom", line);
+    }
+
+    [Fact]
     public void BuildDigestBody_IncludesIntroLinesAndTotals()
     {
         var digestLines = new[] { "line one.", "line two." };
