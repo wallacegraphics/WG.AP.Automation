@@ -186,7 +186,13 @@ public sealed class MailMessageRepository(
                    AND LEN(LTRIM(RTRIM([ErrorMessage]))) > 0
                  ORDER BY [MailMessageId];
                 """,
-                new { ProcessingRunId = processingRunId },
+                new
+                {
+                    ProcessingRunId = processingRunId,
+                    MailNeedsReviewStatusId = (int)ApStatus.MailNeedsReview,
+                    MailErrorStatusId = (int)ApStatus.MailError,
+                    MailSkippedStatusId = (int)ApStatus.MailSkipped
+                },
                 commandTimeout: connectionFactory.CommandTimeoutSeconds,
                 cancellationToken: cancellationToken));
 

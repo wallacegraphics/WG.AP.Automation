@@ -148,7 +148,13 @@ public sealed class APProcessor(
                 mailbox.MailboxUser, batch.Messages.Count, messageCount, skippedAsAlreadyFinal, invoiceCount,
                 string.Join(", ", outcomes.Select(pair => $"{pair.Key}={pair.Value}")));
 
-            if (processingRunId is not null)
+            var shouldLogErrorRows =
+                 outcomes.GetValueOrDefault(ApStatus.MailNeedsReview) > 0
+                 || outcomes.GetValueOrDefault(ApStatus.MailError) > 0
+                 || outcomes.GetValueOrDefault(ApStatus.MailSkipped) > 0
+                 || outcomes.GetValueOrDefault(ApStatus.MailDuplicate) > 0;
+
+            if (processingRunId is not null && shouldLogErrorRows)
             {
                 var errorRows = await mailMessageRepository.LoadErrorLogRowsForRunAsync(processingRunId.Value, cancellationToken);
 
