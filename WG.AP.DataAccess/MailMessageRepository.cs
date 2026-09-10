@@ -124,7 +124,7 @@ public sealed class MailMessageRepository(
                 {
                     MailMessageId = mailMessageId,
                     StatusId = (int)status,
-                    ErrorMessage = Truncate(errorMessage, 1000),
+                    ErrorMessage = errorMessage,
                     AppIdentity = connectionFactory.AppIdentity
                 },
                 commandTimeout: connectionFactory.CommandTimeoutSeconds,
@@ -166,9 +166,9 @@ public sealed class MailMessageRepository(
         }
     }
 
-    // Subject and error text are bounded in the schema but not at the source: Graph subjects can run
-    // long, and an exception message is arbitrary. Truncating here keeps a long value from failing
-    // the write - losing the tail of a subject is a far better outcome than losing the row.
+    // Subject text is bounded in the schema but not at the source: Graph subjects can run long.
+    // Truncating here keeps a long value from failing the write - losing the tail of a subject is
+    // a far better outcome than losing the row.
     internal static string? Truncate(string? value, int maxLength) =>
         value is null || value.Length <= maxLength ? value : value[..maxLength];
 

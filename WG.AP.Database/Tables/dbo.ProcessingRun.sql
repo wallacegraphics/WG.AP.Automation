@@ -12,7 +12,7 @@ CREATE TABLE [dbo].[ProcessingRun]
     [MessageCount]    INT              NOT NULL CONSTRAINT [DF_ProcessingRun_MessageCount] DEFAULT (0),
     [InvoiceCount]    INT              NOT NULL CONSTRAINT [DF_ProcessingRun_InvoiceCount] DEFAULT (0),
     [IsSuccessful]    BIT              NULL,
-    [ErrorMessage]    NVARCHAR(1000)   NULL,
+    [ErrorMessage]    NVARCHAR(MAX)    NULL,
 
     [CreatedBy]       NVARCHAR(128) NOT NULL CONSTRAINT [DF_ProcessingRun_CreatedBy] DEFAULT (SUSER_SNAME()),
     [CreatedOn]       DATETIME2(3)  NOT NULL CONSTRAINT [DF_ProcessingRun_CreatedOn] DEFAULT (SYSUTCDATETIME()),

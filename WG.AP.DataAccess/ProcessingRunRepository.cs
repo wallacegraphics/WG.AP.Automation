@@ -75,7 +75,7 @@ public sealed class ProcessingRunRepository(
                     MessageCount = messageCount,
                     InvoiceCount = invoiceCount,
                     IsSuccessful = isSuccessful,
-                    ErrorMessage = MailMessageRepository.Truncate(errorMessage, 1000),
+                    ErrorMessage = errorMessage,
                     AppIdentity = connectionFactory.AppIdentity
                 },
                 commandTimeout: connectionFactory.CommandTimeoutSeconds,

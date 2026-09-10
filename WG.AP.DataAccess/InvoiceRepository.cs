@@ -75,7 +75,7 @@ public sealed class InvoiceRepository(
                     invoice.ExtractionMethod,
                     invoice.ExtractionPromptId,
                     StatusId = (int)invoice.Status,
-                    ErrorMessage = MailMessageRepository.Truncate(invoice.ErrorMessage, 1000),
+                    ErrorMessage = invoice.ErrorMessage,
                     CreatedBy = connectionFactory.AppIdentity
                 },
                 commandTimeout: connectionFactory.CommandTimeoutSeconds,
