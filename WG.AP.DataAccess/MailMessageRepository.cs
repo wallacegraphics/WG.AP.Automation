@@ -182,6 +182,7 @@ public sealed class MailMessageRepository(
                 SELECT [StatusId], [SenderAddress], [Subject], [ReceivedOn], [ErrorMessage]
                   FROM [dbo].[MailMessage]
                  WHERE [ProcessingRunId] = @ProcessingRunId
+                   AND [StatusId] IN (@MailNeedsReviewStatusId, @MailErrorStatusId, @MailSkippedStatusId, @MailDuplicateStatusId)
                    AND [ErrorMessage] IS NOT NULL
                    AND LEN(LTRIM(RTRIM([ErrorMessage]))) > 0
                  ORDER BY [MailMessageId];
@@ -191,7 +192,8 @@ public sealed class MailMessageRepository(
                     ProcessingRunId = processingRunId,
                     MailNeedsReviewStatusId = (int)ApStatus.MailNeedsReview,
                     MailErrorStatusId = (int)ApStatus.MailError,
-                    MailSkippedStatusId = (int)ApStatus.MailSkipped
+                    MailSkippedStatusId = (int)ApStatus.MailSkipped,
+                    MailDuplicateStatusId = (int)ApStatus.MailDuplicate
                 },
                 commandTimeout: connectionFactory.CommandTimeoutSeconds,
                 cancellationToken: cancellationToken));
