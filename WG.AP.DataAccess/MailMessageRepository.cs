@@ -87,9 +87,7 @@ public sealed class MailMessageRepository(
                  WHERE NOT EXISTS (
                      SELECT 1
                        FROM [dbo].[MailMessage] AS m WITH (UPDLOCK, HOLDLOCK)
-                       LEFT JOIN [lkup].[Status] AS s ON s.[StatusId] = m.[StatusId]
-                      WHERE m.[MessageKeyHash] = @GraphHash
-                        AND s.[IsFinal] = 0);
+                      WHERE m.[MessageKeyHash] = @GraphHash);
 
                 UPDATE m
                    SET [AttemptCount]    = m.[AttemptCount] + 1,
@@ -171,7 +169,7 @@ public sealed class MailMessageRepository(
                        N'Duplicate replay of already-final message id in this run.', @AppIdentity
                  WHERE NOT EXISTS (
                      SELECT 1
-                       FROM [dbo].[MailMessage]
+                       FROM [dbo].[MailMessage] WITH (UPDLOCK, HOLDLOCK)
                       WHERE [ProcessingRunId] = @ProcessingRunId
                         AND [GraphMessageId] = @ReplayGraphMessageId);
 

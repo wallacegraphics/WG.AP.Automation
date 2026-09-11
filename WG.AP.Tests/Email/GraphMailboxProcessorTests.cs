@@ -408,6 +408,7 @@ public class GraphMailboxProcessorTests
             CancellationToken.None);
 
         Assert.NotNull(capturedBody);
+        Assert.Contains("\"contentType\":\"html\"", capturedBody, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("Test notification", capturedBody);
         Assert.Contains("ap-team@wallacegraphics.com", capturedBody);
     }
