@@ -381,7 +381,7 @@ public sealed class GraphMailboxProcessor : IMailSource, IMailSender
                 Subject = request.Subject,
                 Body = new ItemBody
                 {
-                    ContentType = BodyType.Text,
+                    ContentType = BodyType.Html,
                     Content = request.Body
                 },
                 ToRecipients = request.ToAddresses

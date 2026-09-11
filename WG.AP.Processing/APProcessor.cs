@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Globalization;
+using System.Net;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using WG.AP.Core.Abstractions;
@@ -62,6 +63,7 @@ public sealed class APProcessor(
     {
         var mailbox = mailboxOptions.Value.ToMailboxRef();
         long? processingRunId = null;
+        var deliveredCount = 0;
         var messageCount = 0;
         var invoiceCount = 0;
 
@@ -83,7 +85,7 @@ public sealed class APProcessor(
 
             var batch = await mailboxSyncProcessor.GetNewMessagesAsync(cancellationToken);
             var outcomes = new Dictionary<ApStatus, int>();
-            var digestLines = new List<string>();
+            var digestEntries = new List<DigestEntry>();
             var skippedAsAlreadyFinal = 0;
 
             foreach (var message in batch.Messages)
@@ -95,6 +97,44 @@ public sealed class APProcessor(
                 {
                     if (!claim.Claimed)
                     {
+                        if (processingRunId is not null)
+                        {
+                            var duplicateReplay = await mailMessageRepository.RecordAlreadyFinalReplayNeedsReviewAsync(
+                                mailbox,
+                                processingRunId.Value,
+                                message,
+                                cancellationToken);
+
+                            if (duplicateReplay is not null)
+                            {
+                                deliveredCount++;
+                                outcomes[ApStatus.MailNeedsReview] = outcomes.GetValueOrDefault(ApStatus.MailNeedsReview) + 1;
+
+                                var duplicateReplayOutcome = new MessageOutcome(
+                                    ApStatus.MailNeedsReview,
+                                    duplicateReplay.ErrorMessage,
+                                    InvoiceCount: 0,
+                                    AttachmentCount: message.Attachments.Count(a => !a.IsInline),
+                                    PdfCount: message.Attachments.Count(a => !a.IsInline && IsPdf(a)),
+                                    SuccessCount: 0);
+
+                                var destination = await MoveIfRoutedAsync(message.Id, ApStatus.MailNeedsReview, mailFolders, cancellationToken);
+
+                                if (destination is not null)
+                                {
+                                    digestEntries.Add(new DigestEntry(
+                                        destination.Value,
+                                        message.ReceivedDateTime,
+                                        BuildDigestLine(message, duplicateReplayOutcome, timeZone),
+                                        BuildDigestErrorDetail(duplicateReplayOutcome),
+                                        Status: ApStatus.MailNeedsReview,
+                                        Subject: message.Subject));
+                                }
+
+                                continue;
+                            }
+                        }
+
                         // Already decided on an earlier run. Re-delivery is normal — it is how the
                         // crash-safe delta ordering works — so this is not a warning.
                         skippedAsAlreadyFinal++;
@@ -104,6 +144,7 @@ public sealed class APProcessor(
                         continue;
                     }
 
+                    deliveredCount++;
                     messageCount++;
 
                     logger.LogInformation(
@@ -130,7 +171,13 @@ public sealed class APProcessor(
 
                         if (destination is not null)
                         {
-                            digestLines.Add(BuildDigestLine(message, result, destination.Value, timeZone));
+                            digestEntries.Add(new DigestEntry(
+                                destination.Value,
+                                message.ReceivedDateTime,
+                                BuildDigestLine(message, result, timeZone),
+                                BuildDigestErrorDetail(result),
+                                Status: result.Status,
+                                Subject: message.Subject));
                         }
                     }
                 }
@@ -145,8 +192,8 @@ public sealed class APProcessor(
             logger.LogInformation(
                 "Mailbox scan complete for {MailboxUser}: {DeliveredCount} delivered, {MessageCount} processed, "
                 + "{AlreadyFinal} already final, {InvoiceCount} invoice(s). Outcomes: {Outcomes}.",
-                mailbox.MailboxUser, batch.Messages.Count, messageCount, skippedAsAlreadyFinal, invoiceCount,
-                string.Join(", ", outcomes.Select(pair => $"{pair.Key}={pair.Value}")));
+                mailbox.MailboxUser, deliveredCount, messageCount, skippedAsAlreadyFinal, invoiceCount,
+                BuildOutcomesSummary(outcomes, digestEntries, timeZone));
 
             var shouldLogErrorRows =
                  outcomes.GetValueOrDefault(ApStatus.MailNeedsReview) > 0
@@ -158,17 +205,28 @@ public sealed class APProcessor(
             {
                 var errorRows = await mailMessageRepository.LoadErrorLogRowsForRunAsync(processingRunId.Value, cancellationToken);
 
+                // Two dbo.MailMessage rows can render to the identical line (e.g. Graph reissuing a
+                // message's id after it moves records the same physical email twice) - de-duplicated
+                // on the rendered text itself, not the raw row, so rows differing only by the
+                // millisecond precision BuildErrorLogLine doesn't print still collapse to one line.
+                var loggedLines = new HashSet<string>();
+
                 foreach (var errorRow in errorRows)
                 {
-                    logger.LogInformation("{ErrorLine}", BuildErrorLogLine(errorRow));
+                    var line = BuildErrorLogLine(errorRow);
+
+                    if (loggedLines.Add(line))
+                    {
+                        logger.LogInformation("{ErrorLine}", line);
+                    }
                 }
             }
 
-            if (digestLines.Count > 0)
+            if (digestEntries.Count > 0)
             {
                 await errorNotifier.NotifyAsync(
                     $"AP Automation - Processing Summary ({mailbox.MailboxUser})",
-                    BuildDigestBody(digestLines, outcomes),
+                    BuildDigestBody(digestEntries, outcomes),
                     cancellationToken);
             }
 
@@ -183,9 +241,11 @@ public sealed class APProcessor(
 
             // Sent first, before FinishAsync: the team should still hear about the failure even if
             // recording it against dbo.ProcessingRun also fails (e.g. the database is what's down).
+            // HTML-encoded because SendMailAsync sends BodyType.Html, and exception.Message is not
+            // guaranteed free of '<'/'&'.
             await errorNotifier.NotifyAsync(
                 "AP Automation - Mailbox processing failed",
-                $"{exception.Message}\n\nProcessed {messageCount} message(s), {invoiceCount} invoice(s) before failing.",
+                $"<p>{Html(exception.Message)}</p>\n<p>Processed {messageCount} message(s), {invoiceCount} invoice(s) before failing.</p>",
                 cancellationToken);
 
             if (processingRunId is not null)
@@ -201,7 +261,57 @@ public sealed class APProcessor(
         }
     }
 
-    internal sealed record MessageOutcome(ApStatus Status, string? ErrorMessage, int InvoiceCount, int AttachmentCount, int PdfCount, int SuccessCount);
+    internal sealed record MessageOutcome(
+        ApStatus Status,
+        string? ErrorMessage,
+        int InvoiceCount,
+        int AttachmentCount,
+        int PdfCount,
+        int SuccessCount,
+        IReadOnlyList<(string FileName, ApStatus MailStatus, string? Reason)>? PdfOutcomes = null);
+
+    /// <summary>
+    /// One entry in the per-run summary email: the routed destination and received time (used to
+    /// group and order entries), the one-line summary (see <see cref="BuildDigestLine"/>), and any
+    /// per-PDF failure detail lines (see <see cref="BuildDigestErrorDetail"/>) to render under it.
+    /// </summary>
+    internal sealed record DigestEntry(
+        MailDestinationFolder Destination,
+        DateTimeOffset? ReceivedAt,
+        string SummaryLine,
+        IReadOnlyList<string> ErrorDetailLines,
+        ApStatus Status = default,
+        string? Subject = null);
+
+    /// <summary>
+    /// The completion log line's "Outcomes: ..." text - one <c>Status=Count</c> pair per status, plus,
+    /// only when duplicate-content collapsing (<see cref="DistinctByRenderedContent"/>) actually
+    /// reduced a status's count, a trailing "(routed to Status=N: ...)" naming how many distinct
+    /// messages that raw count collapsed to and which ones they were. A status with no collapsing
+    /// (the common case) renders exactly as it always has.
+    /// </summary>
+    internal static string BuildOutcomesSummary(
+        IReadOnlyDictionary<ApStatus, int> outcomes,
+        IReadOnlyList<DigestEntry> digestEntries,
+        TimeZoneInfo timeZone)
+    {
+        var distinctEntries = DistinctByRenderedContent(digestEntries);
+
+        return string.Join(", ", outcomes.Select(pair =>
+        {
+            var text = $"{pair.Key}={pair.Value}";
+            var distinctForStatus = distinctEntries.Where(entry => entry.Status == pair.Key).ToList();
+
+            if (distinctForStatus.Count > 0 && distinctForStatus.Count < pair.Value)
+            {
+                var identified = string.Join("; ", distinctForStatus.Select(entry =>
+                    $"\"{entry.Subject ?? "(no subject)"}\" received {FormatReceivedAt(entry.ReceivedAt, timeZone)}"));
+                text += $" (routed to {pair.Key}={distinctForStatus.Count}: {identified})";
+            }
+
+            return text;
+        }));
+    }
 
     /// <summary>
     /// Records a message's attachments, extracts an invoice from each PDF, and decides where the
@@ -317,36 +427,56 @@ public sealed class APProcessor(
         // and that the others were fine, instead of silently dropping that context.
         var errorMessage = worst == ApStatus.MailProcessed ? null : BuildMessageErrorSummary(pdfOutcomes);
 
-        return new MessageOutcome(worst, errorMessage, invoiceCount, attachmentCount, pdfs.Count, pdfSuccessCount);
+        return new MessageOutcome(worst, errorMessage, invoiceCount, attachmentCount, pdfs.Count, pdfSuccessCount, pdfOutcomes);
     }
 
     /// <summary>
     /// Builds the <c>dbo.MailMessage.ErrorMessage</c> text for a message with at least one
-    /// non-successful PDF: every problem PDF's own reason, followed by how many other PDFs in the same
-    /// message were processed successfully (and which). For the common case of a single failing PDF
-    /// with nothing else in the message, this is byte-identical to that PDF's own reason string.
+    /// non-successful PDF: every distinct problem (see <see cref="RenderProblems"/>), followed by
+    /// how many other PDFs in the same message were processed successfully (and which). For the
+    /// common case of a single failing PDF with nothing else in the message, this is byte-identical
+    /// to that PDF's own reason string.
     /// </summary>
     internal static string BuildMessageErrorSummary(
         IReadOnlyList<(string FileName, ApStatus MailStatus, string? Reason)> pdfOutcomes)
     {
-        var problems = pdfOutcomes
-            .Where(pdf => pdf.MailStatus != ApStatus.MailProcessed)
-            .Select(pdf => pdf.Reason ?? $"'{pdf.FileName}': {pdf.MailStatus}.")
-            .ToList();
+        var summary = string.Join(" ", RenderProblems(pdfOutcomes));
 
         var succeeded = pdfOutcomes
             .Where(pdf => pdf.MailStatus == ApStatus.MailProcessed)
             .Select(pdf => pdf.FileName)
             .ToList();
 
-        var summary = string.Join(" ", problems);
-
-        // Problems first, success note last: MailMessageRepository.SetStatusAsync truncates this to
-        // 1000 chars, so if it ever has to cut, the actual errors survive and only this trailing note
-        // is what gets clipped.
+        // Problems first, success note last: dbo.MailMessage.ErrorMessage is nvarchar(max), so nothing
+        // here is ever clipped, but keeping the actual errors ahead of this trailing note still makes
+        // the important part the first thing read.
         return succeeded.Count > 0
             ? $"{summary} {succeeded.Count} other PDF(s) processed successfully: {string.Join(", ", succeeded)}."
             : summary;
+    }
+
+    /// <summary>
+    /// Renders every non-successful PDF's problem as one string each, collapsing PDFs that share the
+    /// identical underlying reason (once the filename is stripped off) into a single "N PDF(s) failed:
+    /// {reason}" line instead of repeating the same sentence once per filename. A PDF whose reason is
+    /// unique among its message keeps its own <c>Reason</c> string exactly as recorded.
+    /// </summary>
+    /// <remarks>
+    /// Shared by <see cref="BuildMessageErrorSummary"/> (feeding <c>dbo.MailMessage.ErrorMessage</c>,
+    /// and via it the file log line built by <see cref="BuildErrorLogLine"/>) and
+    /// <see cref="BuildDigestErrorDetail"/> (the summary email), so both places agree on what counts
+    /// as "the same reason".
+    /// </remarks>
+    private static IReadOnlyList<string> RenderProblems(
+        IReadOnlyList<(string FileName, ApStatus MailStatus, string? Reason)> pdfOutcomes)
+    {
+        return pdfOutcomes
+            .Where(pdf => pdf.MailStatus != ApStatus.MailProcessed)
+            .GroupBy(pdf => StripFileNamePrefix(pdf.Reason, pdf.FileName))
+            .Select(group => group.Count() == 1
+                ? group.First().Reason ?? $"'{group.First().FileName}': {group.First().MailStatus}."
+                : $"{group.Count()} PDF(s) failed: {group.Key}")
+            .ToList();
     }
 
     private async Task<(ApStatus InvoiceStatus, ApStatus MailStatus, string? Reason)> ProcessPdfAsync(
@@ -587,46 +717,187 @@ public sealed class APProcessor(
     }
 
     /// <summary>
+    /// HTML-encodes a value pulled from an untrusted source (Graph mail fields, PDF-extracted text)
+    /// before it's embedded in the summary email's HTML body, so a stray <c>&lt;</c>/<c>&amp;</c>/<c>"</c>
+    /// renders as literal text instead of being interpreted as markup.
+    /// </summary>
+    private static string Html(string? value) => WebUtility.HtmlEncode(value) ?? string.Empty;
+
+    /// <summary>
+    /// Formats a Graph UTC timestamp in <paramref name="timeZone"/>, or "unknown time" when absent -
+    /// shared by <see cref="BuildDigestLine"/> and the completion log line's "which one was routed"
+    /// detail so both describe the same message the same way.
+    /// </summary>
+    private static string FormatReceivedAt(DateTimeOffset? utc, TimeZoneInfo timeZone) =>
+        utc is { } value
+            ? TimeZoneInfo.ConvertTime(value, timeZone).ToString("MM'/'dd'/'yyyy HH':'mm':'ss zzz", CultureInfo.InvariantCulture)
+            : "unknown time";
+
+    /// <summary>
     /// One line of the per-run summary email, mirroring <see cref="ProcessMessageAsync"/>'s completion
-    /// log line but with the received time converted from Graph's UTC into <paramref name="timeZone"/>
-    /// and the routed folder named, since the email's whole point is answering "what happened and where
-    /// did it go" without opening the log file.
+    /// log line but with the received time converted from Graph's UTC into <paramref name="timeZone"/>,
+    /// since the email's whole point is answering "what happened" without opening the log file. The
+    /// routed folder is not named here - <see cref="BuildDigestBody"/> already groups entries by folder,
+    /// so naming it again per line would just repeat what the group header already says.
     /// </summary>
     internal static string BuildDigestLine(
         MailMessageSummary message,
         MessageOutcome result,
-        MailDestinationFolder destination,
         TimeZoneInfo timeZone)
     {
-        var receivedAt = message.ReceivedDateTime is { } utc
-            ? TimeZoneInfo.ConvertTime(utc, timeZone).ToString("MM'/'dd'/'yyyy HH':'mm':'ss zzz", CultureInfo.InvariantCulture)
-            : "unknown time";
+        var receivedAt = FormatReceivedAt(message.ReceivedDateTime, timeZone);
 
-        var line = $"\"{message.Subject ?? "(no subject)"}\" from {message.SenderAddress ?? "unknown"} received {receivedAt}: "
+        return $"\"{Html(message.Subject ?? "(no subject)")}\" from {Html(message.SenderAddress ?? "unknown")} received {receivedAt}: "
             + $"{result.AttachmentCount} attachment(s), {result.PdfCount} PDF(s), {result.SuccessCount} processed successfully, "
-            + $"{result.PdfCount - result.SuccessCount} failed. Routed to {destination}.";
-
-        // The reason is what makes NeedsReview/Errors lines actionable from the email alone - it names
-        // the specific problem PDF (and, for a duplicate, the earlier message it matches) rather than
-        // leaving the recipient to open the mailbox just to find out what went wrong.
-        return result.ErrorMessage is null ? line : $"{line} {result.ErrorMessage}";
+            + $"{result.PdfCount - result.SuccessCount} failed.";
     }
 
     /// <summary>
-    /// The full body of the per-run summary email: an intro asking the recipient to check the mailbox
-    /// folders, one <see cref="BuildDigestLine"/> per routed message, and a totals footer reusing the
-    /// same <c>outcomes</c> tally already logged in <see cref="ProcessInvoicesAsync"/>'s completion line.
+    /// The indented detail lines shown under a NeedsReview/Errors message's summary line - what makes
+    /// those lines actionable from the email alone, naming the specific problem PDF(s) (and, for a
+    /// duplicate, the earlier message it matches) rather than leaving the recipient to open the mailbox
+    /// just to find out what went wrong.
     /// </summary>
-    internal static string BuildDigestBody(IReadOnlyList<string> digestLines, IReadOnlyDictionary<ApStatus, int> outcomes)
+    /// <remarks>
+    /// When several PDFs in the same message fail for the identical reason (e.g. a whole resend of an
+    /// earlier thread, every attachment byte-identical to one already on file), listing each filename
+    /// on its own line just repeats the same sentence dozens of times. Those are collapsed into one
+    /// "N PDF(s) failed: {reason}" line; PDFs with genuinely different reasons still get their own line.
+    /// </remarks>
+    private const string DetailIndent = "&nbsp;&nbsp;&nbsp;&nbsp;";
+
+    internal static IReadOnlyList<string> BuildDigestErrorDetail(MessageOutcome result)
+    {
+        if (result.PdfOutcomes is null)
+        {
+            // No per-PDF breakdown available (e.g. the attempt-cap-reached path) - the message-level
+            // reason is all there is, so show it as-is.
+            return result.ErrorMessage is null ? [] : [$"{DetailIndent}{Html(result.ErrorMessage)}"];
+        }
+
+        var lines = RenderProblems(result.PdfOutcomes)
+            .Select(line => $"{DetailIndent}{Html(line)}")
+            .ToList();
+
+        var succeeded = result.PdfOutcomes.Where(pdf => pdf.MailStatus == ApStatus.MailProcessed).Select(pdf => pdf.FileName).ToList();
+
+        if (succeeded.Count > 0)
+        {
+            lines.Add($"{DetailIndent}{succeeded.Count} other PDF(s) processed successfully: {Html(string.Join(", ", succeeded))}.");
+        }
+
+        return lines;
+    }
+
+    /// <summary>
+    /// Strips a per-PDF reason's leading <c>'{fileName}': </c> (or <c>'{fileName}' </c>) prefix, leaving
+    /// just the cause - so PDFs that failed for the identical reason but have different filenames still
+    /// group together in <see cref="RenderProblems"/>.
+    /// </summary>
+    private static string StripFileNamePrefix(string? reason, string fileName)
+    {
+        if (reason is null)
+        {
+            return string.Empty;
+        }
+
+        var withColon = $"'{fileName}': ";
+        if (reason.StartsWith(withColon, StringComparison.Ordinal))
+        {
+            return reason[withColon.Length..];
+        }
+
+        var withSpace = $"'{fileName}' ";
+        if (reason.StartsWith(withSpace, StringComparison.Ordinal))
+        {
+            return reason[withSpace.Length..];
+        }
+
+        return reason;
+    }
+
+    /// <summary>
+    /// The full HTML body of the per-run summary email: an intro asking the recipient to check the
+    /// mailbox folders, a totals line reusing the same <c>outcomes</c> tally already logged in
+    /// <see cref="ProcessInvoicesAsync"/>'s completion line, then one section per destination folder
+    /// (Processed, NeedsReview, Errors, in that order - skipping any with nothing routed to it), each
+    /// ordered by received date ascending.
+    /// </summary>
+    /// <remarks>
+    /// Every visual "block" (intro, totals, each section header, each message) is its own
+    /// <c>&lt;p&gt;</c>: mail clients put natural spacing between paragraphs, which is what gives the
+    /// blank line after each bolded section header and between NeedsReview/Errors messages, for free.
+    /// The Processed section is the one exception - it's deliberately packed into a single paragraph
+    /// with <c>&lt;br&gt;</c> between messages and no per-message routing text, ending in one shared
+    /// "Routed to Processed (N)." line, since a Processed message needs no more attention than "it happened".
+    /// <para>
+    /// Entries that would render identical content (same destination, same summary line, same detail
+    /// lines) are collapsed to one before building each section's messages - e.g. when the mail
+    /// pipeline records two <c>dbo.MailMessage</c> rows for what is actually one physical email (Graph
+    /// reissuing a message's id after it moves is a known way this happens), the reader should see it
+    /// once, not twice. The two counts this can produce are deliberately both shown, not merged: the
+    /// section header states the raw number of routed <c>dbo.MailMessage</c> rows, while the trailing
+    /// "Routed to X (N)." line states how many distinct messages that collapsed down to - so "2 rows,
+    /// but only 1 email" stays visible instead of silently picking one number.
+    /// </para>
+    /// </remarks>
+    /// <summary>
+    /// Collapses entries that would render identical content (same destination, same summary line,
+    /// same detail lines) down to one, keeping the first. Shared by <see cref="BuildDigestBody"/> and
+    /// the completion log line's outcomes summary in <see cref="ProcessInvoicesAsync"/>, so both agree
+    /// on what counts as "the same message" when two <c>dbo.MailMessage</c> rows describe one email.
+    /// </summary>
+    private static IReadOnlyList<DigestEntry> DistinctByRenderedContent(IEnumerable<DigestEntry> entries) =>
+        entries
+            .GroupBy(entry => (entry.Destination, entry.SummaryLine, Detail: string.Join("\n", entry.ErrorDetailLines)))
+            .Select(group => group.First())
+            .ToList();
+
+    internal static string BuildDigestBody(IReadOnlyList<DigestEntry> entries, IReadOnlyDictionary<ApStatus, int> outcomes)
     {
         var totals = string.Join(", ", outcomes
             .Where(pair => pair.Key is ApStatus.MailProcessed or ApStatus.MailNeedsReview or ApStatus.MailError or ApStatus.MailSkipped)
             .Select(pair => $"{pair.Value} {pair.Key}"));
 
-        return "This is a summary of the AP Automation mailbox run just completed. Please verify the "
-            + "Processed, Errors, and NeedsReview folders as needed.\n\n"
-            + string.Join("\n", digestLines)
-            + $"\n\nTotals: {totals}.";
+        var distinctEntries = DistinctByRenderedContent(entries);
+
+        var groupBlocks = new[] { MailDestinationFolder.Processed, MailDestinationFolder.NeedsReview, MailDestinationFolder.Errors }
+            .Select(destination => (
+                destination,
+                rawCount: entries.Count(entry => entry.Destination == destination),
+                ordered: distinctEntries
+                    .Where(entry => entry.Destination == destination)
+                    .OrderBy(entry => entry.ReceivedAt ?? DateTimeOffset.MaxValue)
+                    .ToList()))
+            .Where(group => group.ordered.Count > 0)
+            .Select(group => BuildGroupBlock(group.destination, group.rawCount, group.ordered));
+
+        return "<p>This is a summary of the AP Automation mailbox run just completed. Please verify the "
+            + "Processed, Errors, and NeedsReview folders as needed.</p>\n"
+            + $"<p>Totals: {totals}.</p>\n"
+            + string.Join("\n", groupBlocks);
+    }
+
+    private static string BuildGroupBlock(MailDestinationFolder destination, int rawCount, IReadOnlyList<DigestEntry> entries)
+    {
+        var header = $"<p><b>=== {destination} ({rawCount}) ===</b></p>";
+
+        if (destination == MailDestinationFolder.Processed)
+        {
+            var lines = entries.Select(entry => entry.SummaryLine).Append($"Routed to Processed ({entries.Count}).");
+            return $"{header}\n<p>{string.Join("<br>\n", lines)}</p>";
+        }
+
+        var messageBlocks = entries.Select(entry =>
+        {
+            var summary = $"{entry.SummaryLine} Routed to {destination}.";
+            var block = entry.ErrorDetailLines.Count == 0
+                ? summary
+                : $"{summary}<br>\n{string.Join("<br>\n", entry.ErrorDetailLines)}";
+            return $"<p>{block}</p>";
+        });
+
+        return $"{header}\n{string.Join("\n", messageBlocks)}\n<p>Routed to {destination} ({entries.Count}).</p>";
     }
 
     /// <summary>

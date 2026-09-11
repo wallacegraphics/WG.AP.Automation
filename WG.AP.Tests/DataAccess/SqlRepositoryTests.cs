@@ -105,6 +105,44 @@ public class SqlRepositoryTests
     }
 
     [SkippableFact]
+    public async Task RecordAlreadyFinalReplayNeedsReview_OnASecondOccurrenceInTheSameRun_StillReturnsTheRow()
+    {
+        SkipUnlessConfigured();
+
+        // The exact regression this covers: Graph can redeliver the same already-final message more
+        // than once within a single run's delta batch (e.g. right after this pipeline itself moved it
+        // into a folder). The first occurrence must record one synthetic NeedsReview row; every later
+        // occurrence in the same run must still report that same row rather than silently vanishing.
+        var factory = CreateFactory();
+        var runs = new ProcessingRunRepository(factory, NullLogger<ProcessingRunRepository>.Instance);
+        var messages = new MailMessageRepository(factory, NullLogger<MailMessageRepository>.Instance);
+
+        var mailbox = new MailboxRef(Guid.NewGuid(), "sql-test@wallacegraphics.com");
+        var runId = await runs.StartAsync(mailbox, CancellationToken.None);
+
+        var message = new MailMessageSummary(
+            $"immutable-{Guid.NewGuid():N}",
+            DateTimeOffset.UtcNow,
+            "billing@sanmar.com",
+            "Invoice",
+            []);
+
+        var original = await messages.DiscoverAndClaimAsync(mailbox, runId, message, CancellationToken.None);
+        Assert.True(original.Claimed);
+        await messages.SetStatusAsync(original.MailMessageId, ApStatus.MailNeedsReview, null, CancellationToken.None);
+
+        var first = await messages.RecordAlreadyFinalReplayNeedsReviewAsync(mailbox, runId, message, CancellationToken.None);
+        Assert.NotNull(first);
+        Assert.Equal((int)ApStatus.MailNeedsReview, first!.StatusId);
+
+        var second = await messages.RecordAlreadyFinalReplayNeedsReviewAsync(mailbox, runId, message, CancellationToken.None);
+        Assert.NotNull(second);
+        Assert.Equal(first.MailMessageId, second!.MailMessageId);
+
+        await runs.FinishAsync(runId, 1, 0, isSuccessful: true, null, CancellationToken.None);
+    }
+
+    [SkippableFact]
     public async Task DiscoverAndClaim_TreatsTheSameGraphIdInADifferentMailbox_AsADifferentMessage()
     {
         SkipUnlessConfigured();
@@ -126,6 +164,39 @@ public class SqlRepositoryTests
         var inB = await messages.DiscoverAndClaimAsync(mailboxB, runB, message, CancellationToken.None);
 
         Assert.NotEqual(inA.MailMessageId, inB.MailMessageId);
+    }
+
+    [SkippableFact]
+    public async Task DiscoverAndClaim_WithAChangedGraphId_WhenOriginalIsFinal_InsertsANewRow()
+    {
+        SkipUnlessConfigured();
+
+        // Once the first row is final, a different Graph message id is treated as a distinct arrival
+        // and gets its own dbo.MailMessage row.
+        var factory = CreateFactory();
+        var runs = new ProcessingRunRepository(factory, NullLogger<ProcessingRunRepository>.Instance);
+        var messages = new MailMessageRepository(factory, NullLogger<MailMessageRepository>.Instance);
+
+        var mailbox = new MailboxRef(Guid.NewGuid(), "sql-test@wallacegraphics.com");
+        var runId = await runs.StartAsync(mailbox, CancellationToken.None);
+
+        var firstArrival = new MailMessageSummary(
+            $"immutable-{Guid.NewGuid():N}", DateTimeOffset.UtcNow, "billing@sanmar.com", "Invoice", []);
+        var first = await messages.DiscoverAndClaimAsync(mailbox, runId, firstArrival, CancellationToken.None);
+        Assert.True(first.Claimed);
+
+        // Same email, marked final - as it would be right after being moved to a destination folder.
+        await messages.SetStatusAsync(first.MailMessageId, ApStatus.MailProcessed, null, CancellationToken.None);
+
+        // Reissued Graph id: once the original row is final, this is treated as a distinct
+        // delivery and gets its own row.
+        var reissuedArrival = new MailMessageSummary(
+            $"immutable-{Guid.NewGuid():N}", DateTimeOffset.UtcNow, "billing@sanmar.com", "Invoice", []);
+        var second = await messages.DiscoverAndClaimAsync(mailbox, runId, reissuedArrival, CancellationToken.None);
+
+        Assert.NotEqual(first.MailMessageId, second.MailMessageId);
+        Assert.True(second.Claimed);
+        Assert.Equal((int)ApStatus.MailNew, second.StatusId);
     }
 
     [SkippableFact]

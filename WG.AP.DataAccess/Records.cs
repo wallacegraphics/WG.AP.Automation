@@ -10,7 +10,7 @@ namespace WG.AP.DataAccess;
 /// </param>
 /// <param name="StatusId">The status the row is in, so a skip can be logged with a reason.</param>
 /// <param name="AttemptCount">Attempts including this one, for comparison against the cap.</param>
-public sealed record MailMessageClaim(long MailMessageId, bool Claimed, int StatusId, int AttemptCount);
+public sealed record MailMessageClaim(long MailMessageId, bool Claimed, int StatusId, int AttemptCount, string? ErrorMessage = null);
 
 /// <summary>One MailMessage row with a stored error reason, for log output.</summary>
 public sealed record MailMessageErrorLogRow(
