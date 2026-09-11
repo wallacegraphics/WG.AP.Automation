@@ -40,6 +40,9 @@ public sealed class MailMessageRepository(
     /// the delta link is not advanced, and the row stays claimable. Retry works through the absence of
     /// a final state, exactly as it worked through the absence of a committed delta link before this
     /// table existed.
+    /// <para>
+    /// "Already recorded" is decided by <c>GraphMessageId</c> for the mailbox.
+    /// </para>
     /// </remarks>
     public async Task<MailMessageClaim> DiscoverAndClaimAsync(
         MailboxRef mailbox,
@@ -53,14 +56,38 @@ public sealed class MailMessageRepository(
 
             return await connection.QuerySingleAsync<MailMessageClaim>(new CommandDefinition(
                 """
-                DECLARE @Hash BINARY(32) = CONVERT(BINARY(32), HASHBYTES('SHA2_256',
+                DECLARE @GraphHash BINARY(32) = CONVERT(BINARY(32), HASHBYTES('SHA2_256',
                     CONCAT(CONVERT(CHAR(36), @MailboxId), N'|', @GraphMessageId)));
+                IF EXISTS (SELECT 1 FROM [dbo].[MailMessage] WHERE [MessageKeyHash] = @GraphHash)
+                BEGIN
+                    UPDATE m
+                       SET [AttemptCount]    = m.[AttemptCount] + 1,
+                           [LastAttemptOn]   = SYSUTCDATETIME(),
+                           [ProcessingRunId] = @ProcessingRunId,
+                           [ModifiedBy]      = @AppIdentity,
+                           [ModifiedOn]      = SYSUTCDATETIME()
+                      FROM [dbo].[MailMessage] AS m
+                      JOIN [lkup].[Status]     AS s ON s.[StatusId] = m.[StatusId]
+                     WHERE m.[MessageKeyHash] = @GraphHash
+                       AND s.[IsFinal] = 0;
+
+                    DECLARE @GraphClaimed BIT = CASE WHEN @@ROWCOUNT = 1 THEN 1 ELSE 0 END;
+
+                    SELECT TOP (1) m.[MailMessageId], @GraphClaimed AS [Claimed], m.[StatusId], m.[AttemptCount], m.[ErrorMessage]
+                      FROM [dbo].[MailMessage] AS m
+                     WHERE m.[MessageKeyHash] = @GraphHash
+                     ORDER BY m.[MailMessageId] DESC;
+
+                    RETURN;
+                END;
 
                 INSERT INTO [dbo].[MailMessage]
                     ([ProcessingRunId], [MailboxId], [GraphMessageId], [SenderAddress], [Subject], [ReceivedOn], [StatusId], [CreatedBy])
                 SELECT @ProcessingRunId, @MailboxId, @GraphMessageId, @SenderAddress, @Subject, @ReceivedOn, @NewStatusId, @AppIdentity
-                 WHERE NOT EXISTS (SELECT 1 FROM [dbo].[MailMessage] WITH (UPDLOCK, HOLDLOCK)
-                                    WHERE [MessageKeyHash] = @Hash);
+                 WHERE NOT EXISTS (
+                     SELECT 1
+                       FROM [dbo].[MailMessage] AS m WITH (UPDLOCK, HOLDLOCK)
+                      WHERE m.[MessageKeyHash] = @GraphHash);
 
                 UPDATE m
                    SET [AttemptCount]    = m.[AttemptCount] + 1,
@@ -70,14 +97,15 @@ public sealed class MailMessageRepository(
                        [ModifiedOn]      = SYSUTCDATETIME()
                   FROM [dbo].[MailMessage] AS m
                   JOIN [lkup].[Status]     AS s ON s.[StatusId] = m.[StatusId]
-                 WHERE m.[MessageKeyHash] = @Hash
+                 WHERE m.[MessageKeyHash] = @GraphHash
                    AND s.[IsFinal] = 0;
 
                 DECLARE @Claimed BIT = CASE WHEN @@ROWCOUNT = 1 THEN 1 ELSE 0 END;
 
-                SELECT m.[MailMessageId], @Claimed AS [Claimed], m.[StatusId], m.[AttemptCount]
+                 SELECT TOP (1) m.[MailMessageId], @Claimed AS [Claimed], m.[StatusId], m.[AttemptCount], m.[ErrorMessage]
                   FROM [dbo].[MailMessage] AS m
-                 WHERE m.[MessageKeyHash] = @Hash;
+                 WHERE m.[MessageKeyHash] = @GraphHash
+                 ORDER BY m.[MailMessageId] DESC;
                 """,
                 new
                 {
@@ -96,6 +124,83 @@ public sealed class MailMessageRepository(
         catch (Exception exception)
         {
             logger.LogError(exception, "Failed to record or claim message {MessageId} for {MailboxUser}.", message.Id, mailbox.MailboxUser);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// For a same-Graph replay of an already-final message, records one synthetic NeedsReview row per
+    /// run so the duplicate is visible in the table/log/email and can be routed to NeedsReview.
+    /// </summary>
+    public async Task<MailMessageClaim?> RecordAlreadyFinalReplayNeedsReviewAsync(
+        MailboxRef mailbox,
+        long processingRunId,
+        MailMessageSummary message,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var connection = await connectionFactory.OpenAsync(cancellationToken);
+
+            return await connection.QuerySingleOrDefaultAsync<MailMessageClaim?>(new CommandDefinition(
+                """
+                DECLARE @GraphHash BINARY(32) = CONVERT(BINARY(32), HASHBYTES('SHA2_256',
+                    CONCAT(CONVERT(CHAR(36), @MailboxId), N'|', @GraphMessageId)));
+
+                IF NOT EXISTS (
+                    SELECT 1
+                      FROM [dbo].[MailMessage] AS m
+                      JOIN [lkup].[Status]     AS s ON s.[StatusId] = m.[StatusId]
+                     WHERE m.[MessageKeyHash] = @GraphHash
+                       AND s.[IsFinal] = 1)
+                BEGIN
+                    RETURN;
+                END;
+
+                DECLARE @ReplayGraphMessageId NVARCHAR(512) = CONCAT(
+                    N'dup|',
+                    CONVERT(NVARCHAR(20), @ProcessingRunId),
+                    N'|',
+                    CONVERT(NVARCHAR(64), @GraphHash, 2));
+
+                INSERT INTO [dbo].[MailMessage]
+                    ([ProcessingRunId], [MailboxId], [GraphMessageId], [SenderAddress], [Subject], [ReceivedOn], [StatusId], [ErrorMessage], [CreatedBy])
+                SELECT @ProcessingRunId, @MailboxId, @ReplayGraphMessageId, @SenderAddress, @Subject, @ReceivedOn, @MailNeedsReviewStatusId,
+                       N'Duplicate replay of already-final message id in this run.', @AppIdentity
+                 WHERE NOT EXISTS (
+                     SELECT 1
+                       FROM [dbo].[MailMessage] WITH (UPDLOCK, HOLDLOCK)
+                      WHERE [ProcessingRunId] = @ProcessingRunId
+                        AND [GraphMessageId] = @ReplayGraphMessageId);
+
+                -- Whether this call performed the insert or an earlier call this run already did,
+                -- exactly one row exists for this key - so the lookup below always finds it. A repeat
+                -- occurrence of the same already-final message within one run (Graph can redeliver the
+                -- same changed item more than once in a single delta pass) must still be reported, not
+                -- silently dropped just because the row was already there.
+                SELECT TOP (1) [MailMessageId], CAST(0 AS BIT) AS [Claimed], [StatusId], [AttemptCount], [ErrorMessage]
+                  FROM [dbo].[MailMessage]
+                 WHERE [ProcessingRunId] = @ProcessingRunId
+                   AND [GraphMessageId] = @ReplayGraphMessageId
+                 ORDER BY [MailMessageId] DESC;
+                """,
+                new
+                {
+                    mailbox.MailboxId,
+                    ProcessingRunId = processingRunId,
+                    GraphMessageId = message.Id,
+                    SenderAddress = message.SenderAddress,
+                    Subject = Truncate(message.Subject, 500),
+                    ReceivedOn = message.ReceivedDateTime,
+                    MailNeedsReviewStatusId = (int)ApStatus.MailNeedsReview,
+                    AppIdentity = connectionFactory.AppIdentity
+                },
+                commandTimeout: connectionFactory.CommandTimeoutSeconds,
+                cancellationToken: cancellationToken));
+        }
+        catch (Exception exception)
+        {
+            logger.LogError(exception, "Failed to record duplicate replay review row for message {MessageId} on processing run {ProcessingRunId}.", message.Id, processingRunId);
             throw;
         }
     }
