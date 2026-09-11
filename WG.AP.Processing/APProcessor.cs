@@ -118,6 +118,8 @@ public sealed class APProcessor(
                                     PdfCount: message.Attachments.Count(a => !a.IsInline && IsPdf(a)),
                                     SuccessCount: 0);
 
+                                ProcessingRunContext.CurrentMailMessageId = duplicateReplay.MailMessageId;
+
                                 var destination = await MoveIfRoutedAsync(message.Id, ApStatus.MailNeedsReview, mailFolders, cancellationToken);
 
                                 if (destination is not null)
@@ -305,7 +307,10 @@ public sealed class APProcessor(
             if (distinctForStatus.Count > 0 && distinctForStatus.Count < pair.Value)
             {
                 var identified = string.Join("; ", distinctForStatus.Select(entry =>
-                    $"\"{entry.Subject ?? "(no subject)"}\" received {FormatReceivedAt(entry.ReceivedAt, timeZone)}"));
+                {
+                    var subject = (entry.Subject ?? "(no subject)").ReplaceLineEndings(" ");
+                    return $"\"{subject}\" received {FormatReceivedAt(entry.ReceivedAt, timeZone)}";
+                }));
                 text += $" (routed to {pair.Key}={distinctForStatus.Count}: {identified})";
             }
 
@@ -817,6 +822,18 @@ public sealed class APProcessor(
     }
 
     /// <summary>
+    /// Collapses entries that would render identical content (same destination, same summary line,
+    /// same detail lines) down to one, keeping the first. Shared by <see cref="BuildDigestBody"/> and
+    /// the completion log line's outcomes summary in <see cref="ProcessInvoicesAsync"/>, so both agree
+    /// on what counts as "the same message" when two <c>dbo.MailMessage</c> rows describe one email.
+    /// </summary>
+    private static IReadOnlyList<DigestEntry> DistinctByRenderedContent(IEnumerable<DigestEntry> entries) =>
+        entries
+            .GroupBy(entry => (entry.Destination, entry.SummaryLine, Detail: string.Join("\n", entry.ErrorDetailLines)))
+            .Select(group => group.First())
+            .ToList();
+
+    /// <summary>
     /// The full HTML body of the per-run summary email: an intro asking the recipient to check the
     /// mailbox folders, a totals line reusing the same <c>outcomes</c> tally already logged in
     /// <see cref="ProcessInvoicesAsync"/>'s completion line, then one section per destination folder
@@ -841,17 +858,6 @@ public sealed class APProcessor(
     /// but only 1 email" stays visible instead of silently picking one number.
     /// </para>
     /// </remarks>
-    /// <summary>
-    /// Collapses entries that would render identical content (same destination, same summary line,
-    /// same detail lines) down to one, keeping the first. Shared by <see cref="BuildDigestBody"/> and
-    /// the completion log line's outcomes summary in <see cref="ProcessInvoicesAsync"/>, so both agree
-    /// on what counts as "the same message" when two <c>dbo.MailMessage</c> rows describe one email.
-    /// </summary>
-    private static IReadOnlyList<DigestEntry> DistinctByRenderedContent(IEnumerable<DigestEntry> entries) =>
-        entries
-            .GroupBy(entry => (entry.Destination, entry.SummaryLine, Detail: string.Join("\n", entry.ErrorDetailLines)))
-            .Select(group => group.First())
-            .ToList();
 
     internal static string BuildDigestBody(IReadOnlyList<DigestEntry> entries, IReadOnlyDictionary<ApStatus, int> outcomes)
     {
