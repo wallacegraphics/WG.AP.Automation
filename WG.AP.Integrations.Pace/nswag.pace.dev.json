@@ -1,0 +1,25 @@
+{
+  "runtime": "WinX64",
+  "documentGenerator": {
+    "fromDocument": {
+      "url": "swagger/pace.dev.swagger.json"
+    }
+  },
+  "codeGenerators": {
+    "openApiToCSharpClient": {
+      "className": "PaceClient",
+      "namespace": "WG.AP.Integrations.Pace.Generated",
+      "output": "Generated/PaceClient.cs",
+      "generateClientClasses": true,
+      "generateClientInterfaces": true,
+      "injectHttpClient": true,
+      "disposeHttpClient": false,
+      "generateDtoTypes": true,
+      "generateOptionalParameters": true,
+      "generateNullableReferenceTypes": true,
+      "dateTimeType": "System.DateTimeOffset",
+      "jsonLibrary": "SystemTextJson",
+      "operationGenerationMode": "SingleClientFromOperationId"
+    }
+  }
+}
