@@ -15,6 +15,9 @@ GO
 :r .\Seed\Status.sql
 GO
 
+:r .\Seed\PaceSubmissionStatus.sql
+GO
+
 :r .\Seed\Client.sql
 GO
 

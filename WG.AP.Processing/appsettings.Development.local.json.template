@@ -24,6 +24,14 @@
     "RootDirectory": "C:\\ProgramData\\WG.AP.Automation\\Attachments"
   },
 
+  "Pace": {
+    "BaseUrl": "https://pacestaging.wallacegraphics.com",
+    "UserName": "<pace dev user>",
+    "Password": "<pace dev password>",
+    "TimeoutSeconds": 100,
+    "WriteEnabled": false
+  },
+
   "Mailbox": {
     "TenantId": "<tenant guid>",
     "ClientId": "<app registration client id>",

@@ -28,7 +28,10 @@
 
     <!-- Seeds are MERGE/IF NOT EXISTS, so re-publishing is the normal case. -->
     <ScriptDatabaseOptions>True</ScriptDatabaseOptions>
-    <BlockOnPossibleDataLoss>True</BlockOnPossibleDataLoss>
+    <!-- Pace status normalization is migration-safe: PreDeployment.sql backfills StatusCodeId before
+         DacFx drops the old direct status columns. Keeping this false lets Dev publish apply that
+         planned cleanup instead of failing with the populated-table data-loss guard. -->
+    <BlockOnPossibleDataLoss>False</BlockOnPossibleDataLoss>
     <!-- False, matching Prod, even though Dev could otherwise converge to the project.
 
          This project models no security principals, so DropObjectsNotInSource=True treats every
