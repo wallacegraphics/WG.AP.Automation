@@ -3,7 +3,9 @@ using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using WG.AP.Core.Abstractions;
 using WG.AP.DataAccess;
+using WG.AP.Integrations.Pace;
 using WG.AP.Invoice.Models;
+using WG.AP.Processor;
 
 namespace WG.AP.Tests.DataAccess;
 
@@ -465,22 +467,25 @@ public class SqlRepositoryTests
         await SkipUnlessPaceSchemaPublishedAsync(factory);
         await AssertPaceSubmissionUsesStatusLookupIdAsync(factory);
 
+        var runs = new ProcessingRunRepository(factory, NullLogger<ProcessingRunRepository>.Instance);
         var invoices = new InvoiceRepository(factory, NullLogger<InvoiceRepository>.Instance);
         var paceSubmissions = new PaceSubmissionRepository(factory, NullLogger<PaceSubmissionRepository>.Instance);
         var (mailMessageId, mailAttachmentId) = await CreateRecordedPdfAsync(factory);
+        var processingRunId = await runs.StartAsync(new MailboxRef(Guid.NewGuid(), "sql-test@wallacegraphics.com"), CancellationToken.None);
 
         var invoice = await invoices.RecordAsync(NewInvoice(mailMessageId, mailAttachmentId, $"INV-{Guid.NewGuid():N}"[..20]), CancellationToken.None);
 
         Assert.True(await paceSubmissions.EnqueueExtractedInvoicesAsync(CancellationToken.None) >= 1);
         Assert.Equal(0, await paceSubmissions.EnqueueExtractedInvoicesAsync(CancellationToken.None));
 
-        var claim = await ClaimUntilInvoiceAsync(paceSubmissions, invoice.InvoiceId!.Value);
+        var claim = await ClaimUntilInvoiceAsync(paceSubmissions, invoice.InvoiceId!.Value, processingRunId);
 
         Assert.NotNull(claim);
         Assert.Equal(invoice.InvoiceId, claim.InvoiceId);
         Assert.Equal(1, claim.AttemptCount);
         Assert.Contains("InvoiceNumber", claim.FieldsJson);
         await AssertPaceSubmissionStatusAsync(factory, claim.PaceSubmissionId, PaceSubmissionStatus.InProgressId, PaceSubmissionStatus.InProgress);
+        Assert.Equal(processingRunId, await LoadPaceSubmissionProcessingRunIdAsync(factory, claim.PaceSubmissionId));
     }
 
     [SkippableFact]
@@ -593,6 +598,57 @@ public class SqlRepositoryTests
         }, CancellationToken.None);
 
         Assert.True(completed);
+    }
+
+    [SkippableFact]
+    public async Task PaceInvoiceProcessor_RoutePaceError_SetsMailErrorMovesMessageAndSendsAlert()
+    {
+        SkipUnlessConfigured();
+
+        var factory = CreateFactory();
+        await SkipUnlessPaceSchemaPublishedAsync(factory);
+
+        var (mailMessageId, _) = await CreateRecordedPdfAsync(factory);
+        var graphMessageId = await LoadGraphMessageIdAsync(factory, mailMessageId);
+        var mailSource = new RecordingMailSource();
+        var mailSender = new RecordingMailSender();
+        var processor = new PaceInvoiceProcessor(
+            mailSource,
+            new MailMessageRepository(factory, NullLogger<MailMessageRepository>.Instance),
+            new PaceSubmissionRepository(factory, NullLogger<PaceSubmissionRepository>.Instance),
+            new StubPaceInvoiceService(new PaceInvoiceSubmissionResult { StatusCode = PaceInvoiceOutcomeStatus.Error }),
+            new ErrorNotifier(
+                mailSender,
+                Options.Create(new AlertOptions { Recipients = ["errors@wallacegraphics.com"] }),
+                NullLogger<ErrorNotifier>.Instance),
+            NullLogger<PaceInvoiceProcessor>.Instance);
+        var claim = new PaceSubmissionClaim
+        {
+            PaceSubmissionId = 1,
+            InvoiceId = 42,
+            MailMessageId = mailMessageId,
+            GraphMessageId = graphMessageId,
+            AttemptCount = 1,
+            ClaimToken = Guid.NewGuid(),
+            FieldsJson = "{}",
+            InvoiceNumber = "INV-PACE-ERR",
+            CustomerPO = "PO-PACE-ERR",
+            Total = 123.45m,
+            PaceVendorId = "SANMAR-PACE"
+        };
+        var routeMethod = typeof(PaceInvoiceProcessor).GetMethod("RoutePaceErrorAsync", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+
+        Assert.NotNull(routeMethod);
+        await (Task)routeMethod.Invoke(processor, [claim, "Pace invoice 'INV-PACE-ERR' for PO 'PO-PACE-ERR': no unpaid PO receipts were found.", CancellationToken.None])!;
+
+        var mailStatus = await LoadMailStatusAsync(factory, mailMessageId);
+        Assert.Equal((int)ApStatus.MailError, mailStatus.StatusId);
+        Assert.Contains("no unpaid PO receipts", mailStatus.ErrorMessage);
+        Assert.Equal((graphMessageId, MailDestinationFolder.Errors), mailSource.LastMove);
+        Assert.NotNull(mailSender.LastRequest);
+        Assert.Contains("INV-PACE-ERR", mailSender.LastRequest.Subject);
+        Assert.Contains("PO-PACE-ERR", mailSender.LastRequest.Body);
+        Assert.Equal(["errors@wallacegraphics.com"], mailSender.LastRequest.ToAddresses);
     }
 
     private static async Task AssertPaceSubmissionUsesStatusLookupIdAsync(SqlConnectionFactory factory)
@@ -713,11 +769,29 @@ public class SqlRepositoryTests
             new { PaceSubmissionId = paceSubmissionId });
     }
 
-    private static async Task<PaceSubmissionClaim> ClaimUntilInvoiceAsync(PaceSubmissionRepository repository, long invoiceId)
+    private static async Task<string> LoadGraphMessageIdAsync(SqlConnectionFactory factory, long mailMessageId)
+    {
+        await using var connection = await factory.OpenAsync(CancellationToken.None);
+
+        return await connection.QuerySingleAsync<string>(
+            "SELECT [GraphMessageId] FROM [dbo].[MailMessage] WHERE [MailMessageId] = @MailMessageId;",
+            new { MailMessageId = mailMessageId });
+    }
+
+    private static async Task<(int StatusId, string? ErrorMessage)> LoadMailStatusAsync(SqlConnectionFactory factory, long mailMessageId)
+    {
+        await using var connection = await factory.OpenAsync(CancellationToken.None);
+
+        return await connection.QuerySingleAsync<(int StatusId, string? ErrorMessage)>(
+            "SELECT [StatusId], [ErrorMessage] FROM [dbo].[MailMessage] WHERE [MailMessageId] = @MailMessageId;",
+            new { MailMessageId = mailMessageId });
+    }
+
+    private static async Task<PaceSubmissionClaim> ClaimUntilInvoiceAsync(PaceSubmissionRepository repository, long invoiceId, long? processingRunId = null)
     {
         for (var i = 0; i < 100; i++)
         {
-            var claim = await repository.ClaimNextAsync(processingRunId: null, CancellationToken.None);
+            var claim = await repository.ClaimNextAsync(processingRunId, CancellationToken.None);
 
             Assert.NotNull(claim);
 
@@ -736,6 +810,15 @@ public class SqlRepositoryTests
         }
 
         throw new InvalidOperationException($"Pace submission for invoice {invoiceId} was not claimed within the test limit.");
+    }
+
+    private static async Task<long?> LoadPaceSubmissionProcessingRunIdAsync(SqlConnectionFactory factory, long paceSubmissionId)
+    {
+        await using var connection = await factory.OpenAsync(CancellationToken.None);
+
+        return await connection.QuerySingleAsync<long?>(
+            "SELECT [ProcessingRunId] FROM [intgr].[PaceSubmission] WHERE [PaceSubmissionId] = @PaceSubmissionId;",
+            new { PaceSubmissionId = paceSubmissionId });
     }
 
     private static async Task<(long MailMessageId, long MailAttachmentId)> CreateRecordedPdfAsync(SqlConnectionFactory factory)
@@ -783,4 +866,43 @@ public class SqlRepositoryTests
             ExtractionMethod = "Regex",
             Status = ApStatus.InvoiceExtracted
         };
+
+    private sealed class RecordingMailSource : IMailSource
+    {
+        public (string MessageId, MailDestinationFolder Destination)? LastMove { get; private set; }
+
+        public Task ValidateAuthAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task EnsureFoldersExistAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public IAsyncEnumerable<MailMessageSummary> EnumerateInboxAsync(CancellationToken cancellationToken = default) => AsyncEnumerable.Empty<MailMessageSummary>();
+
+        public Task<MailboxDeltaResult> GetInboxDeltaAsync(string? deltaLink, CancellationToken cancellationToken) => throw new NotImplementedException();
+
+        public Task<MailMessageSummary?> GetMessageAsync(string messageId, CancellationToken cancellationToken) => Task.FromResult<MailMessageSummary?>(null);
+
+        public Task<byte[]> GetAttachmentContentAsync(string messageId, string attachmentId, CancellationToken cancellationToken) => Task.FromResult(Array.Empty<byte>());
+
+        public Task<string> MoveMessageAsync(string messageId, MailDestinationFolder destination, CancellationToken cancellationToken)
+        {
+            LastMove = (messageId, destination);
+            return Task.FromResult(messageId);
+        }
+    }
+
+    private sealed class RecordingMailSender : IMailSender
+    {
+        public MailSendRequest? LastRequest { get; private set; }
+
+        public Task SendMailAsync(MailSendRequest request, CancellationToken cancellationToken)
+        {
+            LastRequest = request;
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class StubPaceInvoiceService(PaceInvoiceSubmissionResult result) : IPaceInvoiceService
+    {
+        public Task<PaceInvoiceSubmissionResult> SubmitAsync(PaceInvoiceSubmission submission, CancellationToken cancellationToken) => Task.FromResult(result);
+    }
 }

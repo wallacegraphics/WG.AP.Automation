@@ -60,6 +60,8 @@ public sealed record PaceSubmissionClaim
 {
     public required long PaceSubmissionId { get; init; }
     public required long InvoiceId { get; init; }
+    public required long MailMessageId { get; init; }
+    public required string GraphMessageId { get; init; }
     public required int AttemptCount { get; init; }
     public required Guid ClaimToken { get; init; }
     public required string FieldsJson { get; init; }

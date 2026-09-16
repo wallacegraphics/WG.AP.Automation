@@ -59,7 +59,7 @@ public sealed class APProcessor(
     IOptions<AlertOptions> alertOptions,
     ILogger<APProcessor> logger)
 {
-    public async Task ProcessInvoicesAsync(CancellationToken cancellationToken)
+    public async Task<long?> ProcessInvoicesAsync(CancellationToken cancellationToken)
     {
         var mailbox = mailboxOptions.Value.ToMailboxRef();
         long? processingRunId = null;
@@ -261,6 +261,8 @@ public sealed class APProcessor(
         {
             ProcessingRunContext.CurrentRunId = null;
         }
+
+        return processingRunId;
     }
 
     internal sealed record MessageOutcome(

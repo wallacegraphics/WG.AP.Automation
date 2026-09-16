@@ -207,10 +207,10 @@ try
     }
 
     var apProcessor = host.Services.GetRequiredService<APProcessor>();
-    await apProcessor.ProcessInvoicesAsync(CancellationToken.None);
+    var processingRunId = await apProcessor.ProcessInvoicesAsync(CancellationToken.None);
 
     var paceInvoiceProcessor = host.Services.GetRequiredService<PaceInvoiceProcessor>();
-    await paceInvoiceProcessor.ProcessPendingAsync(CancellationToken.None);
+    await paceInvoiceProcessor.ProcessPendingAsync(processingRunId, CancellationToken.None);
 }
 catch (Exception exception)
 {

@@ -88,7 +88,7 @@ public sealed class PaceIntegrationTests
                     "PurchaseOrderLine" => Group("PurchaseOrderLine",
                         Row(("id", 163108), ("qtyReceived", 1), ("glAccount", 5609), ("glDepartment", 5024), ("job", "222260"), ("jobPart", "05"), ("activityCode", "13030"))),
                     "PurchaseOrderReceipt" => Group("PurchaseOrderReceipt",
-                        Row(("id", 144841), ("purchaseOrderLine", 163108), ("quantity", 1), ("unitCost", 40), ("extendedPrice", 40), ("stockingUOM", "EA"))),
+                        Row(("id", 144841), ("purchaseOrderLine", 163108), ("quantity", 1), ("unitCost", 77253.12m), ("extendedPrice", 77253.12m), ("stockingUOM", "EA"))),
                     "BillLine" => Group("BillLine"),
                     "Bill" => Group("Bill"),
                     _ => throw new InvalidOperationException(_.ObjectName)
@@ -166,6 +166,27 @@ public sealed class PaceIntegrationTests
     }
 
     [Fact]
+    public async Task PaceInvoiceService_WhenPoReceiptsAreMissing_ReturnsError()
+    {
+        var service = new PaceInvoiceService(
+            new FakePaceClient(_ => Task.FromResult(_.ObjectName switch
+            {
+                "PurchaseOrderLine" => Group("PurchaseOrderLine", Row(("id", 163108), ("qtyReceived", 1))),
+                "PurchaseOrderReceipt" => Group("PurchaseOrderReceipt"),
+                _ => Group(_.ObjectName!)
+            })),
+            Options.Create(NewPaceOptions()),
+            NullLogger<PaceInvoiceService>.Instance);
+
+        var result = await service.SubmitAsync(NewSubmission(), CancellationToken.None);
+
+        Assert.Equal(PaceInvoiceOutcomeStatus.Error, result.StatusCode);
+        Assert.Contains("no unpaid PO receipts", result.ErrorMessage);
+        Assert.Contains("163108", result.ErrorMessage);
+        Assert.Contains("2887-2533", result.ResponseJson);
+    }
+
+    [Fact]
     public async Task PaceInvoiceService_WhenEveryReceiptAlreadyBilled_ReturnsAlreadyEntered()
     {
         var service = new PaceInvoiceService(
@@ -174,6 +195,7 @@ public sealed class PaceIntegrationTests
                 "PurchaseOrderLine" => Group("PurchaseOrderLine", Row(("id", 163108), ("qtyReceived", 1))),
                 "PurchaseOrderReceipt" => Group("PurchaseOrderReceipt", Row(("id", 144841), ("purchaseOrderLine", 163108), ("quantity", 1), ("unitCost", 40), ("extendedPrice", 40), ("billedQuantity", 1), ("billedAmount", 40), ("stockingUOM", "EA"))),
                 "BillLine" => Group("BillLine", Row(("id", 900), ("purchaseOrderReceipt", 144841), ("bill", "bill-123"))),
+                "Bill" => Group("Bill"),
                 _ => throw new InvalidOperationException(_.ObjectName)
             })),
             Options.Create(NewPaceOptions()),
@@ -193,7 +215,7 @@ public sealed class PaceIntegrationTests
             new FakePaceClient(_ => Task.FromResult(_.ObjectName switch
             {
                 "PurchaseOrderLine" => Group("PurchaseOrderLine", Row(("id", 163108), ("qtyReceived", 3), ("glAccount", 5609), ("glDepartment", 5024), ("job", "222260"))),
-                "PurchaseOrderReceipt" => Group("PurchaseOrderReceipt", Row(("id", 144841), ("purchaseOrderLine", 163108), ("quantity", 3), ("unitCost", 40), ("extendedPrice", 120), ("billedQuantity", 1), ("billedAmount", 40), ("stockingUOM", "EA"))),
+                "PurchaseOrderReceipt" => Group("PurchaseOrderReceipt", Row(("id", 144841), ("purchaseOrderLine", 163108), ("quantity", 3), ("unitCost", 38626.56m), ("extendedPrice", 115879.68m), ("billedQuantity", 1), ("billedAmount", 38626.56m), ("stockingUOM", "EA"))),
                 "BillLine" => Group("BillLine", Row(("id", 900), ("purchaseOrderReceipt", 144841), ("bill", "bill-123"))),
                 "Bill" => Group("Bill"),
                 _ => throw new InvalidOperationException(_.ObjectName)
@@ -205,8 +227,32 @@ public sealed class PaceIntegrationTests
 
         Assert.Equal(PaceInvoiceOutcomeStatus.DryRunPrepared, result.StatusCode);
         Assert.Contains("144841", result.ResponseJson);
-        Assert.Contains("\"invoiceAmount\": 80", result.ResponseJson);
+        Assert.Contains("\"invoiceAmount\": 77253.12", result.ResponseJson);
         Assert.Contains("\"poQuantity\": 2", result.ResponseJson);
+    }
+
+    [Fact]
+    public async Task PaceInvoiceService_WhenReceiptTotalDiffersFromInvoiceTotal_ReturnsError()
+    {
+        var service = new PaceInvoiceService(
+            new FakePaceClient(_ => Task.FromResult(_.ObjectName switch
+            {
+                "PurchaseOrderLine" => Group("PurchaseOrderLine", Row(("id", 163108), ("qtyReceived", 1), ("glAccount", 5609), ("glDepartment", 5024), ("job", "222260"))),
+                "PurchaseOrderReceipt" => Group("PurchaseOrderReceipt", Row(("id", 144841), ("purchaseOrderLine", 163108), ("quantity", 1), ("unitCost", 40), ("extendedPrice", 40), ("stockingUOM", "EA"))),
+                "BillLine" => Group("BillLine"),
+                "Bill" => Group("Bill"),
+                _ => throw new InvalidOperationException(_.ObjectName)
+            })),
+            Options.Create(NewPaceOptions()),
+            NullLogger<PaceInvoiceService>.Instance);
+
+        var result = await service.SubmitAsync(NewSubmission(), CancellationToken.None);
+
+        Assert.Equal(PaceInvoiceOutcomeStatus.Error, result.StatusCode);
+        Assert.Contains("does not match unpaid PO receipt total", result.ErrorMessage);
+        Assert.Contains("77253.12", result.ErrorMessage);
+        Assert.Contains("40", result.ErrorMessage);
+        Assert.Contains("144841", result.ResponseJson);
     }
 
     [Fact]
@@ -218,6 +264,7 @@ public sealed class PaceIntegrationTests
                 "PurchaseOrderLine" => Group("PurchaseOrderLine", Row(("id", 163108), ("qtyReceived", 1), ("invoiceComplete", true))),
                 "PurchaseOrderReceipt" => Group("PurchaseOrderReceipt", Row(("id", 144841), ("purchaseOrderLine", 163108), ("quantity", 1), ("unitCost", 40), ("extendedPrice", 40), ("stockingUOM", "EA"))),
                 "BillLine" => Group("BillLine"),
+                "Bill" => Group("Bill"),
                 _ => throw new InvalidOperationException(_.ObjectName)
             })),
             Options.Create(NewPaceOptions()),
@@ -239,7 +286,7 @@ public sealed class PaceIntegrationTests
                 "PurchaseOrderReceipt" when _.Offset == 0 => Group("PurchaseOrderReceipt", 501, Enumerable.Range(1, 500)
                     .Select(id => Row(("id", id), ("purchaseOrderLine", 163108), ("quantity", 1), ("unitCost", 40), ("extendedPrice", 40), ("billedQuantity", 1), ("billedAmount", 40), ("stockingUOM", "EA")))
                     .ToArray()),
-                "PurchaseOrderReceipt" when _.Offset == 500 => Group("PurchaseOrderReceipt", 501, Row(("id", 144841), ("purchaseOrderLine", 163108), ("quantity", 1), ("unitCost", 40), ("extendedPrice", 40), ("billedQuantity", 0), ("billedAmount", 0), ("stockingUOM", "EA"))),
+                "PurchaseOrderReceipt" when _.Offset == 500 => Group("PurchaseOrderReceipt", 501, Row(("id", 144841), ("purchaseOrderLine", 163108), ("quantity", 1), ("unitCost", 77253.12m), ("extendedPrice", 77253.12m), ("billedQuantity", 0), ("billedAmount", 0), ("stockingUOM", "EA"))),
                 "BillLine" => Group("BillLine"),
                 "Bill" => Group("Bill"),
                 _ => throw new InvalidOperationException($"{_.ObjectName} offset {_.Offset}")
@@ -257,6 +304,7 @@ public sealed class PaceIntegrationTests
     public async Task PaceInvoiceService_WhenPaceBillExistsForVendorAndInvoice_ReturnsAlreadyEntered()
     {
         ValueObjectDescriptor? billDescriptor = null;
+        var purchaseOrderLineLookupCalled = false;
         var service = new PaceInvoiceService(
             new FakePaceClient(_ =>
             {
@@ -264,12 +312,13 @@ public sealed class PaceIntegrationTests
                 {
                     billDescriptor = _;
                 }
+                else if (_.ObjectName == "PurchaseOrderLine")
+                {
+                    purchaseOrderLineLookupCalled = true;
+                }
 
                 return Task.FromResult(_.ObjectName switch
                 {
-                    "PurchaseOrderLine" => Group("PurchaseOrderLine", Row(("id", 163108), ("qtyReceived", 1))),
-                    "PurchaseOrderReceipt" => Group("PurchaseOrderReceipt", Row(("id", 144841), ("purchaseOrderLine", 163108), ("quantity", 1), ("unitCost", 40), ("extendedPrice", 40), ("stockingUOM", "EA"))),
-                    "BillLine" => Group("BillLine"),
                     "Bill" => Group("Bill", Row(("id", 12345), ("vendor", "SANMAR-PACE"), ("invoiceNumber", "INV-163939830"), ("poNumber", "2887-2533"), ("billBatch", "987"), ("postingStatus", "Open"))),
                     _ => throw new InvalidOperationException(_.ObjectName)
                 });
@@ -284,6 +333,36 @@ public sealed class PaceIntegrationTests
         Assert.Equal("987", result.PaceBillBatchId);
         Assert.Contains("INV-163939830", result.ResponseJson);
         Assert.Equal("@vendor = 'SANMAR-PACE' and @invoiceNumber = 'INV-163939830'", billDescriptor?.XpathFilter);
+        Assert.False(purchaseOrderLineLookupCalled);
+    }
+
+    [Fact]
+    public async Task PaceInvoiceService_WhenPaceBillExists_ReturnsAlreadyEnteredBeforePoReceiptGates()
+    {
+        var purchaseOrderLineLookupCalled = false;
+        var service = new PaceInvoiceService(
+            new FakePaceClient(_ =>
+            {
+                if (_.ObjectName == "PurchaseOrderLine")
+                {
+                    purchaseOrderLineLookupCalled = true;
+                }
+
+                return Task.FromResult(_.ObjectName switch
+                {
+                    "Bill" => Group("Bill", Row(("id", 12345), ("vendor", "SANMAR-PACE"), ("invoiceNumber", "INV-163939830"), ("poNumber", "2887-2533"), ("billBatch", "987"), ("postingStatus", "Open"))),
+                    _ => throw new InvalidOperationException(_.ObjectName)
+                });
+            }),
+            Options.Create(NewPaceOptions()),
+            NullLogger<PaceInvoiceService>.Instance);
+
+        var result = await service.SubmitAsync(NewSubmission(), CancellationToken.None);
+
+        Assert.Equal(PaceInvoiceOutcomeStatus.AlreadyEntered, result.StatusCode);
+        Assert.Equal("12345", result.PaceBillId);
+        Assert.Equal("987", result.PaceBillBatchId);
+        Assert.False(purchaseOrderLineLookupCalled);
     }
 
     [Fact]
@@ -322,7 +401,9 @@ public sealed class PaceIntegrationTests
     {
         var exception = new ApiException("missing", 404, "not found", new Dictionary<string, IEnumerable<string>>(), null);
         var service = new PaceInvoiceService(
-            new FakePaceClient(_ => Task.FromException<ValueObjectsGroup>(exception)),
+            new FakePaceClient(_ => _.ObjectName == "Bill"
+                ? Task.FromResult(Group("Bill"))
+                : Task.FromException<ValueObjectsGroup>(exception)),
             Options.Create(NewPaceOptions()),
             NullLogger<PaceInvoiceService>.Instance);
 
@@ -372,6 +453,26 @@ public sealed class PaceIntegrationTests
         Assert.True(result.IsTransient);
         Assert.Null(result.RequestJson);
         Assert.Contains("try later", result.ResponseJson);
+        Assert.Contains("statusCode", result.ResponseJson);
+    }
+
+    [Theory]
+    [InlineData(401)]
+    [InlineData(403)]
+    public async Task PaceInvoiceService_MapsAuthenticationFailureToRetryLater(int statusCode)
+    {
+        var exception = new ApiException("auth failed", statusCode, "not authorized", new Dictionary<string, IEnumerable<string>>(), null);
+        var service = new PaceInvoiceService(
+            new FakePaceClient(_ => Task.FromException<ValueObjectsGroup>(exception)),
+            Options.Create(NewPaceOptions()),
+            NullLogger<PaceInvoiceService>.Instance);
+
+        var result = await service.SubmitAsync(NewSubmission(), CancellationToken.None);
+
+        Assert.Equal(PaceInvoiceOutcomeStatus.RetryLater, result.StatusCode);
+        Assert.True(result.IsTransient);
+        Assert.Contains(statusCode.ToString(), result.ErrorMessage);
+        Assert.Contains("credentials or permissions", result.ErrorMessage);
         Assert.Contains("statusCode", result.ResponseJson);
     }
 

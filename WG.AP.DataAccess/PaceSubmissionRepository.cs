@@ -87,6 +87,8 @@ public sealed class PaceSubmissionRepository(
             OUTPUT
                    inserted.[PaceSubmissionId],
                    inserted.[InvoiceId],
+                   mailMessage.[MailMessageId],
+                   mailMessage.[GraphMessageId],
                    inserted.[AttemptCount],
                    inserted.[ClaimToken],
                    invoice.[FieldsJson],
@@ -102,6 +104,8 @@ public sealed class PaceSubmissionRepository(
                 ON nextSubmission.[PaceSubmissionId] = submission.[PaceSubmissionId]
             INNER JOIN [dbo].[Invoice] AS invoice
                 ON invoice.[InvoiceId] = submission.[InvoiceId]
+            INNER JOIN [dbo].[MailMessage] AS mailMessage
+                ON mailMessage.[MailMessageId] = invoice.[MailMessageId]
             INNER JOIN [dbo].[Client] AS client
                 ON client.[ClientId] = invoice.[ClientId];
             """,
