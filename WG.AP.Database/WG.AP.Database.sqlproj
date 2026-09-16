@@ -91,10 +91,12 @@
     <PostDeploy Include="Scripts\PostDeployment.sql" />
     <None Include="Scripts\PreDeployment.sql" />
     <None Include="Scripts\Seed\*.sql" />
+    <None Include="Scripts\Operations\*.sql" />
     <None Include="Tests\*.sql" />
   </ItemGroup>
   <ItemGroup>
     <Folder Include="Scripts\" />
+    <Folder Include="Scripts\Operations\" />
     <Folder Include="Scripts\Seed\" />
     <Folder Include="Tests\" />
   </ItemGroup>

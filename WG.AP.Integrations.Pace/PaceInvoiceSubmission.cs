@@ -14,8 +14,6 @@ public sealed record PaceInvoiceSubmissionResult
 
     public bool IsTransient { get; init; }
 
-    public string? RequestJson { get; init; }
-
     public string? ResponseJson { get; init; }
 
     public string? PaceBillBatchId { get; init; }

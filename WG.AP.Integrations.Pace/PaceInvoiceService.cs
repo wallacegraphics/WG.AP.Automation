@@ -83,10 +83,18 @@ public sealed class PaceInvoiceService(
 
             if (receivedLines.Count == 0)
             {
+                var errorMessage = BuildPoNotReceivedError(submission, purchaseOrderLines.PurchaseOrderLines);
+                logger.LogError(
+                    "{ErrorMessage} InvoiceId={InvoiceId}; PaceVendorId={PaceVendorId}.",
+                    errorMessage,
+                    submission.InvoiceId,
+                    submission.PaceVendorId);
+
                 return new PaceInvoiceSubmissionResult
                 {
-                    StatusCode = PaceInvoiceOutcomeStatus.PoNotReceived,
-                    ResponseJson = SerializeResponse(new { submission.Fields.CustomerPO, PurchaseOrderLines = purchaseOrderLines })
+                    StatusCode = PaceInvoiceOutcomeStatus.Error,
+                    ResponseJson = SerializeResponse(new { submission.Fields.InvoiceNumber, submission.Fields.CustomerPO, InvoiceTotal = submission.Fields.Total, PurchaseOrderLines = purchaseOrderLines.PurchaseOrderLines }),
+                    ErrorMessage = errorMessage
                 };
             }
 
@@ -138,6 +146,7 @@ public sealed class PaceInvoiceService(
 
                     return new BillableReceipt(
                         receipt.Receipt.Id,
+                        receipt.Receipt.PurchaseOrderLine,
                         invoiceAmount,
                         receipt.RemainingQuantity,
                         receipt.Receipt.UnitCost,
@@ -152,15 +161,25 @@ public sealed class PaceInvoiceService(
 
             if (billableReceipts.Count == 0)
             {
+                var errorMessage = BuildNoUnpaidReceiptsError(submission, receipts, billLines);
+                logger.LogError(
+                    "{ErrorMessage} InvoiceId={InvoiceId}; PaceVendorId={PaceVendorId}.",
+                    errorMessage,
+                    submission.InvoiceId,
+                    submission.PaceVendorId);
+
                 return new PaceInvoiceSubmissionResult
                 {
-                    StatusCode = PaceInvoiceOutcomeStatus.AlreadyEntered,
+                    StatusCode = PaceInvoiceOutcomeStatus.Error,
                     ResponseJson = SerializeResponse(new
                     {
+                        submission.Fields.InvoiceNumber,
                         submission.Fields.CustomerPO,
+                        InvoiceTotal = submission.Fields.Total,
+                        Receipts = receipts,
                         BillLines = billLines
                     }),
-                    PaceBillId = string.Join(",", billLines.Select(line => line.Bill).Where(bill => !string.IsNullOrWhiteSpace(bill)).Distinct(StringComparer.OrdinalIgnoreCase))
+                    ErrorMessage = errorMessage
                 };
             }
 
@@ -536,11 +555,23 @@ public sealed class PaceInvoiceService(
     private static bool IsAuthenticationFailureStatus(int statusCode) =>
         statusCode is 401 or 403;
 
+    private static string BuildPoNotReceivedError(PaceInvoiceSubmission submission, IReadOnlyCollection<PurchaseOrderLineValue> purchaseOrderLines) =>
+        $"Pace invoice '{submission.Fields.InvoiceNumber}' for PO '{submission.Fields.CustomerPO}': no received PO lines were found. Invoice total: {submission.Fields.Total:0.####}. Purchase order line ids: {string.Join(", ", purchaseOrderLines.Select(line => line.Id))}.";
+
     private static string BuildNoReceiptsError(PaceInvoiceSubmission submission, IReadOnlyCollection<PurchaseOrderLineValue> billableLines) =>
         $"Pace invoice '{submission.Fields.InvoiceNumber}' for PO '{submission.Fields.CustomerPO}': no unpaid PO receipts were found. Purchase order line ids: {string.Join(", ", billableLines.Select(line => line.Id))}.";
 
+    private static string BuildNoUnpaidReceiptsError(PaceInvoiceSubmission submission, IReadOnlyCollection<PurchaseOrderReceiptValue> receipts, IReadOnlyCollection<BillLineValue> billLines) =>
+        $"Pace invoice '{submission.Fields.InvoiceNumber}' for PO '{submission.Fields.CustomerPO}': PO receipts exist but no unpaid receipt quantity remains, and no Pace bill was found for vendor/invoice. Invoice total: {submission.Fields.Total:0.####}. Receipt ids: {string.Join(", ", receipts.Select(receipt => receipt.Id))}. Bill line ids: {JoinOrNone(billLines.Select(line => line.Id.ToString(System.Globalization.CultureInfo.InvariantCulture)))}. Existing bill ids: {JoinOrNone(billLines.Select(line => line.Bill).Where(bill => !string.IsNullOrWhiteSpace(bill)).Distinct(StringComparer.OrdinalIgnoreCase))}.";
+
     private static string BuildReceiptTotalMismatchError(PaceInvoiceSubmission submission, decimal receiptTotal, IReadOnlyCollection<BillableReceipt> billableReceipts) =>
-        $"Pace invoice '{submission.Fields.InvoiceNumber}' for PO '{submission.Fields.CustomerPO}': invoice total {submission.Fields.Total:0.####} does not match unpaid PO receipt total {receiptTotal:0.####}. Receipt ids: {string.Join(", ", billableReceipts.Select(receipt => receipt.PurchaseOrderReceipt))}.";
+        $"Pace invoice '{submission.Fields.InvoiceNumber}' for PO '{submission.Fields.CustomerPO}': invoice total {submission.Fields.Total:0.####} does not match unpaid PO receipt total {receiptTotal:0.####}. Purchase order line ids: {string.Join(", ", billableReceipts.Select(receipt => receipt.PurchaseOrderLine).Distinct())}. Receipt ids: {string.Join(", ", billableReceipts.Select(receipt => receipt.PurchaseOrderReceipt))}.";
+
+    private static string JoinOrNone(IEnumerable<string?> values)
+    {
+        var joined = string.Join(", ", values.Where(value => !string.IsNullOrWhiteSpace(value)));
+        return string.IsNullOrWhiteSpace(joined) ? "none" : joined;
+    }
 
     private sealed record PurchaseOrderLineValue(int Id, decimal QtyReceived, bool InvoiceComplete, int? GlAccount, int? GlDepartment, string? Job, string? JobPart, string? ActivityCode);
 
@@ -552,5 +583,5 @@ public sealed class PaceInvoiceService(
 
     private sealed record BillValue(int Id, string? Vendor, string? InvoiceNumber, string? PoNumber, string? BillBatch, string? PostingStatus);
 
-    private sealed record BillableReceipt(int PurchaseOrderReceipt, decimal InvoiceAmount, decimal PoQuantity, decimal PoUnitPrice, string? PoUom, int? GlAccount, int? GlDepartment, string? Job, string? JobPart, string? ActivityCode);
+    private sealed record BillableReceipt(int PurchaseOrderReceipt, int PurchaseOrderLine, decimal InvoiceAmount, decimal PoQuantity, decimal PoUnitPrice, string? PoUom, int? GlAccount, int? GlDepartment, string? Job, string? JobPart, string? ActivityCode);
 }

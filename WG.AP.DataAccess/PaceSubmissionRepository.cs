@@ -139,7 +139,6 @@ public sealed class PaceSubmissionRepository(
                SET [StatusCodeId] = @StatusId,
                    [ClaimToken] = NULL,
                    [ClaimedOn] = NULL,
-                   [RequestJson] = @RequestJson,
                    [ResponseJson] = @ResponseJson,
                    [PaceBillBatchId] = @PaceBillBatchId,
                    [PaceBillId] = @PaceBillId,
@@ -154,7 +153,6 @@ public sealed class PaceSubmissionRepository(
                     completion.PaceSubmissionId,
                     completion.ClaimToken,
                     StatusId = PaceSubmissionStatus.ToId(completion.StatusCode),
-                    completion.RequestJson,
                     completion.ResponseJson,
                     completion.PaceBillBatchId,
                     completion.PaceBillId,
@@ -186,7 +184,6 @@ public sealed class PaceSubmissionRepository(
                    [NextAttemptOn] = @NextAttemptOn,
                    [ClaimToken] = NULL,
                    [ClaimedOn] = NULL,
-                   [RequestJson] = @RequestJson,
                    [ResponseJson] = @ResponseJson,
                    [ErrorMessage] = @ErrorMessage,
                    [ModifiedOn] = SYSUTCDATETIME()
@@ -199,7 +196,6 @@ public sealed class PaceSubmissionRepository(
                     retry.ClaimToken,
                     RetryLaterStatusId = PaceSubmissionStatus.RetryLaterId,
                     retry.NextAttemptOn,
-                    retry.RequestJson,
                     retry.ResponseJson,
                     retry.ErrorMessage
                 },

@@ -77,7 +77,6 @@ public sealed class PaceInvoiceProcessor(
                     PaceSubmissionId = claim.PaceSubmissionId,
                     ClaimToken = claim.ClaimToken,
                     NextAttemptOn = CalculateNextAttemptOn(claim.AttemptCount),
-                    RequestJson = result.RequestJson,
                     ResponseJson = result.ResponseJson,
                     ErrorMessage = result.ErrorMessage
                 }, cancellationToken);
@@ -95,7 +94,6 @@ public sealed class PaceInvoiceProcessor(
                 PaceSubmissionId = claim.PaceSubmissionId,
                 ClaimToken = claim.ClaimToken,
                 StatusCode = result.StatusCode,
-                RequestJson = result.RequestJson,
                 ResponseJson = result.ResponseJson,
                 PaceBillBatchId = result.PaceBillBatchId,
                 PaceBillId = result.PaceBillId,
@@ -126,6 +124,14 @@ public sealed class PaceInvoiceProcessor(
             if (!savedCompletion)
             {
                 logger.LogWarning("Pace submission {PaceSubmissionId} parse-error update skipped because its claim token no longer matched.", claim.PaceSubmissionId);
+            }
+
+            if (savedCompletion)
+            {
+                await RoutePaceErrorAsync(
+                    claim,
+                    $"Pace invoice '{claim.InvoiceNumber}' for PO '{claim.CustomerPO}': stored invoice fields could not be processed. {exception.Message}",
+                    cancellationToken);
             }
         }
     }

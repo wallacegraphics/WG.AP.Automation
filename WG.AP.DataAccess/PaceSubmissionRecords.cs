@@ -48,7 +48,6 @@ public sealed record PaceSubmissionRecord
     public Guid? ClaimToken { get; init; }
     public DateTime? ClaimedOn { get; init; }
     public long? ProcessingRunId { get; init; }
-    public string? RequestJson { get; init; }
     public string? ResponseJson { get; init; }
     public string? PaceBillBatchId { get; init; }
     public string? PaceBillId { get; init; }
@@ -79,7 +78,6 @@ public sealed record PaceSubmissionCompletion
     public required long PaceSubmissionId { get; init; }
     public required Guid ClaimToken { get; init; }
     public required string StatusCode { get; init; }
-    public string? RequestJson { get; init; }
     public string? ResponseJson { get; init; }
     public string? PaceBillBatchId { get; init; }
     public string? PaceBillId { get; init; }
@@ -92,7 +90,6 @@ public sealed record PaceSubmissionRetry
     public required long PaceSubmissionId { get; init; }
     public required Guid ClaimToken { get; init; }
     public required DateTime NextAttemptOn { get; init; }
-    public string? RequestJson { get; init; }
     public string? ResponseJson { get; init; }
     public string? ErrorMessage { get; init; }
 }

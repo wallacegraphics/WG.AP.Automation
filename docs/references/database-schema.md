@@ -246,6 +246,12 @@ while stale claim-token updates are ignored.
 normalization keeps deployed status ids stable and lets the code store `StatusCodeId` while still
 reporting readable status names in queries.
 
+Dry run is controlled by application configuration, not by SQL: `Pace:WriteEnabled=false` validates and
+prepares Pace bill payloads without writing bills, while `Pace:WriteEnabled=true` allows the write path.
+Rows that reach `DryRunPrepared` are final audit rows by default. After reviewing those rows and before
+the first real write run, use `Scripts/Operations/RequeuePaceDryRunPrepared.sql` against the target
+database to promote only approved dry-run rows back to `Pending`.
+
 ## Client requirements
 
 `dbo.MailMessage` and `dbo.Invoice` carry indexes on persisted computed columns, so SQL Server refuses

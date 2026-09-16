@@ -107,7 +107,6 @@ public sealed class PaceIntegrationTests
 
         Assert.Equal(PaceInvoiceOutcomeStatus.DryRunPrepared, result.StatusCode);
         Assert.False(result.IsTransient);
-        Assert.Null(result.RequestJson);
         Assert.Contains("billableReceipts", result.ResponseJson);
         Assert.Contains("144841", result.ResponseJson);
         Assert.Contains("222260", result.ResponseJson);
@@ -151,7 +150,7 @@ public sealed class PaceIntegrationTests
     }
 
     [Fact]
-    public async Task PaceInvoiceService_WhenPoLineNotReceived_ReturnsPoNotReceived()
+    public async Task PaceInvoiceService_WhenPoLineNotReceived_ReturnsError()
     {
         var service = new PaceInvoiceService(
             new FakePaceClient(_ => Task.FromResult(_.ObjectName == "PurchaseOrderLine"
@@ -162,7 +161,13 @@ public sealed class PaceIntegrationTests
 
         var result = await service.SubmitAsync(NewSubmission(), CancellationToken.None);
 
-        Assert.Equal(PaceInvoiceOutcomeStatus.PoNotReceived, result.StatusCode);
+        Assert.Equal(PaceInvoiceOutcomeStatus.Error, result.StatusCode);
+        Assert.Contains("no received PO lines", result.ErrorMessage);
+        Assert.Contains("INV-163939830", result.ErrorMessage);
+        Assert.Contains("2887-2533", result.ErrorMessage);
+        Assert.Contains("77253.12", result.ErrorMessage);
+        Assert.Contains("163108", result.ErrorMessage);
+        Assert.Contains("163108", result.ResponseJson);
     }
 
     [Fact]
@@ -187,7 +192,7 @@ public sealed class PaceIntegrationTests
     }
 
     [Fact]
-    public async Task PaceInvoiceService_WhenEveryReceiptAlreadyBilled_ReturnsAlreadyEntered()
+    public async Task PaceInvoiceService_WhenEveryReceiptAlreadyBilledWithoutDuplicateBill_ReturnsError()
     {
         var service = new PaceInvoiceService(
             new FakePaceClient(_ => Task.FromResult(_.ObjectName switch
@@ -203,9 +208,14 @@ public sealed class PaceIntegrationTests
 
         var result = await service.SubmitAsync(NewSubmission(), CancellationToken.None);
 
-        Assert.Equal(PaceInvoiceOutcomeStatus.AlreadyEntered, result.StatusCode);
-        Assert.Equal("bill-123", result.PaceBillId);
+        Assert.Equal(PaceInvoiceOutcomeStatus.Error, result.StatusCode);
+        Assert.Null(result.PaceBillId);
+        Assert.Contains("no unpaid receipt quantity remains", result.ErrorMessage);
+        Assert.Contains("144841", result.ErrorMessage);
+        Assert.Contains("900", result.ErrorMessage);
+        Assert.Contains("bill-123", result.ErrorMessage);
         Assert.Contains("bill-123", result.ResponseJson);
+        Assert.Contains("144841", result.ResponseJson);
     }
 
     [Fact]
@@ -232,6 +242,34 @@ public sealed class PaceIntegrationTests
     }
 
     [Fact]
+    public async Task PaceInvoiceService_WhenMultipleUnpaidReceiptsMatchInvoiceTotal_ReturnsDryRunPrepared()
+    {
+        var service = new PaceInvoiceService(
+            new FakePaceClient(_ => Task.FromResult(_.ObjectName switch
+            {
+                "PurchaseOrderLine" => Group("PurchaseOrderLine",
+                    Row(("id", 163108), ("qtyReceived", 1), ("glAccount", 5609), ("glDepartment", 5024), ("job", "222260")),
+                    Row(("id", 163109), ("qtyReceived", 1), ("glAccount", 5609), ("glDepartment", 5024), ("job", "222260"))),
+                "PurchaseOrderReceipt" => Group("PurchaseOrderReceipt",
+                    Row(("id", 144841), ("purchaseOrderLine", 163108), ("quantity", 1), ("unitCost", 70000m), ("extendedPrice", 70000m), ("stockingUOM", "EA")),
+                    Row(("id", 144842), ("purchaseOrderLine", 163109), ("quantity", 1), ("unitCost", 7253.12m), ("extendedPrice", 7253.12m), ("stockingUOM", "EA"))),
+                "BillLine" => Group("BillLine"),
+                "Bill" => Group("Bill"),
+                _ => throw new InvalidOperationException(_.ObjectName)
+            })),
+            Options.Create(NewPaceOptions()),
+            NullLogger<PaceInvoiceService>.Instance);
+
+        var result = await service.SubmitAsync(NewSubmission(), CancellationToken.None);
+
+        Assert.Equal(PaceInvoiceOutcomeStatus.DryRunPrepared, result.StatusCode);
+        Assert.Contains("144841", result.ResponseJson);
+        Assert.Contains("144842", result.ResponseJson);
+        Assert.Contains("163108", result.ResponseJson);
+        Assert.Contains("163109", result.ResponseJson);
+    }
+
+    [Fact]
     public async Task PaceInvoiceService_WhenReceiptTotalDiffersFromInvoiceTotal_ReturnsError()
     {
         var service = new PaceInvoiceService(
@@ -252,7 +290,9 @@ public sealed class PaceIntegrationTests
         Assert.Contains("does not match unpaid PO receipt total", result.ErrorMessage);
         Assert.Contains("77253.12", result.ErrorMessage);
         Assert.Contains("40", result.ErrorMessage);
+        Assert.Contains("144841", result.ErrorMessage);
         Assert.Contains("144841", result.ResponseJson);
+        Assert.Contains("163108", result.ResponseJson);
     }
 
     [Fact]
@@ -411,7 +451,6 @@ public sealed class PaceIntegrationTests
 
         Assert.Equal(PaceInvoiceOutcomeStatus.NoPo, result.StatusCode);
         Assert.False(result.IsTransient);
-        Assert.Null(result.RequestJson);
         Assert.Contains("not found", result.ResponseJson);
         Assert.Contains("statusCode", result.ResponseJson);
     }
@@ -451,7 +490,6 @@ public sealed class PaceIntegrationTests
 
         Assert.Equal(PaceInvoiceOutcomeStatus.RetryLater, result.StatusCode);
         Assert.True(result.IsTransient);
-        Assert.Null(result.RequestJson);
         Assert.Contains("try later", result.ResponseJson);
         Assert.Contains("statusCode", result.ResponseJson);
     }
