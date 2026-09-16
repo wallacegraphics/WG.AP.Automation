@@ -70,6 +70,7 @@ GO
 
 IF OBJECT_ID(N'intgr.PaceSubmissionStatus', N'U') IS NOT NULL
 	  AND COL_LENGTH(N'intgr.PaceSubmissionStatus', N'StatusCodeId') IS NULL
+	  AND COL_LENGTH(N'intgr.PaceSubmissionStatus', N'StatusCode') IS NOT NULL
 BEGIN
 	ALTER TABLE [intgr].[PaceSubmissionStatus]
 		ADD [StatusCodeId] INT NULL;
