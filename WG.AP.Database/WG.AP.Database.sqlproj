@@ -19,7 +19,6 @@
     <TargetDatabaseSet>True</TargetDatabaseSet>
     <ProjectGuid>{5c74f562-4ba4-9b84-2e2d-a39d637e4ced}</ProjectGuid>
   </PropertyGroup>
-
   <!-- Makes Visual Studio build this project with the DacFx this SDK ships rather than the older one
        bundled in the IDE.
 
@@ -88,13 +87,20 @@
     <Build Remove="bin\**\*.sql" />
     <None Remove="obj\**\*.sql" />
     <None Remove="bin\**\*.sql" />
+    <PreDeploy Include="Scripts\PreDeployment.sql" />
     <PostDeploy Include="Scripts\PostDeployment.sql" />
+    <None Include="Scripts\PreDeployment.sql" />
     <None Include="Scripts\Seed\*.sql" />
+    <None Include="Scripts\Operations\*.sql" />
     <None Include="Tests\*.sql" />
   </ItemGroup>
   <ItemGroup>
     <Folder Include="Scripts\" />
+    <Folder Include="Scripts\Operations\" />
     <Folder Include="Scripts\Seed\" />
     <Folder Include="Tests\" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="WG.AP.Database.Prod.PaceStatusNormalization.publish.xml" />
   </ItemGroup>
 </Project>

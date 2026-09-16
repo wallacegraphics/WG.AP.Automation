@@ -1,8 +1,11 @@
+using Dapper;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using WG.AP.Core.Abstractions;
 using WG.AP.DataAccess;
+using WG.AP.Integrations.Pace;
 using WG.AP.Invoice.Models;
+using WG.AP.Processor;
 
 namespace WG.AP.Tests.DataAccess;
 
@@ -43,6 +46,23 @@ public class SqlRepositoryTests
         Skip.If(
             string.IsNullOrWhiteSpace(ConnectionString),
             "Set AP_TEST_DB_CONNECTION to a database the WG.AP.Database project has been published to.");
+
+    private static async Task SkipUnlessPaceSchemaPublishedAsync(SqlConnectionFactory factory)
+    {
+        await using var connection = await factory.OpenAsync(CancellationToken.None);
+        var exists = await connection.ExecuteScalarAsync<int>(
+            """
+            SELECT CASE
+                WHEN OBJECT_ID(N'intgr.PaceSubmission', N'U') IS NOT NULL
+                 AND COL_LENGTH(N'intgr.PaceSubmission', N'StatusCodeId') IS NOT NULL
+                 AND COL_LENGTH(N'intgr.PaceSubmissionStatus', N'StatusCodeId') IS NOT NULL
+                    THEN 1
+                ELSE 0
+            END;
+            """);
+
+        Skip.If(exists == 0, "Publish the WG.AP.Database project with the normalized Pace submission schema before running Pace SQL repository tests.");
+    }
 
     [SkippableFact]
     public async Task MailboxSyncState_RoundTripsAndOverwrites()
@@ -438,6 +458,441 @@ public class SqlRepositoryTests
         await repository.WriteAsync([], CancellationToken.None);
     }
 
+    [SkippableFact]
+    public async Task PaceSubmission_Enqueue_IsIdempotent_AndClaimReturnsFieldsJson()
+    {
+        SkipUnlessConfigured();
+
+        var factory = CreateFactory();
+        await SkipUnlessPaceSchemaPublishedAsync(factory);
+        await AssertPaceSubmissionUsesStatusLookupIdAsync(factory);
+
+        var runs = new ProcessingRunRepository(factory, NullLogger<ProcessingRunRepository>.Instance);
+        var invoices = new InvoiceRepository(factory, NullLogger<InvoiceRepository>.Instance);
+        var paceSubmissions = new PaceSubmissionRepository(factory, NullLogger<PaceSubmissionRepository>.Instance);
+        var (mailMessageId, mailAttachmentId) = await CreateRecordedPdfAsync(factory);
+        var processingRunId = await runs.StartAsync(new MailboxRef(Guid.NewGuid(), "sql-test@wallacegraphics.com"), CancellationToken.None);
+
+        var invoice = await invoices.RecordAsync(NewInvoice(mailMessageId, mailAttachmentId, $"INV-{Guid.NewGuid():N}"[..20]), CancellationToken.None);
+
+        Assert.True(await paceSubmissions.EnqueueExtractedInvoicesAsync(CancellationToken.None) >= 1);
+        Assert.Equal(0, await paceSubmissions.EnqueueExtractedInvoicesAsync(CancellationToken.None));
+
+        var claim = await ClaimUntilInvoiceAsync(paceSubmissions, invoice.InvoiceId!.Value, processingRunId);
+
+        Assert.NotNull(claim);
+        Assert.Equal(invoice.InvoiceId, claim.InvoiceId);
+        Assert.Equal(1, claim.AttemptCount);
+        Assert.Contains("InvoiceNumber", claim.FieldsJson);
+        await AssertPaceSubmissionStatusAsync(factory, claim.PaceSubmissionId, PaceSubmissionStatus.InProgressId, PaceSubmissionStatus.InProgress);
+        Assert.Equal(processingRunId, await LoadPaceSubmissionProcessingRunIdAsync(factory, claim.PaceSubmissionId));
+    }
+
+    [SkippableFact]
+    public async Task PaceSubmission_RetryThenComplete_UsesClaimTokenAndIncrementsAttempts()
+    {
+        SkipUnlessConfigured();
+
+        var factory = CreateFactory();
+        await SkipUnlessPaceSchemaPublishedAsync(factory);
+        await AssertPaceSubmissionUsesStatusLookupIdAsync(factory);
+
+        var invoices = new InvoiceRepository(factory, NullLogger<InvoiceRepository>.Instance);
+        var paceSubmissions = new PaceSubmissionRepository(factory, NullLogger<PaceSubmissionRepository>.Instance);
+        var (mailMessageId, mailAttachmentId) = await CreateRecordedPdfAsync(factory);
+
+        var invoice = await invoices.RecordAsync(NewInvoice(mailMessageId, mailAttachmentId, $"INV-{Guid.NewGuid():N}"[..20]), CancellationToken.None);
+        await paceSubmissions.EnqueueExtractedInvoicesAsync(CancellationToken.None);
+
+        var firstClaim = await ClaimUntilInvoiceAsync(paceSubmissions, invoice.InvoiceId!.Value);
+        Assert.NotNull(firstClaim);
+
+        var retrySaved = await paceSubmissions.RetryLaterAsync(new PaceSubmissionRetry
+        {
+            PaceSubmissionId = firstClaim.PaceSubmissionId,
+            ClaimToken = firstClaim.ClaimToken,
+            NextAttemptOn = DateTime.UtcNow.AddSeconds(-1),
+            ResponseJson = "{}",
+            ErrorMessage = "temporary"
+        }, CancellationToken.None);
+
+        Assert.True(retrySaved);
+        await AssertPaceSubmissionStatusAsync(factory, firstClaim.PaceSubmissionId, PaceSubmissionStatus.RetryLaterId, PaceSubmissionStatus.RetryLater);
+
+        var secondClaim = await paceSubmissions.ClaimNextAsync(processingRunId: null, CancellationToken.None);
+        Assert.NotNull(secondClaim);
+        Assert.Equal(firstClaim.PaceSubmissionId, secondClaim.PaceSubmissionId);
+        Assert.Equal(2, secondClaim.AttemptCount);
+        await AssertPaceSubmissionStatusAsync(factory, secondClaim.PaceSubmissionId, PaceSubmissionStatus.InProgressId, PaceSubmissionStatus.InProgress);
+
+        var completed = await paceSubmissions.CompleteAsync(new PaceSubmissionCompletion
+        {
+            PaceSubmissionId = secondClaim.PaceSubmissionId,
+            ClaimToken = secondClaim.ClaimToken,
+            StatusCode = PaceSubmissionStatus.BillCreated,
+            ResponseJson = "{}",
+            PaceBillBatchId = "batch-1",
+            PaceBillId = "bill-1",
+            PaceBillLineId = "line-1"
+        }, CancellationToken.None);
+
+        Assert.True(completed);
+        await AssertPaceSubmissionStatusAsync(factory, secondClaim.PaceSubmissionId, PaceSubmissionStatus.BillCreatedId, PaceSubmissionStatus.BillCreated);
+
+        var staleTokenUpdate = await paceSubmissions.CompleteAsync(new PaceSubmissionCompletion
+        {
+            PaceSubmissionId = secondClaim.PaceSubmissionId,
+            ClaimToken = secondClaim.ClaimToken,
+            StatusCode = PaceSubmissionStatus.Error,
+            ErrorMessage = "stale token"
+        }, CancellationToken.None);
+
+        Assert.False(staleTokenUpdate);
+    }
+
+    [SkippableFact]
+    public async Task PaceSubmission_StaleInProgressClaim_IsReclaimedWithNewToken()
+    {
+        SkipUnlessConfigured();
+
+        var factory = CreateFactory();
+        await SkipUnlessPaceSchemaPublishedAsync(factory);
+        await AssertPaceSubmissionUsesStatusLookupIdAsync(factory);
+
+        var invoices = new InvoiceRepository(factory, NullLogger<InvoiceRepository>.Instance);
+        var paceSubmissions = new PaceSubmissionRepository(factory, NullLogger<PaceSubmissionRepository>.Instance);
+        var (mailMessageId, mailAttachmentId) = await CreateRecordedPdfAsync(factory);
+
+        var invoice = await invoices.RecordAsync(NewInvoice(mailMessageId, mailAttachmentId, $"INV-{Guid.NewGuid():N}"[..20]), CancellationToken.None);
+        await paceSubmissions.EnqueueExtractedInvoicesAsync(CancellationToken.None);
+
+        var firstClaim = await ClaimUntilInvoiceAsync(paceSubmissions, invoice.InvoiceId!.Value);
+        Assert.Equal(1, firstClaim.AttemptCount);
+        await ForcePaceSubmissionClaimStaleAsync(factory, firstClaim.PaceSubmissionId);
+
+        var reclaimed = await ClaimUntilInvoiceAsync(paceSubmissions, invoice.InvoiceId.Value);
+
+        Assert.Equal(firstClaim.PaceSubmissionId, reclaimed.PaceSubmissionId);
+        Assert.Equal(2, reclaimed.AttemptCount);
+        Assert.NotEqual(firstClaim.ClaimToken, reclaimed.ClaimToken);
+        await AssertPaceSubmissionStatusAsync(factory, reclaimed.PaceSubmissionId, PaceSubmissionStatus.InProgressId, PaceSubmissionStatus.InProgress);
+
+        var staleTokenUpdate = await paceSubmissions.CompleteAsync(new PaceSubmissionCompletion
+        {
+            PaceSubmissionId = firstClaim.PaceSubmissionId,
+            ClaimToken = firstClaim.ClaimToken,
+            StatusCode = PaceSubmissionStatus.Error,
+            ErrorMessage = "stale token"
+        }, CancellationToken.None);
+
+        Assert.False(staleTokenUpdate);
+
+        var completed = await paceSubmissions.CompleteAsync(new PaceSubmissionCompletion
+        {
+            PaceSubmissionId = reclaimed.PaceSubmissionId,
+            ClaimToken = reclaimed.ClaimToken,
+            StatusCode = PaceSubmissionStatus.NoPo,
+            ResponseJson = "{}"
+        }, CancellationToken.None);
+
+        Assert.True(completed);
+    }
+
+    [SkippableFact]
+    public async Task PaceInvoiceProcessor_RoutePaceError_SetsMailErrorMovesMessageAndSendsAlert()
+    {
+        SkipUnlessConfigured();
+
+        var factory = CreateFactory();
+        await SkipUnlessPaceSchemaPublishedAsync(factory);
+
+        var (mailMessageId, _) = await CreateRecordedPdfAsync(factory);
+        var graphMessageId = await LoadGraphMessageIdAsync(factory, mailMessageId);
+        var mailSource = new RecordingMailSource();
+        var mailSender = new RecordingMailSender();
+        var processor = new PaceInvoiceProcessor(
+            mailSource,
+            new MailMessageRepository(factory, NullLogger<MailMessageRepository>.Instance),
+            new PaceSubmissionRepository(factory, NullLogger<PaceSubmissionRepository>.Instance),
+            new StubPaceInvoiceService(new PaceInvoiceSubmissionResult { StatusCode = PaceInvoiceOutcomeStatus.Error }),
+            new ErrorNotifier(
+                mailSender,
+                Options.Create(new AlertOptions { Recipients = ["errors@wallacegraphics.com"] }),
+                NullLogger<ErrorNotifier>.Instance),
+            NullLogger<PaceInvoiceProcessor>.Instance);
+        var claim = new PaceSubmissionClaim
+        {
+            PaceSubmissionId = 1,
+            InvoiceId = 42,
+            MailMessageId = mailMessageId,
+            GraphMessageId = graphMessageId,
+            AttemptCount = 1,
+            ClaimToken = Guid.NewGuid(),
+            FieldsJson = "{}",
+            InvoiceNumber = "INV-PACE-ERR",
+            CustomerPO = "PO-PACE-ERR",
+            Total = 123.45m,
+            PaceVendorId = "SANMAR-PACE"
+        };
+        var routeMethod = typeof(PaceInvoiceProcessor).GetMethod("RoutePaceErrorAsync", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+
+        Assert.NotNull(routeMethod);
+        await (Task)routeMethod.Invoke(processor, [claim, "Pace invoice 'INV-PACE-ERR' for PO 'PO-PACE-ERR': no unpaid PO receipts were found.", CancellationToken.None])!;
+
+        var mailStatus = await LoadMailStatusAsync(factory, mailMessageId);
+        Assert.Equal((int)ApStatus.MailError, mailStatus.StatusId);
+        Assert.Contains("no unpaid PO receipts", mailStatus.ErrorMessage);
+        Assert.Equal((graphMessageId, MailDestinationFolder.Errors), mailSource.LastMove);
+        Assert.NotNull(mailSender.LastRequest);
+        Assert.Contains("INV-PACE-ERR", mailSender.LastRequest.Subject);
+        Assert.Contains("PO-PACE-ERR", mailSender.LastRequest.Body);
+        Assert.Equal(["errors@wallacegraphics.com"], mailSender.LastRequest.ToAddresses);
+    }
+
+    [SkippableFact]
+    public async Task PaceInvoiceProcessor_WhenStoredFieldsJsonIsMalformed_RoutesMailErrorMovesMessageAndSendsAlert()
+    {
+        SkipUnlessConfigured();
+
+        var factory = CreateFactory();
+        await SkipUnlessPaceSchemaPublishedAsync(factory);
+
+        var invoices = new InvoiceRepository(factory, NullLogger<InvoiceRepository>.Instance);
+        var paceSubmissions = new PaceSubmissionRepository(factory, NullLogger<PaceSubmissionRepository>.Instance);
+        var (mailMessageId, mailAttachmentId) = await CreateRecordedPdfAsync(factory);
+        var graphMessageId = await LoadGraphMessageIdAsync(factory, mailMessageId);
+        var invoice = await invoices.RecordAsync(NewInvoice(mailMessageId, mailAttachmentId, $"INV-{Guid.NewGuid():N}"[..20]) with
+        {
+            FieldsJson = "{}"
+        }, CancellationToken.None);
+        var mailSource = new RecordingMailSource();
+        var mailSender = new RecordingMailSender();
+        var processor = new PaceInvoiceProcessor(
+            mailSource,
+            new MailMessageRepository(factory, NullLogger<MailMessageRepository>.Instance),
+            paceSubmissions,
+            new StubPaceInvoiceService(new PaceInvoiceSubmissionResult { StatusCode = PaceInvoiceOutcomeStatus.DryRunPrepared }),
+            new ErrorNotifier(
+                mailSender,
+                Options.Create(new AlertOptions { Recipients = ["errors@wallacegraphics.com"] }),
+                NullLogger<ErrorNotifier>.Instance),
+            NullLogger<PaceInvoiceProcessor>.Instance);
+
+        await processor.ProcessPendingAsync(processingRunId: null, CancellationToken.None);
+
+        var claim = await LoadPaceSubmissionByInvoiceAsync(factory, invoice.InvoiceId!.Value);
+        var mailStatus = await LoadMailStatusAsync(factory, mailMessageId);
+        Assert.Equal(PaceSubmissionStatus.Error, claim.StatusCode);
+        Assert.Contains("JSON deserialization", claim.ErrorMessage);
+        Assert.Equal((int)ApStatus.MailError, mailStatus.StatusId);
+        Assert.Contains("stored invoice fields could not be processed", mailStatus.ErrorMessage);
+        Assert.Equal((graphMessageId, MailDestinationFolder.Errors), mailSource.LastMove);
+        Assert.NotNull(mailSender.LastRequest);
+        Assert.Contains("stored invoice fields could not be processed", mailSender.LastRequest.Body);
+        Assert.Equal(["errors@wallacegraphics.com"], mailSender.LastRequest.ToAddresses);
+    }
+
+    private static async Task AssertPaceSubmissionUsesStatusLookupIdAsync(SqlConnectionFactory factory)
+    {
+        await using var connection = await factory.OpenAsync(CancellationToken.None);
+
+        var hasDirectStatusCode = await connection.ExecuteScalarAsync<int>(
+            "SELECT CASE WHEN COL_LENGTH(N'intgr.PaceSubmission', N'StatusCode') IS NULL THEN 0 ELSE 1 END;");
+        Assert.Equal(0, hasDirectStatusCode);
+
+        var hasIdForeignKey = await connection.ExecuteScalarAsync<int>(
+            """
+            SELECT COUNT(*)
+            FROM sys.foreign_keys AS fk
+            INNER JOIN sys.foreign_key_columns AS fkc
+                ON fkc.constraint_object_id = fk.object_id
+            INNER JOIN sys.tables AS parentTable
+                ON parentTable.object_id = fkc.parent_object_id
+            INNER JOIN sys.schemas AS parentSchema
+                ON parentSchema.schema_id = parentTable.schema_id
+            INNER JOIN sys.columns AS parentColumn
+                ON parentColumn.object_id = fkc.parent_object_id
+               AND parentColumn.column_id = fkc.parent_column_id
+            INNER JOIN sys.tables AS referencedTable
+                ON referencedTable.object_id = fkc.referenced_object_id
+            INNER JOIN sys.schemas AS referencedSchema
+                ON referencedSchema.schema_id = referencedTable.schema_id
+            INNER JOIN sys.columns AS referencedColumn
+                ON referencedColumn.object_id = fkc.referenced_object_id
+               AND referencedColumn.column_id = fkc.referenced_column_id
+            WHERE fk.name = N'FK_PaceSubmission_Status'
+              AND parentSchema.name = N'intgr'
+              AND parentTable.name = N'PaceSubmission'
+              AND parentColumn.name = N'StatusCodeId'
+              AND referencedSchema.name = N'intgr'
+              AND referencedTable.name = N'PaceSubmissionStatus'
+              AND referencedColumn.name = N'StatusCodeId';
+            """);
+
+        Assert.Equal(1, hasIdForeignKey);
+
+        var statusIdIsPrimaryKey = await connection.ExecuteScalarAsync<int>(
+            """
+            SELECT COUNT(*)
+            FROM sys.key_constraints AS keyConstraint
+            INNER JOIN sys.index_columns AS indexColumn
+                ON indexColumn.object_id = keyConstraint.parent_object_id
+               AND indexColumn.index_id = keyConstraint.unique_index_id
+            INNER JOIN sys.columns AS columnInfo
+                ON columnInfo.object_id = indexColumn.object_id
+               AND columnInfo.column_id = indexColumn.column_id
+            INNER JOIN sys.tables AS tableInfo
+                ON tableInfo.object_id = keyConstraint.parent_object_id
+            INNER JOIN sys.schemas AS schemaInfo
+                ON schemaInfo.schema_id = tableInfo.schema_id
+            WHERE keyConstraint.[type] = 'PK'
+              AND keyConstraint.[name] = N'PK_PaceSubmissionStatus'
+              AND schemaInfo.[name] = N'intgr'
+              AND tableInfo.[name] = N'PaceSubmissionStatus'
+              AND columnInfo.[name] = N'StatusCodeId';
+            """);
+
+        Assert.Equal(1, statusIdIsPrimaryKey);
+
+        var statusCodeIsUnique = await connection.ExecuteScalarAsync<int>(
+            """
+            SELECT COUNT(*)
+            FROM sys.key_constraints AS keyConstraint
+            INNER JOIN sys.index_columns AS indexColumn
+                ON indexColumn.object_id = keyConstraint.parent_object_id
+               AND indexColumn.index_id = keyConstraint.unique_index_id
+            INNER JOIN sys.columns AS columnInfo
+                ON columnInfo.object_id = indexColumn.object_id
+               AND columnInfo.column_id = indexColumn.column_id
+            INNER JOIN sys.tables AS tableInfo
+                ON tableInfo.object_id = keyConstraint.parent_object_id
+            INNER JOIN sys.schemas AS schemaInfo
+                ON schemaInfo.schema_id = tableInfo.schema_id
+            WHERE keyConstraint.[type] = 'UQ'
+              AND keyConstraint.[name] = N'UQ_PaceSubmissionStatus_StatusCode'
+              AND schemaInfo.[name] = N'intgr'
+              AND tableInfo.[name] = N'PaceSubmissionStatus'
+              AND columnInfo.[name] = N'StatusCode';
+            """);
+
+        Assert.Equal(1, statusCodeIsUnique);
+    }
+
+    private static async Task AssertPaceSubmissionStatusAsync(SqlConnectionFactory factory, long paceSubmissionId, int expectedStatusId, string expectedStatusCode)
+    {
+        await using var connection = await factory.OpenAsync(CancellationToken.None);
+
+        var status = await connection.QuerySingleAsync<(int StatusCodeId, string StatusCode)>(
+            """
+            SELECT submission.[StatusCodeId], status.[StatusCode]
+            FROM [intgr].[PaceSubmission] AS submission
+            INNER JOIN [intgr].[PaceSubmissionStatus] AS status
+                ON status.[StatusCodeId] = submission.[StatusCodeId]
+            WHERE submission.[PaceSubmissionId] = @PaceSubmissionId;
+            """,
+            new { PaceSubmissionId = paceSubmissionId });
+
+        Assert.Equal(expectedStatusId, status.StatusCodeId);
+        Assert.Equal(expectedStatusCode, status.StatusCode);
+    }
+
+    private static async Task ForcePaceSubmissionClaimStaleAsync(SqlConnectionFactory factory, long paceSubmissionId)
+    {
+        await using var connection = await factory.OpenAsync(CancellationToken.None);
+
+        await connection.ExecuteAsync(
+            """
+            UPDATE [intgr].[PaceSubmission]
+               SET [ClaimedOn] = DATEADD(MINUTE, -90, SYSUTCDATETIME()),
+                   [ModifiedOn] = SYSUTCDATETIME()
+             WHERE [PaceSubmissionId] = @PaceSubmissionId;
+            """,
+            new { PaceSubmissionId = paceSubmissionId });
+    }
+
+    private static async Task<string> LoadGraphMessageIdAsync(SqlConnectionFactory factory, long mailMessageId)
+    {
+        await using var connection = await factory.OpenAsync(CancellationToken.None);
+
+        return await connection.QuerySingleAsync<string>(
+            "SELECT [GraphMessageId] FROM [dbo].[MailMessage] WHERE [MailMessageId] = @MailMessageId;",
+            new { MailMessageId = mailMessageId });
+    }
+
+    private static async Task<(int StatusId, string? ErrorMessage)> LoadMailStatusAsync(SqlConnectionFactory factory, long mailMessageId)
+    {
+        await using var connection = await factory.OpenAsync(CancellationToken.None);
+
+        return await connection.QuerySingleAsync<(int StatusId, string? ErrorMessage)>(
+            "SELECT [StatusId], [ErrorMessage] FROM [dbo].[MailMessage] WHERE [MailMessageId] = @MailMessageId;",
+            new { MailMessageId = mailMessageId });
+    }
+
+    private static async Task<(string StatusCode, string? ErrorMessage)> LoadPaceSubmissionByInvoiceAsync(SqlConnectionFactory factory, long invoiceId)
+    {
+        await using var connection = await factory.OpenAsync(CancellationToken.None);
+
+        return await connection.QuerySingleAsync<(string StatusCode, string? ErrorMessage)>(
+            """
+            SELECT status.[StatusCode], submission.[ErrorMessage]
+            FROM [intgr].[PaceSubmission] AS submission
+            INNER JOIN [intgr].[PaceSubmissionStatus] AS status
+                ON status.[StatusCodeId] = submission.[StatusCodeId]
+            WHERE submission.[InvoiceId] = @InvoiceId;
+            """,
+            new { InvoiceId = invoiceId });
+    }
+
+    private static async Task<PaceSubmissionClaim> ClaimUntilInvoiceAsync(PaceSubmissionRepository repository, long invoiceId, long? processingRunId = null)
+    {
+        for (var i = 0; i < 100; i++)
+        {
+            var claim = await repository.ClaimNextAsync(processingRunId, CancellationToken.None);
+
+            Assert.NotNull(claim);
+
+            if (claim.InvoiceId == invoiceId)
+            {
+                return claim;
+            }
+
+            await repository.CompleteAsync(new PaceSubmissionCompletion
+            {
+                PaceSubmissionId = claim.PaceSubmissionId,
+                ClaimToken = claim.ClaimToken,
+                StatusCode = PaceSubmissionStatus.Error,
+                ErrorMessage = "Completed by Pace SQL repository test while skipping unrelated scratch-database work item."
+            }, CancellationToken.None);
+        }
+
+        throw new InvalidOperationException($"Pace submission for invoice {invoiceId} was not claimed within the test limit.");
+    }
+
+    private static async Task<long?> LoadPaceSubmissionProcessingRunIdAsync(SqlConnectionFactory factory, long paceSubmissionId)
+    {
+        await using var connection = await factory.OpenAsync(CancellationToken.None);
+
+        return await connection.QuerySingleAsync<long?>(
+            "SELECT [ProcessingRunId] FROM [intgr].[PaceSubmission] WHERE [PaceSubmissionId] = @PaceSubmissionId;",
+            new { PaceSubmissionId = paceSubmissionId });
+    }
+
+    private static async Task<(long MailMessageId, long MailAttachmentId)> CreateRecordedPdfAsync(SqlConnectionFactory factory)
+    {
+        var runs = new ProcessingRunRepository(factory, NullLogger<ProcessingRunRepository>.Instance);
+        var messages = new MailMessageRepository(factory, NullLogger<MailMessageRepository>.Instance);
+        var attachments = new MailAttachmentRepository(factory, NullLogger<MailAttachmentRepository>.Instance);
+
+        var mailbox = new MailboxRef(Guid.NewGuid(), "sql-test@wallacegraphics.com");
+        var runId = await runs.StartAsync(mailbox, CancellationToken.None);
+        var summary = new MailAttachmentSummary($"att-{Guid.NewGuid():N}", "invoice.pdf", 1024, "application/pdf");
+        var message = new MailMessageSummary($"immutable-{Guid.NewGuid():N}", DateTimeOffset.UtcNow, "billing@sanmar.com", "Invoice", [summary]);
+        var claim = await messages.DiscoverAndClaimAsync(mailbox, runId, message, CancellationToken.None);
+        var recorded = await attachments.RecordAsync(claim.MailMessageId, [summary], CancellationToken.None);
+
+        return (claim.MailMessageId, recorded[0].MailAttachmentId);
+    }
+
     private static InvoiceRecord NewInvoice(long mailMessageId, long mailAttachmentId, string invoiceNumber) =>
         new()
         {
@@ -450,7 +905,60 @@ public class SqlRepositoryTests
             Total = 1234.56m,
             CustomerPO = "PO-1",
             ClientNameAsRead = "SanMar",
+            FieldsJson = """
+            {
+              "InvoiceNumber": "INV-TEST",
+              "SalesOrder": "SO-TEST",
+              "InvoiceDate": "2026-09-01",
+              "DueDate": "2026-11-01",
+              "Total": 1234.56,
+              "ClientName": "SanMar",
+              "CustomerPO": "PO-1",
+              "CustomerNumber": "76274-0000",
+              "OrderAccount": "76274-0000",
+              "Terms": "Net60"
+            }
+            """,
             ExtractionMethod = "Regex",
             Status = ApStatus.InvoiceExtracted
         };
+
+    private sealed class RecordingMailSource : IMailSource
+    {
+        public (string MessageId, MailDestinationFolder Destination)? LastMove { get; private set; }
+
+        public Task ValidateAuthAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task EnsureFoldersExistAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public IAsyncEnumerable<MailMessageSummary> EnumerateInboxAsync(CancellationToken cancellationToken = default) => AsyncEnumerable.Empty<MailMessageSummary>();
+
+        public Task<MailboxDeltaResult> GetInboxDeltaAsync(string? deltaLink, CancellationToken cancellationToken) => throw new NotImplementedException();
+
+        public Task<MailMessageSummary?> GetMessageAsync(string messageId, CancellationToken cancellationToken) => Task.FromResult<MailMessageSummary?>(null);
+
+        public Task<byte[]> GetAttachmentContentAsync(string messageId, string attachmentId, CancellationToken cancellationToken) => Task.FromResult(Array.Empty<byte>());
+
+        public Task<string> MoveMessageAsync(string messageId, MailDestinationFolder destination, CancellationToken cancellationToken)
+        {
+            LastMove = (messageId, destination);
+            return Task.FromResult(messageId);
+        }
+    }
+
+    private sealed class RecordingMailSender : IMailSender
+    {
+        public MailSendRequest? LastRequest { get; private set; }
+
+        public Task SendMailAsync(MailSendRequest request, CancellationToken cancellationToken)
+        {
+            LastRequest = request;
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class StubPaceInvoiceService(PaceInvoiceSubmissionResult result) : IPaceInvoiceService
+    {
+        public Task<PaceInvoiceSubmissionResult> SubmitAsync(PaceInvoiceSubmission submission, CancellationToken cancellationToken) => Task.FromResult(result);
+    }
 }

@@ -38,9 +38,29 @@ never be able to destroy invoice history: `DropObjectsNotInSource=False` (a stal
 a live table), `BlockOnPossibleDataLoss=True`, and `GenerateSmartDefaults=False` (a new `NOT NULL`
 column ships with an explicit default or not at all).
 
+The Pace submission status normalization is the only approved exception to that normal production
+path. It backfills `intgr.PaceSubmission.StatusCodeId` in `Scripts/PreDeployment.sql`, then lets the
+dacpac remove the legacy status column(s). Because DacFx checks for possible data loss before it can
+know that the pre-deployment backfill makes this cleanup intentional, that deployment must use the
+explicit one-time profile:
+
+```
+sqlpackage /Action:Script /SourceFile:WG.AP.Database/bin/Debug/WG.AP.Database.dacpac ^
+           /Profile:WG.AP.Database/WG.AP.Database.Prod.PaceStatusNormalization.publish.xml ^
+           /TargetConnectionString:"Data Source=<server>;Initial Catalog=WG_AP;Integrated Security=True;Encrypt=True;TrustServerCertificate=True"
+
+sqlpackage /Action:Publish /SourceFile:WG.AP.Database/bin/Debug/WG.AP.Database.dacpac ^
+           /Profile:WG.AP.Database/WG.AP.Database.Prod.PaceStatusNormalization.publish.xml ^
+           /TargetConnectionString:"Data Source=<server>;Initial Catalog=WG_AP;Integrated Security=True;Encrypt=True;TrustServerCertificate=True"
+```
+
+Generate and review the script first. Use this profile only for that reviewed migration, then return
+to `WG.AP.Database.Prod.publish.xml` for all later production publishes.
+
 ## The tables
 
-Two schemas: `lkup` for lookups, `dbo` for everything else.
+Three schemas: `lkup` for shared lookups, `dbo` for the AP processing ledger, and `intgr` for
+integration-owned work queues.
 
 | Table | One row per | Notes |
 |---|---|---|
@@ -54,6 +74,8 @@ Two schemas: `lkup` for lookups, `dbo` for everything else.
 | `dbo.ExtractionPrompt` | prompt version | The Ollama prompt, as versioned data |
 | `dbo.ProcessingRun` | process execution | `IsSuccessful IS NULL` = it crashed |
 | `dbo.ApplicationLog` | log event | No foreign keys, deliberately |
+| `intgr.PaceSubmission` | invoice queued for Pace | Outbox row with claim token, retry state, Pace ids and run correlation |
+| `intgr.PaceSubmissionStatus` | Pace outbox status | Normalized queue states such as `Pending`, `RetryLater`, `Error`, `AlreadyEntered` |
 
 Plus one function, `dbo.NormalizeInvoiceNumber`, which is the single definition of "are these two
 invoice numbers the same invoice".
@@ -208,6 +230,28 @@ three today (`BeginScope` returns `null`). Adding them is a code change first.
 Retention is **1 year**. Note the file log is configured at **60 days**, so the two differ
 deliberately rather than by accident.
 
+## Pace outbox
+
+`intgr.PaceSubmission` is the Pace integration outbox. `PaceInvoiceProcessor` enqueues each extracted
+invoice once, claims pending/retryable rows with a `ClaimToken`, and writes the terminal or retry result
+back to the same row. That makes the Pace stage restartable without relying on memory or on Pace having
+an idempotency key.
+
+`ProcessingRunId` correlates the Pace claim to the mailbox execution that queued or processed it.
+`AttemptCount`, `NextAttemptOn`, `ClaimedOn` and `ClaimToken` support exponential backoff and safe stale
+claim recovery: a crashed `InProgress` row becomes claimable again after the repository lease window,
+while stale claim-token updates are ignored.
+
+`intgr.PaceSubmissionStatus` is a lookup table rather than a text column on the outbox row. The
+normalization keeps deployed status ids stable and lets the code store `StatusCodeId` while still
+reporting readable status names in queries.
+
+Dry run is controlled by application configuration, not by SQL: `Pace:WriteEnabled=false` validates and
+prepares Pace bill payloads without writing bills, while `Pace:WriteEnabled=true` allows the write path.
+Rows that reach `DryRunPrepared` are final audit rows by default. After reviewing those rows and before
+the first real write run, use `Scripts/Operations/RequeuePaceDryRunPrepared.sql` against the target
+database to promote only approved dry-run rows back to `Pending`.
+
 ## Client requirements
 
 `dbo.MailMessage` and `dbo.Invoice` carry indexes on persisted computed columns, so SQL Server refuses
@@ -291,9 +335,6 @@ enforced by the database, not by C# — "a message is never claimed twice" is a 
   is the honest gap in duplicate coverage. Adding it needs a deliberate deployment step, because
   **`$select` is baked into the returned `deltaLink`** — the column stays NULL until a one-time full
   resync.
-- **No Pace outbox.** Deferred to the Pace ticket. One note for whoever picks it up: `createBill` is
-  not idempotent and Pace offers no idempotency key, so the outbox row's GUID must be minted and
-  committed *before* the first HTTP call and stamped into `Bill.Reference`, so a crash can be recovered
   by probing rather than guessing. `dbo.Client.PaceVendorId` is the seam.
 - **No status history**, so "how long was this in NeedsReview" is not answerable. A message sees at
   most two transitions today and `ApplicationLog` carries the trail.

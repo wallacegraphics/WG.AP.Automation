@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  One-time production migration profile for Pace submission status normalization.
+
+  Use this profile only for the reviewed migration that backfills intgr.PaceSubmission.StatusCodeId
+  in Scripts\PreDeployment.sql and then lets the dacpac remove the legacy Pace status columns.
+
+  The normal production profile intentionally keeps BlockOnPossibleDataLoss=True. This profile keeps
+  the other production protections but disables that one guard because the column removal is the
+  approved outcome of this specific migration after the pre-deployment backfill has succeeded.
+
+  Generate and review the deployment script before publishing. Return to
+  WG.AP.Database.Prod.publish.xml for every later production publish.
+-->
+<Project ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+	<TargetDatabaseName>WG_AP</TargetDatabaseName>
+	<TargetConnectionString>Data Source=SET-ME;Initial Catalog=WG_AP;Integrated Security=True;Encrypt=True;TrustServerCertificate=True</TargetConnectionString>
+	<ProfileVersionNumber>1</ProfileVersionNumber>
+	<DeployScriptFileName>WG.AP.Database.Prod.PaceStatusNormalization.sql</DeployScriptFileName>
+
+	<ScriptDatabaseOptions>True</ScriptDatabaseOptions>
+	<BlockOnPossibleDataLoss>False</BlockOnPossibleDataLoss>
+	<DropObjectsNotInSource>False</DropObjectsNotInSource>
+	<DropPermissionsNotInSource>False</DropPermissionsNotInSource>
+	<DropRoleMembersNotInSource>False</DropRoleMembersNotInSource>
+	<GenerateSmartDefaults>False</GenerateSmartDefaults>
+	<!-- Note for anyone tempted to add ExcludeObjectTypes or DoNotDropObjectTypes here: sqlpackage
+		 170.5.76 silently ignores collection-valued properties supplied by a publish profile (all
+		 of the semicolon, <string>-list and ItemGroup forms were tested). They work only as /p: on
+		 the command line. DropObjectsNotInSource=False above is what actually protects security
+		 principals in this environment. -->
+	<IgnorePermissions>True</IgnorePermissions>
+	<IgnoreUserSettingsObjects>True</IgnoreUserSettingsObjects>
+	<IgnoreLoginSids>True</IgnoreLoginSids>
+	<VerifyDeployment>True</VerifyDeployment>
+	<IncludeCompositeObjects>True</IncludeCompositeObjects>
+	<AllowIncompatiblePlatform>False</AllowIncompatiblePlatform>
+	<CreateNewDatabase>False</CreateNewDatabase>
+  </PropertyGroup>
+</Project>

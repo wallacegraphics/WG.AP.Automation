@@ -8,6 +8,7 @@ using Microsoft.Graph;
 using WG.AP.Core.Abstractions;
 using WG.AP.DataAccess;
 using WG.AP.Email;
+using WG.AP.Integrations.Pace;
 using WG.AP.Invoice.Abstractions;
 using WG.AP.Invoice.AI;
 using WG.AP.Processor;
@@ -125,6 +126,7 @@ builder.Services.AddSingleton<InvoiceRepository>();
 builder.Services.AddSingleton<ClientRepository>();
 builder.Services.AddSingleton<ExtractionPromptRepository>();
 builder.Services.AddSingleton<ApplicationLogRepository>();
+builder.Services.AddSingleton<PaceSubmissionRepository>();
 builder.Services.AddSingleton<AttachmentFileStore>();
 
 // Both stores are registered concretely so the dual store can hold each. The database is
@@ -147,6 +149,9 @@ builder.Services.AddSingleton<IInvoiceFieldExtractor, PdfInvoiceFieldExtractor>(
 
 builder.Services.AddSingleton<ErrorNotifier>();
 builder.Services.AddSingleton<APProcessor>();
+builder.Services.AddSingleton<PaceInvoiceProcessor>();
+
+builder.Services.AddPaceIntegration(builder.Configuration);
 
 builder.Logging.ClearProviders();
 builder.Logging.AddConsole();
@@ -202,7 +207,10 @@ try
     }
 
     var apProcessor = host.Services.GetRequiredService<APProcessor>();
-    await apProcessor.ProcessInvoicesAsync(CancellationToken.None);
+    var processingRunId = await apProcessor.ProcessInvoicesAsync(CancellationToken.None);
+
+    var paceInvoiceProcessor = host.Services.GetRequiredService<PaceInvoiceProcessor>();
+    await paceInvoiceProcessor.ProcessPendingAsync(processingRunId, CancellationToken.None);
 }
 catch (Exception exception)
 {
