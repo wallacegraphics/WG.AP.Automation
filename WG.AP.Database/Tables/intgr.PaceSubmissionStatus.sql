@@ -15,6 +15,6 @@ CREATE TABLE [intgr].[PaceSubmissionStatus]
 	[ModifiedBy]             NVARCHAR(128) NULL,
 	[ModifiedOn]             DATETIME2(3)  NULL,
 
-	CONSTRAINT [PK_PaceSubmissionStatus] PRIMARY KEY CLUSTERED ([StatusCode]),
-	CONSTRAINT [UQ_PaceSubmissionStatus_StatusCodeId] UNIQUE ([StatusCodeId])
+	CONSTRAINT [PK_PaceSubmissionStatus] PRIMARY KEY CLUSTERED ([StatusCodeId]),
+	CONSTRAINT [UQ_PaceSubmissionStatus_StatusCode] UNIQUE ([StatusCode])
 );

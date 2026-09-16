@@ -58,6 +58,7 @@ public sealed class PaceInvoiceProcessor(
             var result = await paceInvoiceService.SubmitAsync(new PaceInvoiceSubmission
             {
                 InvoiceId = claim.InvoiceId,
+                PaceVendorId = claim.PaceVendorId,
                 Fields = fields
             }, cancellationToken);
 
@@ -99,7 +100,7 @@ public sealed class PaceInvoiceProcessor(
                 logger.LogWarning("Pace submission {PaceSubmissionId} completion skipped because its claim token no longer matched.", claim.PaceSubmissionId);
             }
         }
-        catch (Exception exception) when (exception is JsonException or InvalidOperationException)
+        catch (Exception exception) when (exception is JsonException or InvalidOperationException or FormatException or OverflowException or KeyNotFoundException or ArgumentException)
         {
             var savedCompletion = await paceSubmissionRepository.CompleteAsync(new PaceSubmissionCompletion
             {

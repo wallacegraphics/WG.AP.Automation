@@ -466,7 +466,7 @@ public class SqlRepositoryTests
         await AssertPaceSubmissionUsesStatusLookupIdAsync(factory);
 
         var invoices = new InvoiceRepository(factory, NullLogger<InvoiceRepository>.Instance);
-        var paceSubmissions = new PaceSubmissionRepository(factory);
+        var paceSubmissions = new PaceSubmissionRepository(factory, NullLogger<PaceSubmissionRepository>.Instance);
         var (mailMessageId, mailAttachmentId) = await CreateRecordedPdfAsync(factory);
 
         var invoice = await invoices.RecordAsync(NewInvoice(mailMessageId, mailAttachmentId, $"INV-{Guid.NewGuid():N}"[..20]), CancellationToken.None);
@@ -493,7 +493,7 @@ public class SqlRepositoryTests
         await AssertPaceSubmissionUsesStatusLookupIdAsync(factory);
 
         var invoices = new InvoiceRepository(factory, NullLogger<InvoiceRepository>.Instance);
-        var paceSubmissions = new PaceSubmissionRepository(factory);
+        var paceSubmissions = new PaceSubmissionRepository(factory, NullLogger<PaceSubmissionRepository>.Instance);
         var (mailMessageId, mailAttachmentId) = await CreateRecordedPdfAsync(factory);
 
         var invoice = await invoices.RecordAsync(NewInvoice(mailMessageId, mailAttachmentId, $"INV-{Guid.NewGuid():N}"[..20]), CancellationToken.None);
@@ -547,6 +547,54 @@ public class SqlRepositoryTests
         Assert.False(staleTokenUpdate);
     }
 
+    [SkippableFact]
+    public async Task PaceSubmission_StaleInProgressClaim_IsReclaimedWithNewToken()
+    {
+        SkipUnlessConfigured();
+
+        var factory = CreateFactory();
+        await SkipUnlessPaceSchemaPublishedAsync(factory);
+        await AssertPaceSubmissionUsesStatusLookupIdAsync(factory);
+
+        var invoices = new InvoiceRepository(factory, NullLogger<InvoiceRepository>.Instance);
+        var paceSubmissions = new PaceSubmissionRepository(factory, NullLogger<PaceSubmissionRepository>.Instance);
+        var (mailMessageId, mailAttachmentId) = await CreateRecordedPdfAsync(factory);
+
+        var invoice = await invoices.RecordAsync(NewInvoice(mailMessageId, mailAttachmentId, $"INV-{Guid.NewGuid():N}"[..20]), CancellationToken.None);
+        await paceSubmissions.EnqueueExtractedInvoicesAsync(CancellationToken.None);
+
+        var firstClaim = await ClaimUntilInvoiceAsync(paceSubmissions, invoice.InvoiceId!.Value);
+        Assert.Equal(1, firstClaim.AttemptCount);
+        await ForcePaceSubmissionClaimStaleAsync(factory, firstClaim.PaceSubmissionId);
+
+        var reclaimed = await ClaimUntilInvoiceAsync(paceSubmissions, invoice.InvoiceId.Value);
+
+        Assert.Equal(firstClaim.PaceSubmissionId, reclaimed.PaceSubmissionId);
+        Assert.Equal(2, reclaimed.AttemptCount);
+        Assert.NotEqual(firstClaim.ClaimToken, reclaimed.ClaimToken);
+        await AssertPaceSubmissionStatusAsync(factory, reclaimed.PaceSubmissionId, PaceSubmissionStatus.InProgressId, PaceSubmissionStatus.InProgress);
+
+        var staleTokenUpdate = await paceSubmissions.CompleteAsync(new PaceSubmissionCompletion
+        {
+            PaceSubmissionId = firstClaim.PaceSubmissionId,
+            ClaimToken = firstClaim.ClaimToken,
+            StatusCode = PaceSubmissionStatus.Error,
+            ErrorMessage = "stale token"
+        }, CancellationToken.None);
+
+        Assert.False(staleTokenUpdate);
+
+        var completed = await paceSubmissions.CompleteAsync(new PaceSubmissionCompletion
+        {
+            PaceSubmissionId = reclaimed.PaceSubmissionId,
+            ClaimToken = reclaimed.ClaimToken,
+            StatusCode = PaceSubmissionStatus.NoPo,
+            ResponseJson = "{}"
+        }, CancellationToken.None);
+
+        Assert.True(completed);
+    }
+
     private static async Task AssertPaceSubmissionUsesStatusLookupIdAsync(SqlConnectionFactory factory)
     {
         await using var connection = await factory.OpenAsync(CancellationToken.None);
@@ -585,6 +633,52 @@ public class SqlRepositoryTests
             """);
 
         Assert.Equal(1, hasIdForeignKey);
+
+        var statusIdIsPrimaryKey = await connection.ExecuteScalarAsync<int>(
+            """
+            SELECT COUNT(*)
+            FROM sys.key_constraints AS keyConstraint
+            INNER JOIN sys.index_columns AS indexColumn
+                ON indexColumn.object_id = keyConstraint.parent_object_id
+               AND indexColumn.index_id = keyConstraint.unique_index_id
+            INNER JOIN sys.columns AS columnInfo
+                ON columnInfo.object_id = indexColumn.object_id
+               AND columnInfo.column_id = indexColumn.column_id
+            INNER JOIN sys.tables AS tableInfo
+                ON tableInfo.object_id = keyConstraint.parent_object_id
+            INNER JOIN sys.schemas AS schemaInfo
+                ON schemaInfo.schema_id = tableInfo.schema_id
+            WHERE keyConstraint.[type] = 'PK'
+              AND keyConstraint.[name] = N'PK_PaceSubmissionStatus'
+              AND schemaInfo.[name] = N'intgr'
+              AND tableInfo.[name] = N'PaceSubmissionStatus'
+              AND columnInfo.[name] = N'StatusCodeId';
+            """);
+
+        Assert.Equal(1, statusIdIsPrimaryKey);
+
+        var statusCodeIsUnique = await connection.ExecuteScalarAsync<int>(
+            """
+            SELECT COUNT(*)
+            FROM sys.key_constraints AS keyConstraint
+            INNER JOIN sys.index_columns AS indexColumn
+                ON indexColumn.object_id = keyConstraint.parent_object_id
+               AND indexColumn.index_id = keyConstraint.unique_index_id
+            INNER JOIN sys.columns AS columnInfo
+                ON columnInfo.object_id = indexColumn.object_id
+               AND columnInfo.column_id = indexColumn.column_id
+            INNER JOIN sys.tables AS tableInfo
+                ON tableInfo.object_id = keyConstraint.parent_object_id
+            INNER JOIN sys.schemas AS schemaInfo
+                ON schemaInfo.schema_id = tableInfo.schema_id
+            WHERE keyConstraint.[type] = 'UQ'
+              AND keyConstraint.[name] = N'UQ_PaceSubmissionStatus_StatusCode'
+              AND schemaInfo.[name] = N'intgr'
+              AND tableInfo.[name] = N'PaceSubmissionStatus'
+              AND columnInfo.[name] = N'StatusCode';
+            """);
+
+        Assert.Equal(1, statusCodeIsUnique);
     }
 
     private static async Task AssertPaceSubmissionStatusAsync(SqlConnectionFactory factory, long paceSubmissionId, int expectedStatusId, string expectedStatusCode)
@@ -603,6 +697,20 @@ public class SqlRepositoryTests
 
         Assert.Equal(expectedStatusId, status.StatusCodeId);
         Assert.Equal(expectedStatusCode, status.StatusCode);
+    }
+
+    private static async Task ForcePaceSubmissionClaimStaleAsync(SqlConnectionFactory factory, long paceSubmissionId)
+    {
+        await using var connection = await factory.OpenAsync(CancellationToken.None);
+
+        await connection.ExecuteAsync(
+            """
+            UPDATE [intgr].[PaceSubmission]
+               SET [ClaimedOn] = DATEADD(MINUTE, -90, SYSUTCDATETIME()),
+                   [ModifiedOn] = SYSUTCDATETIME()
+             WHERE [PaceSubmissionId] = @PaceSubmissionId;
+            """,
+            new { PaceSubmissionId = paceSubmissionId });
     }
 
     private static async Task<PaceSubmissionClaim> ClaimUntilInvoiceAsync(PaceSubmissionRepository repository, long invoiceId)

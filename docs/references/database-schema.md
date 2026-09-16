@@ -38,6 +38,25 @@ never be able to destroy invoice history: `DropObjectsNotInSource=False` (a stal
 a live table), `BlockOnPossibleDataLoss=True`, and `GenerateSmartDefaults=False` (a new `NOT NULL`
 column ships with an explicit default or not at all).
 
+The Pace submission status normalization is the only approved exception to that normal production
+path. It backfills `intgr.PaceSubmission.StatusCodeId` in `Scripts/PreDeployment.sql`, then lets the
+dacpac remove the legacy status column(s). Because DacFx checks for possible data loss before it can
+know that the pre-deployment backfill makes this cleanup intentional, that deployment must use the
+explicit one-time profile:
+
+```
+sqlpackage /Action:Script /SourceFile:WG.AP.Database/bin/Debug/WG.AP.Database.dacpac ^
+           /Profile:WG.AP.Database/WG.AP.Database.Prod.PaceStatusNormalization.publish.xml ^
+           /TargetConnectionString:"Data Source=<server>;Initial Catalog=WG_AP;Integrated Security=True;Encrypt=True;TrustServerCertificate=True"
+
+sqlpackage /Action:Publish /SourceFile:WG.AP.Database/bin/Debug/WG.AP.Database.dacpac ^
+           /Profile:WG.AP.Database/WG.AP.Database.Prod.PaceStatusNormalization.publish.xml ^
+           /TargetConnectionString:"Data Source=<server>;Initial Catalog=WG_AP;Integrated Security=True;Encrypt=True;TrustServerCertificate=True"
+```
+
+Generate and review the script first. Use this profile only for that reviewed migration, then return
+to `WG.AP.Database.Prod.publish.xml` for all later production publishes.
+
 ## The tables
 
 Two schemas: `lkup` for lookups, `dbo` for everything else.

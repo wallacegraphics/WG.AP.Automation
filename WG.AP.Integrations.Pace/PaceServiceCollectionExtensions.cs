@@ -15,7 +15,7 @@ public static class PaceServiceCollectionExtensions
         services
             .AddOptions<PaceOptions>()
             .Bind(configuration.GetSection(PaceOptions.SectionName))
-            .Validate(options => Uri.TryCreate(options.BaseUrl, UriKind.Absolute, out _), $"{PaceOptions.SectionName}:BaseUrl must be an absolute URL.")
+            .Validate(options => Uri.TryCreate(options.BaseUrl, UriKind.Absolute, out var uri) && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps), $"{PaceOptions.SectionName}:BaseUrl must be an absolute HTTP(S) URL.")
             .Validate(options => !string.IsNullOrWhiteSpace(options.UserName), $"{PaceOptions.SectionName}:UserName is required.")
             .Validate(options => !string.IsNullOrWhiteSpace(options.Password), $"{PaceOptions.SectionName}:Password is required.")
             .Validate(options => options.TimeoutSeconds > 0, $"{PaceOptions.SectionName}:TimeoutSeconds must be greater than 0.")

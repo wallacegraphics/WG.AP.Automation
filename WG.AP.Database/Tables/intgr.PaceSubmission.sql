@@ -45,10 +45,16 @@ CREATE TABLE [intgr].[PaceSubmission]
 );
 GO
 
-CREATE NONCLUSTERED INDEX [IX_PaceSubmission_WorkQueue]
+CREATE NONCLUSTERED INDEX [IX_PaceSubmission_WorkQueue_Pending]
 	ON [intgr].[PaceSubmission] ([StatusCodeId], [NextAttemptOn], [CreatedOn])
 	INCLUDE ([InvoiceId], [AttemptCount])
-	WHERE [StatusCodeId] IN (7, 9);
+	WHERE [StatusCodeId] = 7;
+GO
+
+CREATE NONCLUSTERED INDEX [IX_PaceSubmission_WorkQueue_RetryLater]
+	ON [intgr].[PaceSubmission] ([StatusCodeId], [NextAttemptOn], [CreatedOn])
+	INCLUDE ([InvoiceId], [AttemptCount])
+	WHERE [StatusCodeId] = 9;
 GO
 
 CREATE UNIQUE NONCLUSTERED INDEX [UX_PaceSubmission_ClaimToken]

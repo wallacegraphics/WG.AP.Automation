@@ -98,4 +98,7 @@
     <Folder Include="Scripts\Seed\" />
     <Folder Include="Tests\" />
   </ItemGroup>
+  <ItemGroup>
+    <None Include="WG.AP.Database.Prod.PaceStatusNormalization.publish.xml" />
+  </ItemGroup>
 </Project>

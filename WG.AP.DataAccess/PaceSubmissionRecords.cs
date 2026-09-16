@@ -66,6 +66,7 @@ public sealed record PaceSubmissionClaim
     public required string? InvoiceNumber { get; init; }
     public required string? CustomerPO { get; init; }
     public required decimal? Total { get; init; }
+    public required string? PaceVendorId { get; init; }
     public string? PaceBillBatchId { get; init; }
     public string? PaceBillId { get; init; }
     public string? PaceBillLineId { get; init; }

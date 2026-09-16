@@ -3,6 +3,7 @@ namespace WG.AP.Integrations.Pace;
 public sealed record PaceInvoiceSubmission
 {
     public required long InvoiceId { get; init; }
+    public string? PaceVendorId { get; init; }
 
     public required PaceInvoiceFields Fields { get; init; }
 }
