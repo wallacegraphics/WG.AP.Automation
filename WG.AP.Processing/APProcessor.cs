@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Globalization;
 using System.Net;
+using System.Security.Cryptography;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using WG.AP.Core.Abstractions;
@@ -495,28 +496,63 @@ public sealed class APProcessor(
         ExtractionRequest request,
         CancellationToken cancellationToken)
     {
-        // Not wrapped in a try: a failure here is either Graph being unreachable or the attachment
-        // exceeding MaxAttachmentSizeBytes, and neither is a verdict this method can reach about the
-        // invoice. Letting it propagate leaves nothing committed and the batch re-delivered next run,
-        // which is the correct outcome for both.
-        var pdfBytes = await mailSource.GetAttachmentContentAsync(message.Id, pdf.Attachment.Id, cancellationToken);
+        byte[] pdfBytes;
+        string storedPath;
+        byte[] sha256;
+        DuplicateAttachmentMatch? duplicate;
         ExtractionResult extraction;
 
-        // File first, then the row. CK_MailAttachment_Stored requires the path and hash together, and
-        // an orphan file is harmless whereas a row pointing at nothing is not.
-        var (storedPath, sha256) = await attachmentFileStore.SaveAsync(
-            pdf.MailAttachmentId,
-            pdf.Attachment.Name,
-            message.ReceivedDateTime ?? DateTimeOffset.UtcNow,
-            pdfBytes,
-            cancellationToken);
+        if (pdf.StoredPath is not null && pdf.ContentSha256 is not null)
+        {
+            // A prior attempt on this message already fetched, wrote and recorded this exact
+            // attachment before failing on a later PDF in the same foreach (below) or on the message
+            // finalization that follows it. Graph redelivers the whole message on the next run because
+            // the delta link only commits after every message in the batch succeeds; re-fetching from
+            // Graph and re-writing this file would just repeat work an earlier attempt already
+            // finished, and re-log it as a duplicate a second time for no reason.
+            try
+            {
+                pdfBytes = await attachmentFileStore.LoadAsync(pdf.StoredPath, cancellationToken);
+                storedPath = pdf.StoredPath;
+                sha256 = pdf.ContentSha256;
+                duplicate = await mailAttachmentRepository.FindDuplicateByHashAsync(pdf.MailAttachmentId, sha256, cancellationToken);
+            }
+            catch (Exception exception) when (exception is FileNotFoundException or DirectoryNotFoundException)
+            {
+                // The row says it was stored, but the file is actually gone (manual deletion, a
+                // retention sweep, a moved share). Treat this the same as never-stored rather than let
+                // a read failure permanently block the invoice: re-fetch from Graph and re-write, same
+                // as first sight of the attachment.
+                logger.LogWarning(
+                    exception,
+                    "Message {MessageId}: attachment '{FileName}' is recorded as stored at {StoredPath} but the file " +
+                    "is missing; re-fetching from Graph.",
+                    message.Id, pdf.Attachment.Name, pdf.StoredPath);
 
-        await mailAttachmentRepository.SetStoredAsync(pdf.MailAttachmentId, storedPath, sha256, cancellationToken);
+                pdfBytes = await mailSource.GetAttachmentContentAsync(message.Id, pdf.Attachment.Id, cancellationToken);
+                (storedPath, sha256, duplicate) = await StoreOrReuseAsync(
+                    pdf.MailAttachmentId,
+                    pdf.Attachment.Name,
+                    message.ReceivedDateTime ?? DateTimeOffset.UtcNow,
+                    pdfBytes,
+                    cancellationToken);
+            }
+        }
+        else
+        {
+            // Not wrapped in a try: a failure here is either Graph being unreachable or the attachment
+            // exceeding MaxAttachmentSizeBytes, and neither is a verdict this method can reach about the
+            // invoice. Letting it propagate leaves nothing committed and the batch re-delivered next run,
+            // which is the correct outcome for both.
+            pdfBytes = await mailSource.GetAttachmentContentAsync(message.Id, pdf.Attachment.Id, cancellationToken);
 
-        // Checked before extraction runs, not after: these are the exact same bytes as an attachment
-        // already accounted for, so there is nothing new to read out of them, and skipping the Ollama/
-        // regex call avoids re-deriving (and possibly mis-reading differently) data already on record.
-        var duplicate = await mailAttachmentRepository.FindDuplicateByHashAsync(pdf.MailAttachmentId, sha256, cancellationToken);
+            (storedPath, sha256, duplicate) = await StoreOrReuseAsync(
+                pdf.MailAttachmentId,
+                pdf.Attachment.Name,
+                message.ReceivedDateTime ?? DateTimeOffset.UtcNow,
+                pdfBytes,
+                cancellationToken);
+        }
 
         if (duplicate is not null)
         {
@@ -567,6 +603,37 @@ public sealed class APProcessor(
         }
 
         return (invoiceStatus, mailStatus, reason);
+    }
+
+    /// <summary>
+    /// Points a never-stored-before attachment at an existing file with identical content if one
+    /// exists, or writes a new one if not - either way, records the row.
+    /// </summary>
+    /// <remarks>
+    /// Hashes before deciding whether to write, not after: the common trigger is several redelivered
+    /// copies of the same email (a crashed-mid-run message re-delivered, or the same test email
+    /// literally sitting in the Inbox more than once), each getting its own fresh MailAttachmentId but
+    /// byte-identical content. Writing a second physical copy of that content per copy would just be
+    /// the same file on disk N times over; every later copy instead has its row point at the file the
+    /// first one already wrote.
+    /// </remarks>
+    private async Task<(string StoredPath, byte[] Sha256, DuplicateAttachmentMatch? Duplicate)> StoreOrReuseAsync(
+        long mailAttachmentId,
+        string fileName,
+        DateTimeOffset receivedOn,
+        byte[] content,
+        CancellationToken cancellationToken)
+    {
+        var sha256 = SHA256.HashData(content);
+        var duplicate = await mailAttachmentRepository.FindDuplicateByHashAsync(mailAttachmentId, sha256, cancellationToken);
+
+        // duplicate.StoredPath is never null here - see the invariant note on DuplicateAttachmentMatch.
+        var storedPath = duplicate?.StoredPath
+            ?? (await attachmentFileStore.SaveAsync(mailAttachmentId, fileName, receivedOn, content, cancellationToken)).RelativePath;
+
+        await mailAttachmentRepository.SetStoredAsync(mailAttachmentId, storedPath, sha256, cancellationToken);
+
+        return (storedPath, sha256, duplicate);
     }
 
     /// <summary>

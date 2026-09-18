@@ -66,7 +66,7 @@ public sealed class PaceInvoiceProcessor(
             var result = await paceInvoiceService.SubmitAsync(new PaceInvoiceSubmission
             {
                 InvoiceId = claim.InvoiceId,
-                PaceVendorId = claim.PaceVendorId,
+                PaceVendoreAccountNumber = claim.PaceVendoreAccountNumber,
                 Fields = fields
             }, cancellationToken);
 
@@ -106,7 +106,7 @@ public sealed class PaceInvoiceProcessor(
                 logger.LogWarning("Pace submission {PaceSubmissionId} completion skipped because its claim token no longer matched.", claim.PaceSubmissionId);
             }
 
-            if (savedCompletion && result.StatusCode == PaceSubmissionStatus.Error)
+            if (savedCompletion && result.StatusCode is PaceSubmissionStatus.Error or PaceSubmissionStatus.NoPo)
             {
                 await RoutePaceErrorAsync(claim, result.ErrorMessage, cancellationToken);
             }

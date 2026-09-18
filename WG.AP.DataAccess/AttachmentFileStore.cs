@@ -121,6 +121,15 @@ public sealed class AttachmentFileStore(
     /// <c>CK_MailAttachment_Stored</c> requires the path and hash together, and an orphan file is
     /// harmless whereas a row pointing at a file that does not exist is not.
     /// </para>
+    /// <para>
+    /// "Retention is a matter of deleting a month" stops being true the moment two different
+    /// attachment rows share one physical file, which the caller does deliberately for a
+    /// content-duplicate (see <c>MailAttachmentRepository.FindDuplicateByHashAsync</c>): the file lives
+    /// under the FIRST attachment's <c>yyyy\MM</c>, but a LATER-dated duplicate row's only copy can be
+    /// that same file. A future retention sweep must not delete a month's folder just because every
+    /// file in it is old - it must first confirm no <c>MailAttachment.StoredPath</c> of any age still
+    /// points into it. No such sweep exists in this repo yet; this is a warning for whoever builds one.
+    /// </para>
     /// </remarks>
     public async Task<(string RelativePath, byte[] Sha256)> SaveAsync(
         long mailAttachmentId,
@@ -138,7 +147,22 @@ public sealed class AttachmentFileStore(
 
         try
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
+            var directoryPath = Path.GetDirectoryName(fullPath);
+
+            if (string.IsNullOrEmpty(directoryPath))
+            {
+                // Path.Combine on two non-null strings should never produce a path with no directory
+                // component, so this is not expected - but it happened once (2026-09-17, attachment
+                // 16479) and the prior code's Path.GetDirectoryName(fullPath)! turned it into a bare
+                // ArgumentNullException from Directory.CreateDirectory with no context at all. Failing
+                // here instead captures every input that produced the bad path, so a recurrence is
+                // diagnosable on the spot rather than needing another after-the-fact log investigation.
+                throw new InvalidOperationException(
+                    $"Attachment {mailAttachmentId}: computed path '{fullPath}' (root '{options.Value.RootDirectory}', " +
+                    $"relative '{relativePath}', original filename '{fileName}') has no directory component; refusing to write.");
+            }
+
+            Directory.CreateDirectory(directoryPath);
             await File.WriteAllBytesAsync(fullPath, content, cancellationToken);
 
             return (relativePath, SHA256.HashData(content));
@@ -148,6 +172,21 @@ public sealed class AttachmentFileStore(
             logger.LogError(exception, "Failed to store attachment {MailAttachmentId} at {FullPath}.", mailAttachmentId, fullPath);
             throw;
         }
+    }
+
+    /// <summary>Reads back the bytes at a path previously returned by <see cref="SaveAsync"/>.</summary>
+    /// <remarks>
+    /// Used by a retried message claim to avoid re-fetching from Graph and re-writing a file that a
+    /// prior attempt on the same message already stored. Deliberately not wrapped in a try/catch that
+    /// swallows anything: the caller distinguishes "the file is genuinely gone" (fall back to Graph)
+    /// from every other I/O failure (propagate, same as an unreachable share does in
+    /// <see cref="SaveAsync"/>), and only the caller has the context to make that call.
+    /// </remarks>
+    public Task<byte[]> LoadAsync(string relativePath, CancellationToken cancellationToken)
+    {
+        var fullPath = Path.Combine(options.Value.RootDirectory, relativePath);
+
+        return File.ReadAllBytesAsync(fullPath, cancellationToken);
     }
 
     // Attachment names come from an external mailbox, so they are untrusted input on a path. Anything

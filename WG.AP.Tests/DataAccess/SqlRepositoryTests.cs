@@ -1,4 +1,5 @@
 using Dapper;
+using System.Net;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using WG.AP.Core.Abstractions;
@@ -56,12 +57,13 @@ public class SqlRepositoryTests
                 WHEN OBJECT_ID(N'intgr.PaceSubmission', N'U') IS NOT NULL
                  AND COL_LENGTH(N'intgr.PaceSubmission', N'StatusCodeId') IS NOT NULL
                  AND COL_LENGTH(N'intgr.PaceSubmissionStatus', N'StatusCodeId') IS NOT NULL
+                 AND COL_LENGTH(N'dbo.Client', N'PaceVendoreAccountNumber') IS NOT NULL
                     THEN 1
                 ELSE 0
             END;
             """);
 
-        Skip.If(exists == 0, "Publish the WG.AP.Database project with the normalized Pace submission schema before running Pace SQL repository tests.");
+        Skip.If(exists == 0, "Publish the WG.AP.Database project with the normalized Pace submission schema and Client.PaceVendoreAccountNumber before running Pace SQL repository tests.");
     }
 
     [SkippableFact]
@@ -255,6 +257,45 @@ public class SqlRepositoryTests
     }
 
     [SkippableFact]
+    public async Task RecordAttachments_OnARetryAfterSetStored_CarriesForwardTheStoredPathAndHash()
+    {
+        SkipUnlessConfigured();
+
+        // The exact property ProcessPdfAsync's retry branch depends on: once a prior attempt has
+        // fetched, written and recorded an attachment, a later re-delivery of the same message must
+        // see that stored path and hash through this same RecordAsync call, so it can read the file
+        // back locally instead of re-fetching from Graph and re-writing it.
+        var factory = CreateFactory();
+        var runs = new ProcessingRunRepository(factory, NullLogger<ProcessingRunRepository>.Instance);
+        var messages = new MailMessageRepository(factory, NullLogger<MailMessageRepository>.Instance);
+        var attachments = new MailAttachmentRepository(factory, NullLogger<MailAttachmentRepository>.Instance);
+
+        var mailbox = new MailboxRef(Guid.NewGuid(), "sql-test@wallacegraphics.com");
+        var runId = await runs.StartAsync(mailbox, CancellationToken.None);
+
+        MailAttachmentSummary[] summaries =
+        [
+            new MailAttachmentSummary($"att-{Guid.NewGuid():N}", "INV-1.pdf", 1024, "application/pdf")
+        ];
+
+        var message = new MailMessageSummary($"immutable-{Guid.NewGuid():N}", DateTimeOffset.UtcNow, "billing@sanmar.com", "Invoice", summaries);
+        var claim = await messages.DiscoverAndClaimAsync(mailbox, runId, message, CancellationToken.None);
+
+        var firstSight = (await attachments.RecordAsync(claim.MailMessageId, summaries, CancellationToken.None))[0];
+        Assert.Null(firstSight.StoredPath);
+        Assert.Null(firstSight.ContentSha256);
+
+        var storedPath = @"2026\09\1-INV-1.pdf";
+        var storedHash = System.Security.Cryptography.SHA256.HashData(Guid.NewGuid().ToByteArray());
+        await attachments.SetStoredAsync(firstSight.MailAttachmentId, storedPath, storedHash, CancellationToken.None);
+
+        var retry = (await attachments.RecordAsync(claim.MailMessageId, summaries, CancellationToken.None))[0];
+        Assert.Equal(firstSight.MailAttachmentId, retry.MailAttachmentId);
+        Assert.Equal(storedPath, retry.StoredPath);
+        Assert.Equal(storedHash, retry.ContentSha256);
+    }
+
+    [SkippableFact]
     public async Task FindDuplicateByHash_FindsAnEarlierAttachment_WithTheSameContent()
     {
         SkipUnlessConfigured();
@@ -290,6 +331,10 @@ public class SqlRepositoryTests
         Assert.Equal(firstRecorded.MailAttachmentId, duplicate.MailAttachmentId);
         Assert.Equal(firstClaim.MailMessageId, duplicate.MailMessageId);
         Assert.Equal(firstMessage.Subject, duplicate.Subject);
+
+        // The file the first attachment already wrote to - a retry that finds this match must point
+        // its own row at this same path rather than writing a second copy of identical bytes.
+        Assert.Equal(@"2026\09\1-INV-1.pdf", duplicate.StoredPath);
     }
 
     [SkippableFact]
@@ -632,7 +677,7 @@ public class SqlRepositoryTests
             InvoiceNumber = "INV-PACE-ERR",
             CustomerPO = "PO-PACE-ERR",
             Total = 123.45m,
-            PaceVendorId = "SANMAR-PACE"
+            PaceVendoreAccountNumber = "76274-0000"
         };
         var routeMethod = typeof(PaceInvoiceProcessor).GetMethod("RoutePaceErrorAsync", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
 
@@ -689,6 +734,51 @@ public class SqlRepositoryTests
         Assert.Equal((graphMessageId, MailDestinationFolder.Errors), mailSource.LastMove);
         Assert.NotNull(mailSender.LastRequest);
         Assert.Contains("stored invoice fields could not be processed", mailSender.LastRequest.Body);
+        Assert.Equal(["errors@wallacegraphics.com"], mailSender.LastRequest.ToAddresses);
+    }
+
+    [SkippableFact]
+    public async Task PaceInvoiceProcessor_WhenPaceReturnsNoPo_RoutesMailErrorMovesMessageAndSendsAlert()
+    {
+        SkipUnlessConfigured();
+
+        var factory = CreateFactory();
+        await SkipUnlessPaceSchemaPublishedAsync(factory);
+
+        var invoices = new InvoiceRepository(factory, NullLogger<InvoiceRepository>.Instance);
+        var paceSubmissions = new PaceSubmissionRepository(factory, NullLogger<PaceSubmissionRepository>.Instance);
+        var (mailMessageId, mailAttachmentId) = await CreateRecordedPdfAsync(factory);
+        var graphMessageId = await LoadGraphMessageIdAsync(factory, mailMessageId);
+        var invoice = await invoices.RecordAsync(NewInvoice(mailMessageId, mailAttachmentId, $"INV-{Guid.NewGuid():N}"[..20]), CancellationToken.None);
+        var mailSource = new RecordingMailSource();
+        var mailSender = new RecordingMailSender();
+        var noPoMessage = "Pace purchase order 'PO-1' was not found.";
+        var processor = new PaceInvoiceProcessor(
+            mailSource,
+            new MailMessageRepository(factory, NullLogger<MailMessageRepository>.Instance),
+            paceSubmissions,
+            new StubPaceInvoiceService(new PaceInvoiceSubmissionResult
+            {
+                StatusCode = PaceInvoiceOutcomeStatus.NoPo,
+                ErrorMessage = noPoMessage
+            }),
+            new ErrorNotifier(
+                mailSender,
+                Options.Create(new AlertOptions { Recipients = ["errors@wallacegraphics.com"] }),
+                NullLogger<ErrorNotifier>.Instance),
+            NullLogger<PaceInvoiceProcessor>.Instance);
+
+        await processor.ProcessPendingAsync(processingRunId: null, CancellationToken.None);
+
+        var claim = await LoadPaceSubmissionByInvoiceAsync(factory, invoice.InvoiceId!.Value);
+        var mailStatus = await LoadMailStatusAsync(factory, mailMessageId);
+        Assert.Equal(PaceSubmissionStatus.NoPo, claim.StatusCode);
+        Assert.Equal(noPoMessage, claim.ErrorMessage);
+        Assert.Equal((int)ApStatus.MailError, mailStatus.StatusId);
+        Assert.Contains(noPoMessage, mailStatus.ErrorMessage);
+        Assert.Equal((graphMessageId, MailDestinationFolder.Errors), mailSource.LastMove);
+        Assert.NotNull(mailSender.LastRequest);
+        Assert.Contains(WebUtility.HtmlEncode(noPoMessage), mailSender.LastRequest.Body);
         Assert.Equal(["errors@wallacegraphics.com"], mailSender.LastRequest.ToAddresses);
     }
 
