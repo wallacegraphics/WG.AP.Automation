@@ -21,14 +21,30 @@ public sealed record MailMessageErrorLogRow(
     string ErrorMessage);
 
 /// <summary>A stored attachment, as recorded.</summary>
-public sealed record RecordedAttachment(long MailAttachmentId, MailAttachmentSummary Attachment);
+/// <param name="StoredPath">
+/// Non-null when a prior attempt already wrote this attachment's bytes to the file share and recorded
+/// it via <see cref="MailAttachmentRepository.SetStoredAsync"/> - i.e. this is a retry of a message
+/// that previously got partway through the attachment loop before failing on a later PDF. Null on
+/// first sight of the attachment.
+/// </param>
+/// <param name="ContentSha256">Non-null exactly when <see cref="StoredPath"/> is non-null.</param>
+public sealed record RecordedAttachment(
+    long MailAttachmentId,
+    MailAttachmentSummary Attachment,
+    string? StoredPath = null,
+    byte[]? ContentSha256 = null);
 
 /// <summary>
-/// An earlier attachment whose bytes are identical to the one just stored, as found via
+/// An earlier attachment whose bytes are identical to the one just fetched, as found via
 /// <c>IX_MailAttachment_Sha256</c>.
 /// </summary>
 /// <param name="Subject">The earlier message's subject, for naming it in a human-readable reason.</param>
-public sealed record DuplicateAttachmentMatch(long MailAttachmentId, long MailMessageId, string? Subject);
+/// <param name="StoredPath">
+/// The file this match's bytes already live at. Never null when a match is returned:
+/// <c>CK_MailAttachment_Stored</c> guarantees StoredPath and ContentSha256 are set together, and this
+/// query only matches on ContentSha256 - so a row this method can find already has a StoredPath.
+/// </param>
+public sealed record DuplicateAttachmentMatch(long MailAttachmentId, long MailMessageId, string? Subject, string StoredPath);
 
 /// <summary>The client an incoming email resolved to.</summary>
 /// <param name="ClientId">0 when the sender domain matched no enabled client.</param>

@@ -335,7 +335,7 @@ enforced by the database, not by C# — "a message is never claimed twice" is a 
   is the honest gap in duplicate coverage. Adding it needs a deliberate deployment step, because
   **`$select` is baked into the returned `deltaLink`** — the column stays NULL until a one-time full
   resync.
-  by probing rather than guessing. `dbo.Client.PaceVendorId` is the seam.
+  by probing rather than guessing. `dbo.Client.PaceVendoreAccountNumber` is the seam.
 - **No status history**, so "how long was this in NeedsReview" is not answerable. A message sees at
   most two transitions today and `ApplicationLog` carries the trail.
 - **No scored format detection.** A client with two enabled formats is a configuration error rather

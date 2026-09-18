@@ -22,12 +22,19 @@ public static class PaceServiceCollectionExtensions
             .ValidateOnStart();
 
         services.AddTransient<PaceBasicAuthHandler>();
+        services.AddTransient<PaceHttpLoggingHandler>();
 
         services.AddHttpClient(HttpClientName, (serviceProvider, httpClient) =>
             {
                 var options = serviceProvider.GetRequiredService<IOptions<PaceOptions>>().Value;
                 httpClient.Timeout = TimeSpan.FromSeconds(options.TimeoutSeconds);
             })
+            // The framework's default logging handlers only ever print the bare numeric status code
+            // with no indication of what it means - removed here so PaceHttpLoggingHandler (which
+            // reproduces the same four log lines, enriched with the status description) is the only
+            // one logging this client's requests, rather than both firing and doubling every line.
+            .RemoveAllLoggers()
+            .AddHttpMessageHandler<PaceHttpLoggingHandler>()
             .AddHttpMessageHandler<PaceBasicAuthHandler>();
 
         services.AddTransient<IPaceClient>(serviceProvider =>
@@ -41,6 +48,7 @@ public static class PaceServiceCollectionExtensions
             };
         });
 
+        services.AddTransient<PaceBillBatchResolver>();
         services.AddTransient<IPaceInvoiceService, PaceInvoiceService>();
 
         return services;
