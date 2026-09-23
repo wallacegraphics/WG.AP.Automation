@@ -570,6 +570,7 @@ public sealed class PaceInvoiceService(
                     VendorDefaultGlAccount = vendorDefaultCoding.GlAccount,
                     VendorDefaultGlDepartment = vendorDefaultCoding.GlDepartment
                 }),
+                ErrorMessage = $"Pace invoice '{submission.Fields.InvoiceNumber}' for PO '{submission.Fields.CustomerPO}': no matching Pace PO found; Pace writes are disabled, a bill would be created using the Pace vendor default GL account/department.",
                 RequiresReview = true
             };
         }
@@ -650,6 +651,7 @@ public sealed class PaceInvoiceService(
                 VendorDefaultGlAccount = vendorDefaultCoding.GlAccount,
                 VendorDefaultGlDepartment = vendorDefaultCoding.GlDepartment
             }),
+            ErrorMessage = $"Pace invoice '{submission.Fields.InvoiceNumber}' for PO '{submission.Fields.CustomerPO}': no matching Pace PO found; bill {createdBill.Id} created in batch {resolved.BillBatchId} using the Pace vendor default GL account/department.",
             RequiresReview = true
         };
     }
@@ -773,7 +775,7 @@ public sealed class PaceInvoiceService(
         var rows = await LoadAllValueObjectRowsAsync(new ValueObjectDescriptor
         {
             ObjectName = "PurchaseOrderLine",
-            XpathFilter = $"@purchaseOrder/@poNumber = {XPathStringLiteral(pacePoNumber)}",
+            XpathFilter = $"@purchaseOrder/@poNumber = {PaceXPath.StringLiteral(pacePoNumber)}",
             Fields =
             [
                 Field("id", "@id"),
@@ -808,7 +810,7 @@ public sealed class PaceInvoiceService(
         var rows = await LoadAllValueObjectRowsAsync(new ValueObjectDescriptor
         {
             ObjectName = "PurchaseOrder",
-            XpathFilter = $"@poNumber = {XPathStringLiteral(pacePoNumber)}",
+            XpathFilter = $"@poNumber = {PaceXPath.StringLiteral(pacePoNumber)}",
             Fields =
             [
                 Field("id", "@id"),
@@ -860,7 +862,7 @@ public sealed class PaceInvoiceService(
             rows = await LoadAllValueObjectRowsAsync(new ValueObjectDescriptor
             {
                 ObjectName = "Bill",
-                XpathFilter = $"@vendor = {XPathStringLiteral(paceVendoreAccountNumber)} and @invoiceNumber = {XPathStringLiteral(invoiceNumber)}",
+                XpathFilter = $"@vendor = {PaceXPath.StringLiteral(paceVendoreAccountNumber)} and @invoiceNumber = {PaceXPath.StringLiteral(invoiceNumber)}",
                 Fields =
                 [
                     Field("id", "@id"),
@@ -1031,21 +1033,6 @@ public sealed class PaceInvoiceService(
 
     private static string OrFilter(string field, IEnumerable<int> values) =>
         string.Join(" or ", values.Select(value => $"{field} = {value}"));
-
-    private static string XPathStringLiteral(string value)
-    {
-        if (!value.Contains('\'', StringComparison.Ordinal))
-        {
-            return $"'{value}'";
-        }
-
-        if (!value.Contains('"', StringComparison.Ordinal))
-        {
-            return $"\"{value}\"";
-        }
-
-        return $"concat({string.Join(", \"'\", ", value.Split('\'').Select(part => $"'{part}'"))})";
-    }
 
     private static string NormalizePaceInvoiceNumber(string invoiceNumber)
     {

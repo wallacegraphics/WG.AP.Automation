@@ -39,6 +39,11 @@ public sealed class PaceDateTimeOffsetConverter : JsonConverter<DateTimeOffset>
 
     public override DateTimeOffset Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
     {
+        if (reader.TokenType != JsonTokenType.String)
+        {
+            throw new JsonException($"Expected a Pace date string but got {reader.TokenType}.");
+        }
+
         var value = reader.GetString();
 
         if (DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.None, out var parsed))
@@ -46,7 +51,12 @@ public sealed class PaceDateTimeOffsetConverter : JsonConverter<DateTimeOffset>
             return parsed;
         }
 
-        return DateTimeOffset.ParseExact(value!, PaceGmtFormat, CultureInfo.InvariantCulture, DateTimeStyles.None);
+        if (DateTimeOffset.TryParseExact(value, PaceGmtFormat, CultureInfo.InvariantCulture, DateTimeStyles.None, out parsed))
+        {
+            return parsed;
+        }
+
+        throw new JsonException($"Unrecognized Pace date '{value}'.");
     }
 
     public override void Write(Utf8JsonWriter writer, DateTimeOffset value, JsonSerializerOptions options) =>

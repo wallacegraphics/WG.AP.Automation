@@ -465,6 +465,7 @@ public sealed class PaceIntegrationTests
         Assert.Equal(PaceInvoiceOutcomeStatus.BillCreated, result.StatusCode);
         Assert.Equal("16312", result.PaceBillBatchId);
         Assert.True(result.RequiresReview);
+        Assert.Contains("vendor default GL account/department", result.ErrorMessage);
         Assert.Contains("AUTO ", billBatchXpath);
         Assert.DoesNotContain("AUTO-NOPO", billBatchXpath);
         Assert.NotNull(createdBillRequest);
@@ -585,7 +586,28 @@ public sealed class PaceIntegrationTests
 
         Assert.Equal(PaceInvoiceOutcomeStatus.DryRunPrepared, result.StatusCode);
         Assert.True(result.RequiresReview);
+        Assert.Contains("no matching Pace PO", result.ErrorMessage);
         Assert.Contains("2887-2533", result.ResponseJson);
+    }
+
+    [Theory]
+    [InlineData("abc", "'abc'")]
+    [InlineData("O'Brien", "\"O'Brien\"")]
+    [InlineData("a'b\"c", "concat('a', \"'\", 'b\"c')")]
+    public void PaceXPath_StringLiteral_QuotesValues(string value, string expected)
+    {
+        Assert.Equal(expected, PaceXPath.StringLiteral(value));
+    }
+
+    [Theory]
+    [InlineData("123")]
+    [InlineData("\"not-a-date\"")]
+    public void PaceDateTimeOffsetConverter_WhenTokenIsNotAPaceDate_ThrowsJsonException(string json)
+    {
+        var options = new System.Text.Json.JsonSerializerOptions();
+        options.Converters.Add(new PaceDateTimeOffsetConverter());
+
+        Assert.Throws<System.Text.Json.JsonException>(() => System.Text.Json.JsonSerializer.Deserialize<DateTimeOffset>(json, options));
     }
 
     [Fact]

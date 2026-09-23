@@ -32,10 +32,10 @@ internal sealed class PaceHttpLoggingHandler(ILogger<PaceHttpLoggingHandler> log
         // uses, so it can't be relied on here.
         logger.LogInformation(
             "Received HTTP response headers after {ElapsedMilliseconds}ms - {StatusCode} ({StatusDescription})",
-            stopwatch.Elapsed.TotalMilliseconds, (int)response.StatusCode, response.StatusCode);
+            stopwatch.ElapsedMilliseconds, (int)response.StatusCode, response.StatusCode);
         logger.LogInformation(
             "End processing HTTP request after {ElapsedMilliseconds}ms - {StatusCode} ({StatusDescription})",
-            stopwatch.Elapsed.TotalMilliseconds, (int)response.StatusCode, response.StatusCode);
+            stopwatch.ElapsedMilliseconds, (int)response.StatusCode, response.StatusCode);
 
         return response;
     }

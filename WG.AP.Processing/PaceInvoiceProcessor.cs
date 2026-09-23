@@ -189,7 +189,11 @@ public sealed class PaceInvoiceProcessor(
         List<PaceNeedsReviewEntry> needsReviewEntries,
         CancellationToken cancellationToken)
     {
-        await mailMessageRepository.SetStatusAsync(claim.MailMessageId, ApStatus.MailNeedsReview, result.ErrorMessage, cancellationToken);
+        var reason = string.IsNullOrWhiteSpace(result.ErrorMessage)
+            ? $"Pace invoice '{claim.InvoiceNumber}' for PO '{claim.CustomerPO}' requires review."
+            : result.ErrorMessage;
+
+        await mailMessageRepository.SetStatusAsync(claim.MailMessageId, ApStatus.MailNeedsReview, reason, cancellationToken);
         await mailSource.MoveMessageAsync(claim.GraphMessageId, MailDestinationFolder.NeedsReview, cancellationToken);
 
         logger.LogInformation(

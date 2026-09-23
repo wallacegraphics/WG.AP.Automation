@@ -48,7 +48,7 @@ public sealed class PaceBillBatchResolver(IPaceClient paceClient, ILogger<PaceBi
 
         var batchIds = await paceClient.FindAsync(
             "BillBatch",
-            $"@date = date({batchDate.Year},{batchDate.Month},{batchDate.Day}) and @description = {XPathStringLiteral(description)} and @posted = 'false'",
+            $"@date = date({batchDate.Year},{batchDate.Month},{batchDate.Day}) and @description = {PaceXPath.StringLiteral(description)} and @posted = 'false'",
             cancellationToken: cancellationToken);
 
         // Pace has been observed to silently create a BillBatch whose id is the literal value 0
@@ -156,20 +156,6 @@ public sealed class PaceBillBatchResolver(IPaceClient paceClient, ILogger<PaceBi
         return maxId + 1;
     }
 
-    private static string XPathStringLiteral(string value)
-    {
-        if (!value.Contains('\'', StringComparison.Ordinal))
-        {
-            return $"'{value}'";
-        }
-
-        if (!value.Contains('"', StringComparison.Ordinal))
-        {
-            return $"\"{value}\"";
-        }
-
-        return $"concat({string.Join(", \"'\", ", value.Split('\'').Select(part => $"'{part}'"))})";
-    }
 }
 
 public abstract record BillBatchResolution
