@@ -25,6 +25,7 @@ public sealed class PaceInvoiceProcessor(
         logger.LogInformation("Pace submission enqueue complete: {EnqueuedCount} invoice(s) queued.", enqueued);
 
         var processed = 0;
+        var needsReviewEntries = new List<PaceNeedsReviewEntry>();
 
         while (true)
         {
@@ -36,13 +37,21 @@ public sealed class PaceInvoiceProcessor(
             }
 
             processed++;
-            await ProcessClaimAsync(claim, cancellationToken);
+            await ProcessClaimAsync(claim, needsReviewEntries, cancellationToken);
         }
 
         logger.LogInformation("Pace submission processing complete: {ProcessedCount} submission(s) processed.", processed);
+
+        if (needsReviewEntries.Count > 0)
+        {
+            await errorNotifier.NotifyAsync(
+                "AP Automation - Pace invoices needing review (no PO found)",
+                BuildNeedsReviewDigestBody(needsReviewEntries),
+                cancellationToken);
+        }
     }
 
-    private async Task ProcessClaimAsync(PaceSubmissionClaim claim, CancellationToken cancellationToken)
+    private async Task ProcessClaimAsync(PaceSubmissionClaim claim, List<PaceNeedsReviewEntry> needsReviewEntries, CancellationToken cancellationToken)
     {
         try
         {
@@ -66,6 +75,8 @@ public sealed class PaceInvoiceProcessor(
             var result = await paceInvoiceService.SubmitAsync(new PaceInvoiceSubmission
             {
                 InvoiceId = claim.InvoiceId,
+                ClientCode = claim.ClientCode,
+                ClientName = claim.ClientName,
                 PaceVendoreAccountNumber = claim.PaceVendoreAccountNumber,
                 Fields = fields
             }, cancellationToken);
@@ -106,7 +117,11 @@ public sealed class PaceInvoiceProcessor(
                 logger.LogWarning("Pace submission {PaceSubmissionId} completion skipped because its claim token no longer matched.", claim.PaceSubmissionId);
             }
 
-            if (savedCompletion && result.StatusCode is PaceSubmissionStatus.Error or PaceSubmissionStatus.NoPo)
+            if (savedCompletion && result.RequiresReview)
+            {
+                await RouteNeedsReviewAsync(claim, result, needsReviewEntries, cancellationToken);
+            }
+            else if (savedCompletion && result.StatusCode is PaceSubmissionStatus.Error or PaceSubmissionStatus.PoNotReceived)
             {
                 await RoutePaceErrorAsync(claim, result.ErrorMessage, cancellationToken);
             }
@@ -168,5 +183,57 @@ public sealed class PaceInvoiceProcessor(
         + $"<p>PO: {Html(claim.CustomerPO ?? "unknown")}</p>"
         + $"<p>InvoiceId: {claim.InvoiceId}</p>";
 
+    private async Task RouteNeedsReviewAsync(
+        PaceSubmissionClaim claim,
+        PaceInvoiceSubmissionResult result,
+        List<PaceNeedsReviewEntry> needsReviewEntries,
+        CancellationToken cancellationToken)
+    {
+        await mailMessageRepository.SetStatusAsync(claim.MailMessageId, ApStatus.MailNeedsReview, result.ErrorMessage, cancellationToken);
+        await mailSource.MoveMessageAsync(claim.GraphMessageId, MailDestinationFolder.NeedsReview, cancellationToken);
+
+        logger.LogInformation(
+            "Pace invoice {InvoiceId} (no matching PO) routed message {GraphMessageId} to NeedsReview.",
+            claim.InvoiceId,
+            claim.GraphMessageId);
+
+        needsReviewEntries.Add(new PaceNeedsReviewEntry(
+            claim.InvoiceId,
+            claim.InvoiceNumber,
+            claim.CustomerPO,
+            claim.PaceVendoreAccountNumber,
+            result.StatusCode,
+            result.PaceBillBatchId,
+            result.PaceBillId));
+    }
+
+    private static string BuildNeedsReviewDigestBody(IReadOnlyList<PaceNeedsReviewEntry> entries)
+    {
+        var lines = entries.Select(entry =>
+        {
+            var billDescription = entry.StatusCode == PaceSubmissionStatus.BillCreated
+                ? $"Bill {Html(entry.PaceBillId)} created in batch {Html(entry.PaceBillBatchId)} using the Pace vendor default GL account/department."
+                : "Pace writes are disabled; a bill would be created using the Pace vendor default GL account/department.";
+
+            return $"Invoice {Html(entry.InvoiceNumber ?? "unknown")} (PO {Html(entry.CustomerPO ?? "unknown")}, vendor {Html(entry.PaceVendoreAccountNumber ?? "unknown")}): "
+                + "no matching Pace PO was found. "
+                + billDescription
+                + " Routed to NeedsReview.";
+        });
+
+        return "<p>The Pace invoices below had no matching purchase order in Pace and were coded to the Pace vendor default GL "
+            + "account/department. Please verify the coding and PO number.</p>\n"
+            + string.Join("\n", lines.Select(line => $"<p>{line}</p>"));
+    }
+
     private static string Html(string? value) => WebUtility.HtmlEncode(value) ?? string.Empty;
+
+    private sealed record PaceNeedsReviewEntry(
+        long InvoiceId,
+        string? InvoiceNumber,
+        string? CustomerPO,
+        string? PaceVendoreAccountNumber,
+        string StatusCode,
+        string? PaceBillBatchId,
+        string? PaceBillId);
 }

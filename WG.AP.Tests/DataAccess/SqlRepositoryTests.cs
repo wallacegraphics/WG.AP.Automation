@@ -677,6 +677,8 @@ public class SqlRepositoryTests
             InvoiceNumber = "INV-PACE-ERR",
             CustomerPO = "PO-PACE-ERR",
             Total = 123.45m,
+            ClientCode = "SANMAR",
+            ClientName = "SanMar",
             PaceVendoreAccountNumber = "76274-0000"
         };
         var routeMethod = typeof(PaceInvoiceProcessor).GetMethod("RoutePaceErrorAsync", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
@@ -738,7 +740,7 @@ public class SqlRepositoryTests
     }
 
     [SkippableFact]
-    public async Task PaceInvoiceProcessor_WhenPaceReturnsNoPo_RoutesMailErrorMovesMessageAndSendsAlert()
+    public async Task PaceInvoiceProcessor_WhenPaceReturnsPoNotReceived_RoutesMailErrorMovesMessageAndSendsAlert()
     {
         SkipUnlessConfigured();
 
@@ -752,15 +754,15 @@ public class SqlRepositoryTests
         var invoice = await invoices.RecordAsync(NewInvoice(mailMessageId, mailAttachmentId, $"INV-{Guid.NewGuid():N}"[..20]), CancellationToken.None);
         var mailSource = new RecordingMailSource();
         var mailSender = new RecordingMailSender();
-        var noPoMessage = "Pace purchase order 'PO-1' was not found.";
+        var poNotReceivedMessage = "Pace invoice 'INV-1' for PO 'PO-1': no received PO lines were found.";
         var processor = new PaceInvoiceProcessor(
             mailSource,
             new MailMessageRepository(factory, NullLogger<MailMessageRepository>.Instance),
             paceSubmissions,
             new StubPaceInvoiceService(new PaceInvoiceSubmissionResult
             {
-                StatusCode = PaceInvoiceOutcomeStatus.NoPo,
-                ErrorMessage = noPoMessage
+                StatusCode = PaceInvoiceOutcomeStatus.PoNotReceived,
+                ErrorMessage = poNotReceivedMessage
             }),
             new ErrorNotifier(
                 mailSender,
@@ -772,14 +774,112 @@ public class SqlRepositoryTests
 
         var claim = await LoadPaceSubmissionByInvoiceAsync(factory, invoice.InvoiceId!.Value);
         var mailStatus = await LoadMailStatusAsync(factory, mailMessageId);
-        Assert.Equal(PaceSubmissionStatus.NoPo, claim.StatusCode);
-        Assert.Equal(noPoMessage, claim.ErrorMessage);
+        Assert.Equal(PaceSubmissionStatus.PoNotReceived, claim.StatusCode);
+        Assert.Equal(poNotReceivedMessage, claim.ErrorMessage);
         Assert.Equal((int)ApStatus.MailError, mailStatus.StatusId);
-        Assert.Contains(noPoMessage, mailStatus.ErrorMessage);
+        Assert.Contains(poNotReceivedMessage, mailStatus.ErrorMessage);
         Assert.Equal((graphMessageId, MailDestinationFolder.Errors), mailSource.LastMove);
         Assert.NotNull(mailSender.LastRequest);
-        Assert.Contains(WebUtility.HtmlEncode(noPoMessage), mailSender.LastRequest.Body);
+        Assert.Contains(WebUtility.HtmlEncode(poNotReceivedMessage), mailSender.LastRequest.Body);
         Assert.Equal(["errors@wallacegraphics.com"], mailSender.LastRequest.ToAddresses);
+    }
+
+    [SkippableFact]
+    public async Task PaceInvoiceProcessor_WhenMultipleInvoicesRequireReview_MovesEachToNeedsReviewAndSendsOneDigestEmail()
+    {
+        SkipUnlessConfigured();
+
+        var factory = CreateFactory();
+        await SkipUnlessPaceSchemaPublishedAsync(factory);
+
+        var invoices = new InvoiceRepository(factory, NullLogger<InvoiceRepository>.Instance);
+        var paceSubmissions = new PaceSubmissionRepository(factory, NullLogger<PaceSubmissionRepository>.Instance);
+
+        var (firstMailMessageId, firstMailAttachmentId) = await CreateRecordedPdfAsync(factory);
+        var firstGraphMessageId = await LoadGraphMessageIdAsync(factory, firstMailMessageId);
+        var firstInvoiceNumber = $"INV-{Guid.NewGuid():N}"[..20];
+        var firstInvoice = await invoices.RecordAsync(NewInvoice(firstMailMessageId, firstMailAttachmentId, firstInvoiceNumber), CancellationToken.None);
+
+        var (secondMailMessageId, secondMailAttachmentId) = await CreateRecordedPdfAsync(factory);
+        var secondGraphMessageId = await LoadGraphMessageIdAsync(factory, secondMailMessageId);
+        var secondInvoiceNumber = $"INV-{Guid.NewGuid():N}"[..20];
+        var secondInvoice = await invoices.RecordAsync(NewInvoice(secondMailMessageId, secondMailAttachmentId, secondInvoiceNumber), CancellationToken.None);
+
+        var mailSource = new RecordingMailSource();
+        var mailSender = new RecordingMailSender();
+        var paceInvoiceService = new PerInvoiceStubPaceInvoiceService(new Dictionary<long, PaceInvoiceSubmissionResult>
+        {
+            [firstInvoice.InvoiceId!.Value] = new PaceInvoiceSubmissionResult
+            {
+                StatusCode = PaceInvoiceOutcomeStatus.BillCreated,
+                PaceBillBatchId = "111",
+                PaceBillId = "222",
+                RequiresReview = true
+            },
+            [secondInvoice.InvoiceId!.Value] = new PaceInvoiceSubmissionResult
+            {
+                StatusCode = PaceInvoiceOutcomeStatus.DryRunPrepared,
+                RequiresReview = true
+            }
+        });
+        var processor = new PaceInvoiceProcessor(
+            mailSource,
+            new MailMessageRepository(factory, NullLogger<MailMessageRepository>.Instance),
+            paceSubmissions,
+            paceInvoiceService,
+            new ErrorNotifier(
+                mailSender,
+                Options.Create(new AlertOptions { Recipients = ["errors@wallacegraphics.com"] }),
+                NullLogger<ErrorNotifier>.Instance),
+            NullLogger<PaceInvoiceProcessor>.Instance);
+
+        await processor.ProcessPendingAsync(processingRunId: null, CancellationToken.None);
+
+        var firstMailStatus = await LoadMailStatusAsync(factory, firstMailMessageId);
+        var secondMailStatus = await LoadMailStatusAsync(factory, secondMailMessageId);
+        Assert.Equal((int)ApStatus.MailNeedsReview, firstMailStatus.StatusId);
+        Assert.Equal((int)ApStatus.MailNeedsReview, secondMailStatus.StatusId);
+        Assert.Contains((firstGraphMessageId, MailDestinationFolder.NeedsReview), mailSource.Moves);
+        Assert.Contains((secondGraphMessageId, MailDestinationFolder.NeedsReview), mailSource.Moves);
+
+        var digest = Assert.Single(mailSender.Requests.Where(request => request.Subject == "AP Automation - Pace invoices needing review (no PO found)"));
+        Assert.Contains(firstInvoiceNumber, digest.Body);
+        Assert.Contains(secondInvoiceNumber, digest.Body);
+    }
+
+    [SkippableFact]
+    public async Task PaceInvoiceProcessor_WhenNoInvoiceRequiresReview_SendsNoDigestEmail()
+    {
+        SkipUnlessConfigured();
+
+        var factory = CreateFactory();
+        await SkipUnlessPaceSchemaPublishedAsync(factory);
+
+        var invoices = new InvoiceRepository(factory, NullLogger<InvoiceRepository>.Instance);
+        var paceSubmissions = new PaceSubmissionRepository(factory, NullLogger<PaceSubmissionRepository>.Instance);
+        var (mailMessageId, mailAttachmentId) = await CreateRecordedPdfAsync(factory);
+        await invoices.RecordAsync(NewInvoice(mailMessageId, mailAttachmentId, $"INV-{Guid.NewGuid():N}"[..20]), CancellationToken.None);
+
+        var mailSource = new RecordingMailSource();
+        var mailSender = new RecordingMailSender();
+        var processor = new PaceInvoiceProcessor(
+            mailSource,
+            new MailMessageRepository(factory, NullLogger<MailMessageRepository>.Instance),
+            paceSubmissions,
+            new StubPaceInvoiceService(new PaceInvoiceSubmissionResult
+            {
+                StatusCode = PaceInvoiceOutcomeStatus.AlreadyEntered
+            }),
+            new ErrorNotifier(
+                mailSender,
+                Options.Create(new AlertOptions { Recipients = ["errors@wallacegraphics.com"] }),
+                NullLogger<ErrorNotifier>.Instance),
+            NullLogger<PaceInvoiceProcessor>.Instance);
+
+        await processor.ProcessPendingAsync(processingRunId: null, CancellationToken.None);
+
+        Assert.Empty(mailSender.Requests);
+        Assert.Empty(mailSource.Moves);
     }
 
     private static async Task AssertPaceSubmissionUsesStatusLookupIdAsync(SqlConnectionFactory factory)
@@ -1015,7 +1115,9 @@ public class SqlRepositoryTests
 
     private sealed class RecordingMailSource : IMailSource
     {
-        public (string MessageId, MailDestinationFolder Destination)? LastMove { get; private set; }
+        public List<(string MessageId, MailDestinationFolder Destination)> Moves { get; } = [];
+
+        public (string MessageId, MailDestinationFolder Destination)? LastMove => Moves.Count == 0 ? null : Moves[^1];
 
         public Task ValidateAuthAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 
@@ -1031,18 +1133,20 @@ public class SqlRepositoryTests
 
         public Task<string> MoveMessageAsync(string messageId, MailDestinationFolder destination, CancellationToken cancellationToken)
         {
-            LastMove = (messageId, destination);
+            Moves.Add((messageId, destination));
             return Task.FromResult(messageId);
         }
     }
 
     private sealed class RecordingMailSender : IMailSender
     {
-        public MailSendRequest? LastRequest { get; private set; }
+        public List<MailSendRequest> Requests { get; } = [];
+
+        public MailSendRequest? LastRequest => Requests.Count == 0 ? null : Requests[^1];
 
         public Task SendMailAsync(MailSendRequest request, CancellationToken cancellationToken)
         {
-            LastRequest = request;
+            Requests.Add(request);
             return Task.CompletedTask;
         }
     }
@@ -1050,5 +1154,11 @@ public class SqlRepositoryTests
     private sealed class StubPaceInvoiceService(PaceInvoiceSubmissionResult result) : IPaceInvoiceService
     {
         public Task<PaceInvoiceSubmissionResult> SubmitAsync(PaceInvoiceSubmission submission, CancellationToken cancellationToken) => Task.FromResult(result);
+    }
+
+    private sealed class PerInvoiceStubPaceInvoiceService(Dictionary<long, PaceInvoiceSubmissionResult> resultsByInvoiceId) : IPaceInvoiceService
+    {
+        public Task<PaceInvoiceSubmissionResult> SubmitAsync(PaceInvoiceSubmission submission, CancellationToken cancellationToken) =>
+            Task.FromResult(resultsByInvoiceId[submission.InvoiceId]);
     }
 }

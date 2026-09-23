@@ -14,6 +14,32 @@ public sealed class PaceInvoiceService(
 {
     private const int PacePageSize = 500;
 
+    // Bill.Terms is required by Pace - createBill returns HTTP 500 ("terms, Value required") if it's
+    // left null, which is what every automated bill creation was doing until this was added. Maps the
+    // "NetNN" token SanmarPdfHeaderExtractor pulls straight off the PDF (TermsRegex: "Terms:\s*(\S+)")
+    // to the matching Pace Terms value-object id (confirmed 2026-09-21 against Pace staging -
+    // loadValueObjects on "Terms" lists every plain "Net N Days" entry at these ids; the discount-based
+    // ones like "2% 10 Net 30" are not handled here since nothing on a SanMar invoice maps to them).
+    private static readonly Dictionary<int, int> PaceTermsIdByNetDays = new()
+    {
+        [10] = 5005,
+        [15] = 5013,
+        [30] = 1,
+        [45] = 5008,
+        [60] = 5010,
+        [75] = 5027,
+        [90] = 5018
+    };
+
+    // Falls back to this when the extracted Terms text doesn't parse as "NetNN" or names a day count
+    // Pace has no plain entry for - every vendor this pipeline bills is SanMar today, whose own
+    // invoices always carry Net 60 terms, so this is a reasonable default rather than a guess, but it
+    // is a default and not a real per-vendor lookup.
+    private const int DefaultTermsId = 5010;
+
+    private static readonly System.Text.RegularExpressions.Regex NetDaysRegex =
+        new(@"^Net\s*(?<days>\d+)$", System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
+
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
         WriteIndented = true
@@ -40,6 +66,16 @@ public sealed class PaceInvoiceService(
 
             if (existingBills.Count > 0)
             {
+                logger.LogInformation(
+                    "Pace invoice '{InvoiceNumber}' for PO '{PoNumber}' already entered: found {BillCount} existing Pace bill(s) (ids: {BillIds}; bill batch(es): {BillBatches}). InvoiceId={InvoiceId}; PaceVendoreAccountNumber={PaceVendoreAccountNumber}.",
+                    submission.Fields.InvoiceNumber,
+                    submission.Fields.CustomerPO,
+                    existingBills.Count,
+                    string.Join(", ", existingBills.Select(bill => bill.Id)),
+                    JoinOrNone(existingBills.Select(bill => bill.BillBatch)),
+                    submission.InvoiceId,
+                    submission.PaceVendoreAccountNumber);
+
                 return new PaceInvoiceSubmissionResult
                 {
                     StatusCode = PaceInvoiceOutcomeStatus.AlreadyEntered,
@@ -55,6 +91,26 @@ public sealed class PaceInvoiceService(
                 };
             }
 
+            DateOnly? resolvedBatchDate = null;
+            BillBatchResolution.Resolved? resolvedBatch = null;
+
+            if (options.Value.WriteEnabled)
+            {
+                var accountingPeriodDate = submission.Fields.InvoiceDate;
+                var dailyBatchDate = DateOnly.FromDateTime(DateTime.Today);
+                var batchDescription = BuildBillBatchDescription(dailyBatchDate, "AUTO");
+                var batchResolution = await billBatchResolver.ResolveOrCreateAsync(accountingPeriodDate, dailyBatchDate, batchDescription, cancellationToken);
+                var batchErrorResult = HandleUnresolvedBatch(submission, batchResolution);
+
+                if (batchErrorResult is not null)
+                {
+                    return batchErrorResult;
+                }
+
+                resolvedBatchDate = dailyBatchDate;
+                resolvedBatch = (BillBatchResolution.Resolved)batchResolution;
+            }
+
             var purchaseOrderLines = await LoadPurchaseOrderLinesOrNoPoAsync(submission, cancellationToken);
 
             if (purchaseOrderLines.Result is not null)
@@ -62,24 +118,9 @@ public sealed class PaceInvoiceService(
                 return purchaseOrderLines.Result;
             }
 
-            if (purchaseOrderLines.PurchaseOrderLines is null)
+            if (purchaseOrderLines.PurchaseOrderLines is null || purchaseOrderLines.PurchaseOrderLines.Count == 0)
             {
-                return new PaceInvoiceSubmissionResult
-                {
-                    StatusCode = PaceInvoiceOutcomeStatus.NoPo,
-                    ResponseJson = SerializeResponse(new { submission.Fields.CustomerPO }),
-                    ErrorMessage = $"Pace purchase order '{submission.Fields.CustomerPO}' was not found."
-                };
-            }
-
-            if (purchaseOrderLines.PurchaseOrderLines.Count == 0)
-            {
-                return new PaceInvoiceSubmissionResult
-                {
-                    StatusCode = PaceInvoiceOutcomeStatus.NoPo,
-                    ResponseJson = SerializeResponse(new { submission.Fields.CustomerPO }),
-                    ErrorMessage = $"Pace purchase order '{submission.Fields.CustomerPO}' was not found."
-                };
+                return await CreateNoPoBillAsync(submission, normalizedInvoiceNumber, resolvedBatch, resolvedBatchDate, cancellationToken);
             }
 
             var receivedLines = purchaseOrderLines.PurchaseOrderLines.Where(line => line.QtyReceived > 0).ToList();
@@ -95,7 +136,7 @@ public sealed class PaceInvoiceService(
 
                 return new PaceInvoiceSubmissionResult
                 {
-                    StatusCode = PaceInvoiceOutcomeStatus.Error,
+                    StatusCode = PaceInvoiceOutcomeStatus.PoNotReceived,
                     ResponseJson = SerializeResponse(new { submission.Fields.InvoiceNumber, submission.Fields.CustomerPO, InvoiceTotal = submission.Fields.Total, PurchaseOrderLines = purchaseOrderLines.PurchaseOrderLines }),
                     ErrorMessage = errorMessage
                 };
@@ -105,6 +146,14 @@ public sealed class PaceInvoiceService(
 
             if (billableLines.Count == 0)
             {
+                logger.LogInformation(
+                    "Pace invoice '{InvoiceNumber}' for PO '{PoNumber}': all {ReceivedLineCount} received PO line(s) already invoice-complete; nothing to bill. InvoiceId={InvoiceId}; PaceVendoreAccountNumber={PaceVendoreAccountNumber}.",
+                    submission.Fields.InvoiceNumber,
+                    submission.Fields.CustomerPO,
+                    receivedLines.Count,
+                    submission.InvoiceId,
+                    submission.PaceVendoreAccountNumber);
+
                 return new PaceInvoiceSubmissionResult
                 {
                     StatusCode = PaceInvoiceOutcomeStatus.AlreadyEntered,
@@ -212,6 +261,16 @@ public sealed class PaceInvoiceService(
                 };
             }
 
+            logger.LogInformation(
+                "Pace invoice '{InvoiceNumber}' for PO '{PoNumber}': reconciled invoice total {InvoiceTotal} against {ReceiptCount} unpaid PO receipt(s). PO line ids: {PoLineIds}. InvoiceId={InvoiceId}; PaceVendoreAccountNumber={PaceVendoreAccountNumber}.",
+                submission.Fields.InvoiceNumber,
+                submission.Fields.CustomerPO,
+                submission.Fields.Total,
+                billableReceipts.Count,
+                string.Join(", ", billableReceipts.Select(receipt => receipt.PurchaseOrderLine).Distinct()),
+                submission.InvoiceId,
+                submission.PaceVendoreAccountNumber);
+
             var prepared = new
             {
                 submission.Fields.InvoiceNumber,
@@ -222,6 +281,15 @@ public sealed class PaceInvoiceService(
 
             if (!options.Value.WriteEnabled)
             {
+                logger.LogInformation(
+                    "Pace invoice '{InvoiceNumber}' for PO '{PoNumber}': dry-run prepared (Pace writes disabled); would bill vendor {PaceVendoreAccountNumber} for {ReceiptCount} receipt(s) totalling {Total}. InvoiceId={InvoiceId}.",
+                    submission.Fields.InvoiceNumber,
+                    submission.Fields.CustomerPO,
+                    submission.PaceVendoreAccountNumber,
+                    billableReceipts.Count,
+                    submission.Fields.Total,
+                    submission.InvoiceId);
+
                 return new PaceInvoiceSubmissionResult
                 {
                     StatusCode = PaceInvoiceOutcomeStatus.DryRunPrepared,
@@ -229,47 +297,70 @@ public sealed class PaceInvoiceService(
                 };
             }
 
-            var batchDate = DateOnly.FromDateTime(DateTime.Today);
-            var batchDescription = BuildPaceBillBatchDescription(batchDate, submission);
-            var batchResolution = await billBatchResolver.ResolveOrCreateAsync(batchDate, batchDescription, cancellationToken);
+            var billBatchDate = resolvedBatchDate ?? throw new InvalidOperationException("Pace write-enabled bill creation reached without a resolved bill batch date.");
+            var resolved = resolvedBatch ?? throw new InvalidOperationException("Pace write-enabled bill creation reached without a resolved bill batch.");
+            var poVendor = billableLines[0].Vendor ?? submission.PaceVendoreAccountNumber;
+            var (createdBill, duplicateResult) = await TryCreateBillAsync(submission, normalizedInvoiceNumber, poVendor, resolved.BillBatchId, resolved.GlAccountingPeriodId, billBatchDate, cancellationToken);
 
-            switch (batchResolution)
+            if (duplicateResult is not null)
             {
-                case BillBatchResolution.PeriodClosed periodClosed:
-                {
-                    var errorMessage = $"Pace invoice '{submission.Fields.InvoiceNumber}': GL accounting period {periodClosed.GlAccountingPeriodId} is not open for posting (status '{periodClosed.GlPeriodStatus}'); invoice routed to the error report.";
-                    logger.LogError("{ErrorMessage} InvoiceId={InvoiceId}.", errorMessage, submission.InvoiceId);
-
-                    return new PaceInvoiceSubmissionResult
-                    {
-                        StatusCode = PaceInvoiceOutcomeStatus.Error,
-                        ErrorMessage = errorMessage
-                    };
-                }
-
-                case BillBatchResolution.Unresolvable unresolvable:
-                {
-                    var errorMessage = $"Pace invoice '{submission.Fields.InvoiceNumber}': {unresolvable.Reason}";
-                    logger.LogError("{ErrorMessage} InvoiceId={InvoiceId}.", errorMessage, submission.InvoiceId);
-
-                    return new PaceInvoiceSubmissionResult
-                    {
-                        StatusCode = PaceInvoiceOutcomeStatus.Error,
-                        ErrorMessage = errorMessage
-                    };
-                }
-
-                case BillBatchResolution.Resolved resolved:
-                    return new PaceInvoiceSubmissionResult
-                    {
-                        StatusCode = PaceInvoiceOutcomeStatus.Error,
-                        PaceBillBatchId = resolved.BillBatchId.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                        ErrorMessage = "Pace writes are enabled; bill batch resolved but bill/bill-line creation is not implemented until PR 2."
-                    };
-
-                default:
-                    throw new InvalidOperationException($"Unhandled {nameof(BillBatchResolution)} type '{batchResolution.GetType()}'.");
+                return duplicateResult;
             }
+
+            if (createdBill!.Id is null)
+            {
+                throw new InvalidOperationException("Pace createBill did not return an id.");
+            }
+
+            var createdLineIds = new List<int>();
+
+            foreach (var receipt in billableReceipts)
+            {
+                var createdLine = await paceClient.CreateBillLineAsync(new BillLine
+                {
+                    Bill = createdBill.Id,
+                    PurchaseOrderReceipt = receipt.PurchaseOrderReceipt,
+                    InvoiceAmount = (double)receipt.InvoiceAmount,
+                    GlAccount = receipt.GlAccount,
+                    GlDepartment = receipt.GlDepartment,
+                    Job = receipt.Job,
+                    JobPart = receipt.JobPart,
+                    ActivityCode = receipt.ActivityCode
+                }, cancellationToken: cancellationToken);
+
+                if (createdLine.Id is null)
+                {
+                    throw new InvalidOperationException($"Pace createBillLine did not return an id for bill {createdBill.Id}.");
+                }
+
+                createdLineIds.Add(createdLine.Id.Value);
+            }
+
+            logger.LogInformation(
+                "Pace bill {BillId} created for invoice '{InvoiceNumber}' in batch {BillBatchId} with {LineCount} bill line(s) (ids: {BillLineIds}). InvoiceId={InvoiceId}; PaceVendoreAccountNumber={PaceVendoreAccountNumber}.",
+                createdBill.Id,
+                submission.Fields.InvoiceNumber,
+                resolved.BillBatchId,
+                createdLineIds.Count,
+                string.Join(", ", createdLineIds),
+                submission.InvoiceId,
+                submission.PaceVendoreAccountNumber);
+
+            return new PaceInvoiceSubmissionResult
+            {
+                StatusCode = PaceInvoiceOutcomeStatus.BillCreated,
+                PaceBillBatchId = resolved.BillBatchId.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                PaceBillId = createdBill.Id.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                PaceBillLineId = string.Join(",", createdLineIds),
+                ResponseJson = SerializeResponse(new
+                {
+                    submission.Fields.InvoiceNumber,
+                    submission.Fields.CustomerPO,
+                    BillId = createdBill.Id,
+                    BillBatchId = resolved.BillBatchId,
+                    BillLineIds = createdLineIds
+                })
+            };
         }
         catch (PaceValueObjectNotFoundException exception)
         {
@@ -297,6 +388,32 @@ public sealed class PaceInvoiceService(
             if (IsAuthenticationFailureStatus(exception.StatusCode))
             {
                 var errorMessage = $"Pace authentication or authorization failed with HTTP {exception.StatusCode}; retry after credentials or permissions are fixed.";
+                logger.LogError(
+                    exception,
+                    "{ErrorMessage} InvoiceId={InvoiceId}; InvoiceNumber={InvoiceNumber}; CustomerPO={CustomerPO}.",
+                    errorMessage,
+                    submission.InvoiceId,
+                    submission.Fields.InvoiceNumber,
+                    submission.Fields.CustomerPO);
+
+                return new PaceInvoiceSubmissionResult
+                {
+                    StatusCode = PaceInvoiceOutcomeStatus.RetryLater,
+                    IsTransient = true,
+                    ResponseJson = SerializePaceException(exception),
+                    ErrorMessage = errorMessage
+                };
+            }
+
+            if (exception.StatusCode == 200)
+            {
+                // An ApiException can only carry HTTP 200 when the request itself succeeded and the
+                // response body failed to deserialize client-side (see ReadObjectResponseAsync in the
+                // generated client) - there is no legitimate "business" reason for Pace to fail a
+                // successful response. That is far more likely a passing malformed/empty-body glitch
+                // than a genuine data problem, so retry instead of routing the invoice to Errors.
+                var errorMessage = $"Pace invoice '{submission.Fields.InvoiceNumber}' for PO '{submission.Fields.CustomerPO}': Pace returned HTTP 200 but the response body could not be parsed; retrying. {exception.Message}";
+
                 logger.LogError(
                     exception,
                     "{ErrorMessage} InvoiceId={InvoiceId}; InvoiceNumber={InvoiceNumber}; CustomerPO={CustomerPO}.",
@@ -370,6 +487,280 @@ public sealed class PaceInvoiceService(
         }
     }
 
+    private async Task<PaceInvoiceSubmissionResult> CreateNoPoBillAsync(
+        PaceInvoiceSubmission submission,
+        string normalizedInvoiceNumber,
+        BillBatchResolution.Resolved? resolvedBatch,
+        DateOnly? resolvedBatchDate,
+        CancellationToken cancellationToken)
+    {
+        var noPoVendorCode = submission.ClientCode;
+
+        if (string.IsNullOrWhiteSpace(noPoVendorCode))
+        {
+            var errorMessage = $"Pace invoice '{submission.Fields.InvoiceNumber}' for PO '{submission.Fields.CustomerPO}': no matching Pace PO found, and the client code is not available to load the Pace vendor default GL account/department.";
+            logger.LogError("{ErrorMessage} InvoiceId={InvoiceId}; ClientName={ClientName}; PaceVendoreAccountNumber={PaceVendoreAccountNumber}.", errorMessage, submission.InvoiceId, submission.ClientName, submission.PaceVendoreAccountNumber);
+
+            return new PaceInvoiceSubmissionResult
+            {
+                StatusCode = PaceInvoiceOutcomeStatus.Error,
+                ErrorMessage = errorMessage,
+                RequiresReview = true
+            };
+        }
+
+        var vendorDefaultCoding = await LoadVendorDefaultCodingByCodeAsync(noPoVendorCode, cancellationToken);
+
+        if (vendorDefaultCoding is null)
+        {
+            var errorMessage = $"Pace invoice '{submission.Fields.InvoiceNumber}' for PO '{submission.Fields.CustomerPO}': no matching Pace PO found, and Pace vendor '{noPoVendorCode}' was not found; cannot load the Pace vendor default GL account/department.";
+            logger.LogError("{ErrorMessage} InvoiceId={InvoiceId}; ClientCode={ClientCode}; ClientName={ClientName}; PaceVendoreAccountNumber={PaceVendoreAccountNumber}.", errorMessage, submission.InvoiceId, noPoVendorCode, submission.ClientName, submission.PaceVendoreAccountNumber);
+
+            return new PaceInvoiceSubmissionResult
+            {
+                StatusCode = PaceInvoiceOutcomeStatus.Error,
+                ErrorMessage = errorMessage,
+                RequiresReview = true
+            };
+        }
+
+        if (vendorDefaultCoding.GlAccount is null or <= 0 || vendorDefaultCoding.GlDepartment is null or <= 0)
+        {
+            var errorMessage = $"Pace invoice '{submission.Fields.InvoiceNumber}' for PO '{submission.Fields.CustomerPO}': Pace vendor default GL account/department for '{vendorDefaultCoding.Name}' is missing or invalid for no-PO bill creation.";
+            logger.LogError(
+                "{ErrorMessage} InvoiceId={InvoiceId}; PaceVendorName={PaceVendorName}; VendorDefaultGlAccount={VendorDefaultGlAccount}; VendorDefaultGlDepartment={VendorDefaultGlDepartment}.",
+                errorMessage,
+                submission.InvoiceId,
+                vendorDefaultCoding.Name,
+                vendorDefaultCoding.GlAccount,
+                vendorDefaultCoding.GlDepartment);
+
+            return new PaceInvoiceSubmissionResult
+            {
+                StatusCode = PaceInvoiceOutcomeStatus.Error,
+                ErrorMessage = errorMessage,
+                RequiresReview = true
+            };
+        }
+
+        if (!options.Value.WriteEnabled)
+        {
+            logger.LogInformation(
+                "Pace invoice '{InvoiceNumber}' for PO '{PoNumber}': no matching Pace PO found; dry-run prepared (Pace writes disabled) for the no-PO lane using Pace vendor {PaceVendorId}/{PaceVendorName} default GL account {VendorDefaultGlAccount}/department {VendorDefaultGlDepartment}. InvoiceId={InvoiceId}.",
+                submission.Fields.InvoiceNumber,
+                submission.Fields.CustomerPO,
+                vendorDefaultCoding.Id,
+                vendorDefaultCoding.Name,
+                vendorDefaultCoding.GlAccount,
+                vendorDefaultCoding.GlDepartment,
+                submission.InvoiceId);
+
+            return new PaceInvoiceSubmissionResult
+            {
+                StatusCode = PaceInvoiceOutcomeStatus.DryRunPrepared,
+                ResponseJson = SerializeResponse(new
+                {
+                    submission.Fields.InvoiceNumber,
+                    submission.Fields.CustomerPO,
+                    submission.ClientCode,
+                    submission.ClientName,
+                    submission.PaceVendoreAccountNumber,
+                    PaceVendorName = vendorDefaultCoding.Name,
+                    PaceVendorId = vendorDefaultCoding.Id,
+                    VendorDefaultGlAccount = vendorDefaultCoding.GlAccount,
+                    VendorDefaultGlDepartment = vendorDefaultCoding.GlDepartment
+                }),
+                RequiresReview = true
+            };
+        }
+
+        var batchDate = resolvedBatchDate ?? throw new InvalidOperationException("Pace write-enabled no-PO bill creation reached without a resolved bill batch date.");
+        var resolved = resolvedBatch ?? throw new InvalidOperationException("Pace write-enabled no-PO bill creation reached without a resolved bill batch.");
+        var defaultNoPoVendor = vendorDefaultCoding.Id ?? vendorDefaultCoding.Name;
+
+        if (string.IsNullOrWhiteSpace(defaultNoPoVendor))
+        {
+            var errorMessage = $"Pace invoice '{submission.Fields.InvoiceNumber}' for PO '{submission.Fields.CustomerPO}': Pace vendor '{vendorDefaultCoding.Name}' did not include a usable id for no-PO bill creation.";
+            logger.LogError("{ErrorMessage} InvoiceId={InvoiceId}; PaceVendorName={PaceVendorName}; BillBatchId={BillBatchId}.", errorMessage, submission.InvoiceId, vendorDefaultCoding.Name, resolved.BillBatchId);
+
+            return new PaceInvoiceSubmissionResult
+            {
+                StatusCode = PaceInvoiceOutcomeStatus.Error,
+                PaceBillBatchId = resolved.BillBatchId.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                ErrorMessage = errorMessage,
+                RequiresReview = true
+            };
+        }
+
+        var (createdBill, duplicateResult) = await TryCreateBillAsync(submission, normalizedInvoiceNumber, defaultNoPoVendor, resolved.BillBatchId, resolved.GlAccountingPeriodId, batchDate, cancellationToken);
+
+        if (duplicateResult is not null)
+        {
+            return duplicateResult;
+        }
+
+        if (createdBill!.Id is null)
+        {
+            throw new InvalidOperationException("Pace createBill did not return an id.");
+        }
+
+        var createdLine = await paceClient.CreateBillLineAsync(new BillLine
+        {
+            Bill = createdBill.Id,
+            InvoiceAmount = (double)submission.Fields.Total,
+            GlAccount = vendorDefaultCoding.GlAccount,
+            GlDepartment = vendorDefaultCoding.GlDepartment
+        }, cancellationToken: cancellationToken);
+
+        if (createdLine.Id is null)
+        {
+            throw new InvalidOperationException($"Pace createBillLine did not return an id for bill {createdBill.Id}.");
+        }
+
+        logger.LogInformation(
+            "Pace bill {BillId} created for invoice '{InvoiceNumber}' with no matching Pace PO; single bill line {BillLineId} coded to Pace vendor {PaceVendorId}/{PaceVendorName} default GL account {VendorDefaultGlAccount}/department {VendorDefaultGlDepartment} in batch {BillBatchId}. InvoiceId={InvoiceId}; PaceVendoreAccountNumber={PaceVendoreAccountNumber}.",
+            createdBill.Id,
+            submission.Fields.InvoiceNumber,
+            createdLine.Id,
+            vendorDefaultCoding.Id,
+            vendorDefaultCoding.Name,
+            vendorDefaultCoding.GlAccount,
+            vendorDefaultCoding.GlDepartment,
+            resolved.BillBatchId,
+            submission.InvoiceId,
+            submission.PaceVendoreAccountNumber);
+
+        return new PaceInvoiceSubmissionResult
+        {
+            StatusCode = PaceInvoiceOutcomeStatus.BillCreated,
+            PaceBillBatchId = resolved.BillBatchId.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            PaceBillId = createdBill.Id.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            PaceBillLineId = createdLine.Id.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            ResponseJson = SerializeResponse(new
+            {
+                submission.Fields.InvoiceNumber,
+                submission.Fields.CustomerPO,
+                submission.ClientCode,
+                submission.ClientName,
+                BillId = createdBill.Id,
+                BillBatchId = resolved.BillBatchId,
+                BillLineId = createdLine.Id,
+                PaceVendorName = vendorDefaultCoding.Name,
+                PaceVendorId = vendorDefaultCoding.Id,
+                VendorDefaultGlAccount = vendorDefaultCoding.GlAccount,
+                VendorDefaultGlDepartment = vendorDefaultCoding.GlDepartment
+            }),
+            RequiresReview = true
+        };
+    }
+
+    private PaceInvoiceSubmissionResult? HandleUnresolvedBatch(PaceInvoiceSubmission submission, BillBatchResolution batchResolution)
+    {
+        switch (batchResolution)
+        {
+            case BillBatchResolution.PeriodClosed periodClosed:
+            {
+                var errorMessage = $"Pace invoice '{submission.Fields.InvoiceNumber}': GL accounting period {periodClosed.GlAccountingPeriodId} for invoice date {submission.Fields.InvoiceDate:yyyy-MM-dd} is locked/closed for posting (status '{periodClosed.GlPeriodStatus}'); invoice routed to Errors.";
+                logger.LogError("{ErrorMessage} InvoiceId={InvoiceId}.", errorMessage, submission.InvoiceId);
+
+                return new PaceInvoiceSubmissionResult
+                {
+                    StatusCode = PaceInvoiceOutcomeStatus.Error,
+                    ErrorMessage = errorMessage
+                };
+            }
+
+            case BillBatchResolution.Unresolvable unresolvable:
+            {
+                var errorMessage = $"Pace invoice '{submission.Fields.InvoiceNumber}': {unresolvable.Reason}";
+                logger.LogError("{ErrorMessage} InvoiceId={InvoiceId}.", errorMessage, submission.InvoiceId);
+
+                return new PaceInvoiceSubmissionResult
+                {
+                    StatusCode = PaceInvoiceOutcomeStatus.Error,
+                    ErrorMessage = errorMessage
+                };
+            }
+
+            case BillBatchResolution.Resolved:
+                return null;
+
+            default:
+                throw new InvalidOperationException($"Unhandled {nameof(BillBatchResolution)} type '{batchResolution.GetType()}'.");
+        }
+    }
+
+    private async Task<(Bill? Bill, PaceInvoiceSubmissionResult? DuplicateResult)> TryCreateBillAsync(
+        PaceInvoiceSubmission submission,
+        string normalizedInvoiceNumber,
+        string? vendor,
+        int billBatchId,
+        int paymentPeriodId,
+        DateOnly batchDate,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var createdBill = await paceClient.CreateBillAsync(new Bill
+            {
+                BillBatch = billBatchId,
+                PaymentPeriod = paymentPeriodId,
+                Vendor = vendor,
+                InvoiceNumber = normalizedInvoiceNumber,
+                InvoiceDate = submission.Fields.InvoiceDate.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture),
+                BillType = "1",
+                BillStatus = 1,
+                PostingStatus = "Open",
+                InvoiceAmount = (double)submission.Fields.Total,
+                PoNumber = submission.Fields.CustomerPO,
+                Reference = submission.Fields.CustomerPO,
+                // Same date as the bill batch itself - the date this transaction is being entered into
+                // Pace, not the vendor's own invoice date (that's InvoiceDate above).
+                VoucherDate = batchDate.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture),
+                DateDue = submission.Fields.DueDate?.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture),
+                Terms = ResolvePaceTermsId(submission.Fields.Terms, submission.InvoiceId)
+            }, cancellationToken: cancellationToken);
+
+            return (createdBill, null);
+        }
+        catch (ApiException exception) when (IsDuplicateInvoiceError(exception))
+        {
+            var errorMessage = $"Pace invoice '{submission.Fields.InvoiceNumber}' for PO '{submission.Fields.CustomerPO}': Pace rejected createBill as a duplicate invoice for vendor {vendor}.";
+            logger.LogError("{ErrorMessage} InvoiceId={InvoiceId}.", errorMessage, submission.InvoiceId);
+
+            return (null, new PaceInvoiceSubmissionResult
+            {
+                StatusCode = PaceInvoiceOutcomeStatus.Error,
+                ResponseJson = SerializePaceException(exception),
+                ErrorMessage = errorMessage
+            });
+        }
+    }
+
+    private static bool IsDuplicateInvoiceError(ApiException exception) =>
+        exception.StatusCode == 500
+        && exception.Response is not null
+        && exception.Response.Contains("duplicate invoice", StringComparison.OrdinalIgnoreCase);
+
+    private int ResolvePaceTermsId(string? extractedTerms, long invoiceId)
+    {
+        var match = extractedTerms is null ? null : NetDaysRegex.Match(extractedTerms);
+
+        if (match is { Success: true }
+            && int.TryParse(match.Groups["days"].Value, out var days)
+            && PaceTermsIdByNetDays.TryGetValue(days, out var termsId))
+        {
+            return termsId;
+        }
+
+        logger.LogWarning(
+            "Invoice {InvoiceId}: extracted Terms '{ExtractedTerms}' did not map to a known Pace Terms id; " +
+            "falling back to the default ({DefaultTermsId}).",
+            invoiceId, extractedTerms, DefaultTermsId);
+
+        return DefaultTermsId;
+    }
+
     private async Task<PurchaseOrderLineLookup> LoadPurchaseOrderLinesOrNoPoAsync(PaceInvoiceSubmission submission, CancellationToken cancellationToken)
     {
         return new PurchaseOrderLineLookup(await LoadPurchaseOrderLinesAsync(submission.Fields.CustomerPO, cancellationToken), Result: null);
@@ -396,6 +787,8 @@ public sealed class PaceInvoiceService(
             ]
         }, cancellationToken);
 
+        var poVendor = rows.Count == 0 ? null : await LoadPurchaseOrderVendorAsync(pacePoNumber, cancellationToken);
+
         return rows
             .Select(fields => new PurchaseOrderLineValue(
                 GetRequiredInt(fields, "id"),
@@ -405,8 +798,57 @@ public sealed class PaceInvoiceService(
                 GetNullableInt(fields, "glDepartment"),
                 GetString(fields, "job"),
                 GetString(fields, "jobPart"),
-                GetString(fields, "activityCode")))
+                GetString(fields, "activityCode"),
+                poVendor))
             .ToList();
+    }
+
+    private async Task<string?> LoadPurchaseOrderVendorAsync(string pacePoNumber, CancellationToken cancellationToken)
+    {
+        var rows = await LoadAllValueObjectRowsAsync(new ValueObjectDescriptor
+        {
+            ObjectName = "PurchaseOrder",
+            XpathFilter = $"@poNumber = {XPathStringLiteral(pacePoNumber)}",
+            Fields =
+            [
+                Field("id", "@id"),
+                Field("vendor", "@vendor")
+            ]
+        }, cancellationToken);
+
+        if (rows.Count > 1)
+        {
+            logger.LogWarning(
+                "Pace PurchaseOrder query returned {PurchaseOrderCount} row(s) for PO {PoNumber}; using the first vendor.",
+                rows.Count,
+                pacePoNumber);
+        }
+
+        return rows.Count == 0 ? null : GetString(rows[0], "vendor");
+    }
+
+    private async Task<VendorDefaultCoding?> LoadVendorDefaultCodingByCodeAsync(string vendorCode, CancellationToken cancellationToken)
+    {
+        var trimmedVendorCode = vendorCode.Trim();
+
+        try
+        {
+            var vendor = await paceClient.ReadVendorAsync(trimmedVendorCode, cancellationToken: cancellationToken);
+
+            return new VendorDefaultCoding(
+                string.IsNullOrWhiteSpace(vendor.Id) ? trimmedVendorCode : vendor.Id,
+                string.IsNullOrWhiteSpace(vendor.Name) ? trimmedVendorCode : vendor.Name,
+                vendor.GlAccount,
+                vendor.GlDepartment);
+        }
+        catch (ApiException exception) when (exception.StatusCode == 404)
+        {
+            logger.LogError(
+                "Pace Vendor {VendorCode} was not found while loading the Pace vendor default GL account/department.",
+                trimmedVendorCode);
+
+            return null;
+        }
     }
 
     private async Task<List<BillValue>> LoadBillsByPaceVendoreAccountNumberAndInvoiceAsync(string paceVendoreAccountNumber, string invoiceNumber, CancellationToken cancellationToken)
@@ -543,7 +985,7 @@ public sealed class PaceInvoiceService(
                     throw new InvalidOperationException($"Pace returned no {descriptor.ObjectName} rows at offset {offset}, but reported {page.TotalRecords.Value} total record(s).");
                 }
 
-                return rows;
+                break;
             }
 
             foreach (var row in pageRows)
@@ -560,7 +1002,7 @@ public sealed class PaceInvoiceService(
 
             if (page.TotalRecords is not null && rows.Count >= page.TotalRecords.Value)
             {
-                return rows;
+                break;
             }
 
             if (pageRows.Count < PacePageSize)
@@ -570,11 +1012,19 @@ public sealed class PaceInvoiceService(
                     throw new InvalidOperationException($"Pace returned only {pageRows.Count} {descriptor.ObjectName} rows at offset {offset}, but reported {page.TotalRecords.Value} total record(s).");
                 }
 
-                return rows;
+                break;
             }
 
             offset += PacePageSize;
         }
+
+        logger.LogInformation(
+            "Pace {ObjectName} query returned {RowCount} row(s). XPathFilter={XPathFilter}.",
+            descriptor.ObjectName,
+            rows.Count,
+            descriptor.XpathFilter);
+
+        return rows;
     }
 
     private static FieldDescriptor Field(string name, string xpath) => new() { Name = name, Xpath = xpath };
@@ -629,31 +1079,8 @@ public sealed class PaceInvoiceService(
         return trimmed;
     }
 
-    private static string BuildPaceBillBatchDescription(DateOnly batchDate, PaceInvoiceSubmission submission) =>
-        $"{batchDate:MM_dd_yyyy}_{NormalizePaceCustomerAccountNumber(submission)}_{PaceBillBatchResolver.EnteredBy}";
-
-    private static string NormalizePaceCustomerAccountNumber(PaceInvoiceSubmission submission)
-    {
-        var accountNumber = FirstNonEmpty(
-            submission.Fields.CustomerNumber,
-            submission.Fields.OrderAccount,
-            submission.PaceVendoreAccountNumber);
-
-        if (accountNumber is null)
-        {
-            return "unknown";
-        }
-
-        var trimmed = accountNumber.Trim();
-        var dashIndex = trimmed.IndexOf('-', StringComparison.Ordinal);
-
-        return dashIndex > 0
-            ? trimmed[..dashIndex]
-            : trimmed;
-    }
-
-    private static string? FirstNonEmpty(params string?[] values) =>
-        values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value));
+    private static string BuildBillBatchDescription(DateOnly batchDate, string prefix) =>
+        $"{prefix} {batchDate.Month}-{batchDate.Day}-{batchDate:yy}";
 
     private static IEnumerable<IReadOnlyDictionary<string, object?>> ReadRows(ValueObjectsGroup group) =>
         group.ValueObjects?.Select(valueObject =>
@@ -833,7 +1260,7 @@ public sealed class PaceInvoiceService(
         public ApiException ApiException { get; } = apiException;
     }
 
-    private sealed record PurchaseOrderLineValue(int Id, decimal QtyReceived, bool InvoiceComplete, int? GlAccount, int? GlDepartment, string? Job, string? JobPart, string? ActivityCode);
+    private sealed record PurchaseOrderLineValue(int Id, decimal QtyReceived, bool InvoiceComplete, int? GlAccount, int? GlDepartment, string? Job, string? JobPart, string? ActivityCode, string? Vendor);
 
     private sealed record PurchaseOrderLineLookup(List<PurchaseOrderLineValue>? PurchaseOrderLines, PaceInvoiceSubmissionResult? Result);
 
@@ -842,6 +1269,8 @@ public sealed class PaceInvoiceService(
     private sealed record BillLineValue(int Id, int PurchaseOrderReceipt, string? Bill);
 
     private sealed record BillValue(int Id, string? Vendor, string? InvoiceNumber, string? PoNumber, string? BillBatch, string? PostingStatus);
+
+    private sealed record VendorDefaultCoding(string? Id, string Name, int? GlAccount, int? GlDepartment);
 
     private sealed record BillableReceipt(int PurchaseOrderReceipt, int PurchaseOrderLine, decimal InvoiceAmount, decimal PoQuantity, decimal PoUnitPrice, string? PoUom, int? GlAccount, int? GlDepartment, string? Job, string? JobPart, string? ActivityCode);
 }

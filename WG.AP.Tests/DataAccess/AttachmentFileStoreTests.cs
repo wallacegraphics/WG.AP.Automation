@@ -65,7 +65,7 @@ public class AttachmentFileStoreTests : IDisposable
         // explain exactly what input triggered it was deleted before this was investigated. This test
         // instead pins the underlying Path.GetDirectoryName behavior directly, so the guard clause in
         // SaveAsync remains explainable even without a working repro.
-        Assert.Null(Path.GetDirectoryName(@"\\server\share"));
+        Assert.True(string.IsNullOrEmpty(Path.GetDirectoryName(@"\\server\share")));
         Assert.Equal(string.Empty, Path.GetDirectoryName("bare-filename.pdf"));
     }
 

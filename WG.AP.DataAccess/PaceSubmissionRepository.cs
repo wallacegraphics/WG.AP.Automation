@@ -95,6 +95,8 @@ public sealed class PaceSubmissionRepository(
                    invoice.[InvoiceNumber],
                    invoice.[CustomerPO],
                    invoice.[Total],
+                   client.[Code] AS [ClientCode],
+                   client.[Name] AS [ClientName],
                    client.[PaceVendoreAccountNumber],
                    inserted.[PaceBillBatchId],
                    inserted.[PaceBillId],

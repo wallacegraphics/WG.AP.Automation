@@ -153,6 +153,7 @@ public sealed class PaceIntegrationTests
 
         Assert.Equal(PaceInvoiceOutcomeStatus.DryRunPrepared, result.StatusCode);
         Assert.False(result.IsTransient);
+        Assert.False(result.RequiresReview);
         Assert.Contains("billableReceipts", result.ResponseJson);
         Assert.Contains("144841", result.ResponseJson);
         Assert.Contains("222260", result.ResponseJson);
@@ -186,28 +187,34 @@ public sealed class PaceIntegrationTests
         var result = await service.SubmitAsync(NewSubmission(), CancellationToken.None);
 
         Assert.Equal(PaceInvoiceOutcomeStatus.Error, result.StatusCode);
-        Assert.Contains("not open for posting", result.ErrorMessage);
+        Assert.False(result.RequiresReview);
+        Assert.Contains("locked/closed", result.ErrorMessage);
+        Assert.Contains("2026-09-01", result.ErrorMessage);
         Assert.Contains("5201", result.ErrorMessage);
         Assert.False(createBillBatchCalled);
     }
 
     [Fact]
-    public async Task PaceInvoiceService_WithWriteEnabled_WhenNoExistingBatch_CreatesOne_AndReturnsErrorWithBatchIdUntilPR2()
+    public async Task PaceInvoiceService_WhenReadGLAccountingPeriodThrowsWithHttp200_ReturnsRetryLater_NotError()
     {
-        BillBatch? createdRequest = null;
+        var createBillBatchCalled = false;
         var client = new FakeWriteEnabledClient(_ => Task.FromResult(BillableInvoiceValueObjects(_.ObjectName!)))
         {
             OnFind = (type, _) => type switch
             {
                 "GLAccountingPeriod" => ["5201"],
-                "BillBatch" => [],
-                _ => throw new InvalidOperationException(type)
+                _ => throw new InvalidOperationException($"Unexpected FindAsync({type}) once the GL accounting period read has failed.")
             },
-            OnReadGlAccountingPeriod = _ => new GLAccountingPeriod { Id = 5201, GlPeriodStatus = "O" },
-            OnCreateBillBatch = request =>
+            OnReadGlAccountingPeriod = _ => throw new ApiException(
+                "Could not deserialize the response body stream as WG.AP.Integrations.Pace.Generated.GLAccountingPeriod.",
+                200,
+                "not valid json",
+                new Dictionary<string, IEnumerable<string>>(),
+                null),
+            OnCreateBillBatch = _ =>
             {
-                createdRequest = request;
-                return new BillBatch { Id = 16311 };
+                createBillBatchCalled = true;
+                throw new InvalidOperationException("CreateBillBatchAsync should not be called when the GL accounting period read failed.");
             }
         };
 
@@ -219,21 +226,164 @@ public sealed class PaceIntegrationTests
 
         var result = await service.SubmitAsync(NewSubmission(), CancellationToken.None);
 
-        Assert.Equal(PaceInvoiceOutcomeStatus.Error, result.StatusCode);
-        Assert.Contains("not implemented until PR 2", result.ErrorMessage);
+        Assert.Equal(PaceInvoiceOutcomeStatus.RetryLater, result.StatusCode);
+        Assert.True(result.IsTransient);
+        Assert.Contains("could not be parsed", result.ErrorMessage);
+        Assert.Contains("not valid json", result.ResponseJson);
+        Assert.False(createBillBatchCalled);
+    }
+
+    [Fact]
+    public async Task PaceInvoiceService_WithWriteEnabled_WhenNoExistingBatch_CreatesOneAndCreatesBillWithLines()
+    {
+        BillBatch? createdBatchRequest = null;
+        Bill? createdBillRequest = null;
+        ValueObjectDescriptor? purchaseOrderLineDescriptor = null;
+        string? glAccountingPeriodXpath = null;
+        var createdBillLineRequests = new List<BillLine>();
+        var client = new FakeWriteEnabledClient(_ =>
+        {
+            if (_.ObjectName == "PurchaseOrderLine")
+            {
+                purchaseOrderLineDescriptor = _;
+            }
+
+            return Task.FromResult(BillableInvoiceValueObjects(_.ObjectName!));
+        })
+        {
+            OnFind = (type, xpath) => type switch
+            {
+                "GLAccountingPeriod" => CaptureGlAccountingPeriodFind(xpath),
+                "BillBatch" => [],
+                _ => throw new InvalidOperationException(type)
+            },
+            OnReadGlAccountingPeriod = _ => new GLAccountingPeriod { Id = 5201, GlPeriodStatus = "O" },
+            OnCreateBillBatch = request =>
+            {
+                createdBatchRequest = request;
+                return new BillBatch { Id = 16311 };
+            },
+            OnCreateBill = request =>
+            {
+                createdBillRequest = request;
+                return new Bill { Id = 87835 };
+            },
+            OnCreateBillLine = request =>
+            {
+                createdBillLineRequests.Add(request!);
+                return new BillLine { Id = 900 + createdBillLineRequests.Count };
+            }
+        };
+
+        var service = new PaceInvoiceService(
+            client,
+            new PaceBillBatchResolver(client, NullLogger<PaceBillBatchResolver>.Instance),
+            Options.Create(WriteEnabledPaceOptions()),
+            NullLogger<PaceInvoiceService>.Instance);
+
+        var result = await service.SubmitAsync(NewSubmission(InvoiceFieldsJson.Replace("2026-09-01", "2026-08-10", StringComparison.Ordinal)), CancellationToken.None);
+
+        Assert.Equal(PaceInvoiceOutcomeStatus.BillCreated, result.StatusCode);
         Assert.Equal("16311", result.PaceBillBatchId);
-        Assert.NotNull(createdRequest);
-        Assert.Equal(5201, createdRequest!.GlAccountingPeriod);
-        Assert.Equal(DateOnly.FromDateTime(DateTime.Today).ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture), createdRequest.Date);
-        Assert.Equal($"{DateOnly.FromDateTime(DateTime.Today):MM_dd_yyyy}_76274_APAutomation", createdRequest.Description);
-        Assert.Equal(PaceBillBatchResolver.EnteredBy, createdRequest.EnteredBy);
-        Assert.Null(createdRequest.Manual);
+        Assert.Equal("87835", result.PaceBillId);
+        Assert.False(result.RequiresReview);
+
+        Assert.NotNull(createdBatchRequest);
+        Assert.Equal(5201, createdBatchRequest!.GlAccountingPeriod);
+        var invoiceDate = new DateOnly(2026, 8, 10);
+        var processingDate = DateOnly.FromDateTime(DateTime.Today);
+        Assert.Equal("@accountingPeriod = 8 and @fiscalYear = 2026", glAccountingPeriodXpath);
+        Assert.Equal(processingDate.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture), createdBatchRequest.Date);
+        Assert.Equal($"AUTO {processingDate.Month}-{processingDate.Day}-{processingDate:yy}", createdBatchRequest.Description);
+        Assert.Equal(PaceBillBatchResolver.EnteredBy, createdBatchRequest.EnteredBy);
+        Assert.True(createdBatchRequest.Manual);
+        Assert.NotNull(purchaseOrderLineDescriptor);
+        Assert.DoesNotContain(purchaseOrderLineDescriptor!.Fields!, field => string.Equals(field.Xpath, "@purchaseOrder/@vendor", StringComparison.OrdinalIgnoreCase));
+
+        Assert.NotNull(createdBillRequest);
+        Assert.Equal(16311, createdBillRequest!.BillBatch);
+        Assert.Equal(5201, createdBillRequest.PaymentPeriod);
+        // The PO's own vendor ("77000-0000"), not the client's configured PaceVendoreAccountNumber
+        // ("76274-0000") - proves the bill is linked to the vendor on the actual PO, not just config.
+        Assert.Equal("77000-0000", createdBillRequest.Vendor);
+        Assert.Equal("163939830", createdBillRequest.InvoiceNumber);
+        Assert.Equal("2887-2533", createdBillRequest.PoNumber);
+        Assert.Equal("Open", createdBillRequest.PostingStatus);
+
+        // Reference mirrors PoNumber; VoucherDate is the processing-date batch's own date;
+        // DateDue comes straight from the extracted invoice fields.
+        Assert.Equal("2887-2533", createdBillRequest.Reference);
+        Assert.Equal(processingDate.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture), createdBillRequest.VoucherDate);
+        Assert.Equal("2026-10-31", createdBillRequest.DateDue);
+
+        // Pace rejects createBill outright (HTTP 500, "terms, Value required") if this is left null -
+        // confirmed live against Pace staging on 2026-09-21. The fixture's Terms is "Net60" (see
+        // InvoiceFieldsJson below), which ResolvePaceTermsId maps to Pace's "Net 60 Days" id.
+        Assert.Equal(5010, createdBillRequest.Terms);
+
+        Assert.Single(createdBillLineRequests);
+        Assert.Equal(87835, createdBillLineRequests[0].Bill);
+        Assert.Equal(144841, createdBillLineRequests[0].PurchaseOrderReceipt);
+        Assert.Equal(5609, createdBillLineRequests[0].GlAccount);
+        Assert.Equal(5024, createdBillLineRequests[0].GlDepartment);
+        Assert.Equal("222260", createdBillLineRequests[0].Job);
+        Assert.Equal("05", createdBillLineRequests[0].JobPart);
+        Assert.Equal("13030", createdBillLineRequests[0].ActivityCode);
+
+        ICollection<string> CaptureGlAccountingPeriodFind(string xpath)
+        {
+            glAccountingPeriodXpath = xpath;
+            return ["5201"];
+        }
+    }
+
+    [Theory]
+    [InlineData("Net30", 1)]
+    [InlineData("Net60", 5010)]
+    [InlineData("Net90", 5018)]
+    [InlineData("COD", 5010)]
+    [InlineData("Net120", 5010)]
+    public async Task PaceInvoiceService_WithWriteEnabled_MapsExtractedTermsToPaceTermsId_FallingBackWhenUnmapped(string extractedTerms, int expectedPaceTermsId)
+    {
+        // "COD" (not a "NetNN" token at all) and "Net120" (a day count Pace has no plain entry for)
+        // both fall back to the same default as an invoice with no Terms extracted at all - the
+        // fallback exists precisely because not every value on a real invoice will map cleanly.
+        Bill? createdBillRequest = null;
+        var client = new FakeWriteEnabledClient(_ => Task.FromResult(BillableInvoiceValueObjects(_.ObjectName!)))
+        {
+            OnFind = (type, _) => type switch
+            {
+                "GLAccountingPeriod" => ["5201"],
+                "BillBatch" => [],
+                _ => throw new InvalidOperationException(type)
+            },
+            OnReadGlAccountingPeriod = _ => new GLAccountingPeriod { Id = 5201, GlPeriodStatus = "O" },
+            OnCreateBillBatch = _ => new BillBatch { Id = 16311 },
+            OnCreateBill = request =>
+            {
+                createdBillRequest = request;
+                return new Bill { Id = 87835 };
+            },
+            OnCreateBillLine = _ => new BillLine { Id = 901 }
+        };
+
+        var service = new PaceInvoiceService(
+            client,
+            new PaceBillBatchResolver(client, NullLogger<PaceBillBatchResolver>.Instance),
+            Options.Create(WriteEnabledPaceOptions()),
+            NullLogger<PaceInvoiceService>.Instance);
+
+        await service.SubmitAsync(NewSubmission(InvoiceFieldsJson.Replace("Net60", extractedTerms, StringComparison.Ordinal)), CancellationToken.None);
+
+        Assert.NotNull(createdBillRequest);
+        Assert.Equal(expectedPaceTermsId, createdBillRequest!.Terms);
     }
 
     [Fact]
     public async Task PaceInvoiceService_WithWriteEnabled_WhenExistingBatchFound_ReusesIt_AndNeverCreatesANewOne()
     {
         var createBillBatchCalled = false;
+        Bill? createdBillRequest = null;
         var client = new FakeWriteEnabledClient(_ => Task.FromResult(BillableInvoiceValueObjects(_.ObjectName!)))
         {
             OnFind = (type, _) => type switch
@@ -247,6 +397,60 @@ public sealed class PaceIntegrationTests
             {
                 createBillBatchCalled = true;
                 throw new InvalidOperationException("CreateBillBatchAsync should not be called when an open batch already exists.");
+            },
+            OnCreateBill = request =>
+            {
+                createdBillRequest = request;
+                return new Bill { Id = 87836 };
+            },
+            OnCreateBillLine = request => new BillLine { Id = 901 }
+        };
+
+        var service = new PaceInvoiceService(
+            client,
+            new PaceBillBatchResolver(client, NullLogger<PaceBillBatchResolver>.Instance),
+            Options.Create(WriteEnabledPaceOptions()),
+            NullLogger<PaceInvoiceService>.Instance);
+
+        var result = await service.SubmitAsync(NewSubmission(), CancellationToken.None);
+
+        Assert.Equal(PaceInvoiceOutcomeStatus.BillCreated, result.StatusCode);
+        Assert.Equal("16311", result.PaceBillBatchId);
+        Assert.False(createBillBatchCalled);
+        Assert.NotNull(createdBillRequest);
+        Assert.Equal(16311, createdBillRequest!.BillBatch);
+        Assert.Equal(5201, createdBillRequest.PaymentPeriod);
+    }
+
+    [Fact]
+    public async Task PaceInvoiceService_WithWriteEnabled_WhenNoPoFound_CreatesNoPoBillWithPaymentPeriod()
+    {
+        string? billBatchXpath = null;
+        Bill? createdBillRequest = null;
+        BillLine? createdBillLineRequest = null;
+        var client = new FakeWriteEnabledClient(_ => Task.FromResult(_.ObjectName switch
+        {
+            "Bill" => Group("Bill"),
+            "PurchaseOrderLine" => Group("PurchaseOrderLine"),
+            _ => throw new InvalidOperationException(_.ObjectName)
+        }))
+        {
+            OnFind = (type, xpath) => type switch
+            {
+                "GLAccountingPeriod" => ["5201"],
+                "BillBatch" => CaptureBillBatchFind(xpath),
+                _ => throw new InvalidOperationException(type)
+            },
+            OnReadGlAccountingPeriod = _ => new GLAccountingPeriod { Id = 5201, GlPeriodStatus = "O" },
+            OnCreateBill = request =>
+            {
+                createdBillRequest = request;
+                return new Bill { Id = 87837 };
+            },
+            OnCreateBillLine = request =>
+            {
+                createdBillLineRequest = request;
+                return new BillLine { Id = 902 };
             }
         };
 
@@ -258,14 +462,118 @@ public sealed class PaceIntegrationTests
 
         var result = await service.SubmitAsync(NewSubmission(), CancellationToken.None);
 
-        Assert.Equal(PaceInvoiceOutcomeStatus.Error, result.StatusCode);
-        Assert.Contains("not implemented until PR 2", result.ErrorMessage);
-        Assert.Equal("16311", result.PaceBillBatchId);
-        Assert.False(createBillBatchCalled);
+        Assert.Equal(PaceInvoiceOutcomeStatus.BillCreated, result.StatusCode);
+        Assert.Equal("16312", result.PaceBillBatchId);
+        Assert.True(result.RequiresReview);
+        Assert.Contains("AUTO ", billBatchXpath);
+        Assert.DoesNotContain("AUTO-NOPO", billBatchXpath);
+        Assert.NotNull(createdBillRequest);
+        Assert.Equal(16312, createdBillRequest!.BillBatch);
+        Assert.Equal(5201, createdBillRequest.PaymentPeriod);
+        Assert.Equal("SANMAR", createdBillRequest.Vendor);
+        Assert.NotNull(createdBillLineRequest);
+        Assert.Equal(87837, createdBillLineRequest!.Bill);
+        Assert.Null(createdBillLineRequest.PurchaseOrderReceipt);
+        Assert.Equal(40701, createdBillLineRequest.GlAccount);
+        Assert.Equal(655, createdBillLineRequest.GlDepartment);
+
+        ICollection<string> CaptureBillBatchFind(string xpath)
+        {
+            billBatchXpath = xpath;
+            return ["16312"];
+        }
     }
 
     [Fact]
-    public async Task PaceInvoiceService_WhenNoPoLines_ReturnsNoPo()
+    public async Task PaceInvoiceService_WithWriteEnabled_WhenNoPoVendorGlDefaultsMissing_ReturnsErrorAfterBillBatchResolution()
+    {
+        var createBillCalled = false;
+        string? billBatchXpath = null;
+        var client = new FakeWriteEnabledClient(_ => Task.FromResult(_.ObjectName switch
+        {
+            "Bill" => Group("Bill"),
+            "PurchaseOrderLine" => Group("PurchaseOrderLine"),
+            _ => throw new InvalidOperationException(_.ObjectName)
+        }))
+        {
+            OnFind = (type, xpath) => type switch
+            {
+                "GLAccountingPeriod" => ["5201"],
+                "BillBatch" => CaptureBillBatchFind(xpath),
+                _ => throw new InvalidOperationException(type)
+            },
+            OnReadGlAccountingPeriod = _ => new GLAccountingPeriod { Id = 5201, GlPeriodStatus = "O" },
+            OnReadVendor = _ => new Vendor { Id = "SANMAR", Name = "SANMAR" },
+            OnCreateBill = _ =>
+            {
+                createBillCalled = true;
+                throw new InvalidOperationException("CreateBillAsync should not be called when vendor GL defaults are missing.");
+            }
+        };
+
+        var service = new PaceInvoiceService(
+            client,
+            new PaceBillBatchResolver(client, NullLogger<PaceBillBatchResolver>.Instance),
+            Options.Create(new PaceOptions
+            {
+                BaseUrl = "https://pacestaging.wallacegraphics.com",
+                UserName = "pace-user",
+                Password = "pace-password",
+                WriteEnabled = true
+            }),
+            NullLogger<PaceInvoiceService>.Instance);
+
+        var result = await service.SubmitAsync(NewSubmission(), CancellationToken.None);
+
+        Assert.Equal(PaceInvoiceOutcomeStatus.Error, result.StatusCode);
+        Assert.True(result.RequiresReview);
+        Assert.Contains("default GL account/department", result.ErrorMessage);
+        Assert.Contains("AUTO ", billBatchXpath);
+        Assert.DoesNotContain("AUTO-NOPO", billBatchXpath);
+        Assert.False(createBillCalled);
+
+        ICollection<string> CaptureBillBatchFind(string xpath)
+        {
+            billBatchXpath = xpath;
+            return ["16312"];
+        }
+    }
+
+    [Fact]
+    public async Task PaceInvoiceService_WithWriteEnabled_WhenCreateBillReturnsDuplicateInvoice500_ReturnsError()
+    {
+        var client = new FakeWriteEnabledClient(_ => Task.FromResult(BillableInvoiceValueObjects(_.ObjectName!)))
+        {
+            OnFind = (type, _) => type switch
+            {
+                "GLAccountingPeriod" => ["5201"],
+                "BillBatch" => ["16311"],
+                _ => throw new InvalidOperationException(type)
+            },
+            OnReadGlAccountingPeriod = _ => new GLAccountingPeriod { Id = 5201, GlPeriodStatus = "T" },
+            OnCreateBill = _ => throw new ApiException(
+                "Cannot enter duplicate invoice numbers for the same vendor.",
+                500,
+                "Cannot enter duplicate invoice numbers for the same vendor.",
+                new Dictionary<string, IEnumerable<string>>(),
+                null)
+        };
+
+        var service = new PaceInvoiceService(
+            client,
+            new PaceBillBatchResolver(client, NullLogger<PaceBillBatchResolver>.Instance),
+            Options.Create(WriteEnabledPaceOptions()),
+            NullLogger<PaceInvoiceService>.Instance);
+
+        var result = await service.SubmitAsync(NewSubmission(), CancellationToken.None);
+
+        Assert.Equal(PaceInvoiceOutcomeStatus.Error, result.StatusCode);
+        Assert.False(result.IsTransient);
+        Assert.Contains("duplicate invoice", result.ErrorMessage);
+    }
+
+    [Fact]
+    public async Task PaceInvoiceService_WhenNoPoLines_AndWriteDisabled_ReturnsDryRunPrepared()
     {
         var service = new PaceInvoiceService(
             new FakePaceClient(_ => Task.FromResult(Group(_.ObjectName!))),
@@ -275,8 +583,75 @@ public sealed class PaceIntegrationTests
 
         var result = await service.SubmitAsync(NewSubmission(), CancellationToken.None);
 
-        Assert.Equal(PaceInvoiceOutcomeStatus.NoPo, result.StatusCode);
+        Assert.Equal(PaceInvoiceOutcomeStatus.DryRunPrepared, result.StatusCode);
+        Assert.True(result.RequiresReview);
         Assert.Contains("2887-2533", result.ResponseJson);
+    }
+
+    [Fact]
+    public async Task PaceInvoiceService_WhenNoPoLines_AndWriteEnabled_CreatesBillWithVendorDefaultGlCoding()
+    {
+        BillBatch? createdBatchRequest = null;
+        Bill? createdBillRequest = null;
+        BillLine? createdBillLineRequest = null;
+        var client = new FakeWriteEnabledClient(_ => Task.FromResult(Group(_.ObjectName!)))
+        {
+            OnFind = (type, _) => type switch
+            {
+                "GLAccountingPeriod" => ["5201"],
+                "BillBatch" => [],
+                _ => throw new InvalidOperationException(type)
+            },
+            OnReadGlAccountingPeriod = _ => new GLAccountingPeriod { Id = 5201, GlPeriodStatus = "O" },
+            OnCreateBillBatch = request =>
+            {
+                createdBatchRequest = request;
+                return new BillBatch { Id = 16400 };
+            },
+            OnCreateBill = request =>
+            {
+                createdBillRequest = request;
+                return new Bill { Id = 88001 };
+            },
+            OnCreateBillLine = request =>
+            {
+                createdBillLineRequest = request;
+                return new BillLine { Id = 950 };
+            }
+        };
+
+        var service = new PaceInvoiceService(
+            client,
+            new PaceBillBatchResolver(client, NullLogger<PaceBillBatchResolver>.Instance),
+            Options.Create(WriteEnabledPaceOptions()),
+            NullLogger<PaceInvoiceService>.Instance);
+
+        var result = await service.SubmitAsync(NewSubmission(), CancellationToken.None);
+
+        Assert.Equal(PaceInvoiceOutcomeStatus.BillCreated, result.StatusCode);
+        Assert.Equal("16400", result.PaceBillBatchId);
+        Assert.Equal("88001", result.PaceBillId);
+        Assert.Equal("950", result.PaceBillLineId);
+        Assert.True(result.RequiresReview);
+
+        Assert.NotNull(createdBatchRequest);
+        var processingDate = DateOnly.FromDateTime(DateTime.Today);
+        Assert.Equal(processingDate.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture), createdBatchRequest!.Date);
+        Assert.Equal($"AUTO {processingDate.Month}-{processingDate.Day}-{processingDate:yy}", createdBatchRequest.Description);
+        Assert.True(createdBatchRequest.Manual);
+
+        Assert.NotNull(createdBillRequest);
+        Assert.Equal(16400, createdBillRequest!.BillBatch);
+        Assert.Equal("SANMAR", createdBillRequest.Vendor);
+        Assert.Equal("163939830", createdBillRequest.InvoiceNumber);
+        Assert.Equal("2887-2533", createdBillRequest.PoNumber);
+
+        Assert.NotNull(createdBillLineRequest);
+        Assert.Equal(88001, createdBillLineRequest!.Bill);
+        Assert.Null(createdBillLineRequest.PurchaseOrderReceipt);
+        Assert.Equal(40701, createdBillLineRequest.GlAccount);
+        Assert.Equal(655, createdBillLineRequest.GlDepartment);
+        Assert.Equal(77253.12, createdBillLineRequest.InvoiceAmount!.Value, precision: 2);
     }
 
     [Fact]
@@ -299,7 +674,7 @@ public sealed class PaceIntegrationTests
 
         var result = await service.SubmitAsync(NewSubmission(InvoiceFieldsJson.Replace("2887-2533", "ABC'123", StringComparison.Ordinal)), CancellationToken.None);
 
-        Assert.Equal(PaceInvoiceOutcomeStatus.NoPo, result.StatusCode);
+        Assert.Equal(PaceInvoiceOutcomeStatus.DryRunPrepared, result.StatusCode);
         Assert.Equal("@purchaseOrder/@poNumber = \"ABC'123\"", purchaseOrderLineDescriptor?.XpathFilter);
     }
 
@@ -323,7 +698,7 @@ public sealed class PaceIntegrationTests
 
         var result = await service.SubmitAsync(NewSubmission(InvoiceFieldsJson.Replace("2887-2533", "60119-COBB-3921", StringComparison.Ordinal)), CancellationToken.None);
 
-        Assert.Equal(PaceInvoiceOutcomeStatus.NoPo, result.StatusCode);
+        Assert.Equal(PaceInvoiceOutcomeStatus.DryRunPrepared, result.StatusCode);
         Assert.Equal("@purchaseOrder/@poNumber = '60119'", purchaseOrderLineDescriptor?.XpathFilter);
     }
 
@@ -347,7 +722,7 @@ public sealed class PaceIntegrationTests
 
         var result = await service.SubmitAsync(NewSubmission(InvoiceFieldsJson.Replace("2887-2533", "2702-2225 Cobb Nutri Team", StringComparison.Ordinal)), CancellationToken.None);
 
-        Assert.Equal(PaceInvoiceOutcomeStatus.NoPo, result.StatusCode);
+        Assert.Equal(PaceInvoiceOutcomeStatus.DryRunPrepared, result.StatusCode);
         Assert.Equal("@purchaseOrder/@poNumber = 'CS2225'", purchaseOrderLineDescriptor?.XpathFilter);
     }
 
@@ -364,7 +739,7 @@ public sealed class PaceIntegrationTests
 
         var result = await service.SubmitAsync(NewSubmission(), CancellationToken.None);
 
-        Assert.Equal(PaceInvoiceOutcomeStatus.Error, result.StatusCode);
+        Assert.Equal(PaceInvoiceOutcomeStatus.PoNotReceived, result.StatusCode);
         Assert.Contains("no received PO lines", result.ErrorMessage);
         Assert.Contains("INV-163939830", result.ErrorMessage);
         Assert.Contains("2887-2533", result.ErrorMessage);
@@ -612,7 +987,7 @@ public sealed class PaceIntegrationTests
 
         var result = await service.SubmitAsync(NewSubmission(InvoiceFieldsJson.Replace("INV-163939830", "INV 163-939-830", StringComparison.Ordinal)), CancellationToken.None);
 
-        Assert.Equal(PaceInvoiceOutcomeStatus.Error, result.StatusCode);
+        Assert.Equal(PaceInvoiceOutcomeStatus.PoNotReceived, result.StatusCode);
         Assert.Equal("@vendor = '76274-0000' and @invoiceNumber = '163939830'", billDescriptor?.XpathFilter);
     }
 
@@ -646,7 +1021,7 @@ public sealed class PaceIntegrationTests
 
         var result = await service.SubmitAsync(NewSubmission(), CancellationToken.None);
 
-        Assert.Equal(PaceInvoiceOutcomeStatus.Error, result.StatusCode);
+        Assert.Equal(PaceInvoiceOutcomeStatus.PoNotReceived, result.StatusCode);
         Assert.True(purchaseOrderLineLookupCalled);
         Assert.DoesNotContain("was not found using normalized invoice number", result.ErrorMessage);
     }
@@ -882,25 +1257,96 @@ public sealed class PaceIntegrationTests
     {
         "PurchaseOrderLine" => Group("PurchaseOrderLine",
             Row(("id", 163108), ("qtyReceived", 1), ("glAccount", 5609), ("glDepartment", 5024), ("job", "222260"), ("jobPart", "05"), ("activityCode", "13030"))),
+        "PurchaseOrder" => Group("PurchaseOrder",
+            Row(("id", 1234), ("vendor", "77000-0000"))),
         "PurchaseOrderReceipt" => Group("PurchaseOrderReceipt",
             Row(("id", 144841), ("purchaseOrderLine", 163108), ("quantity", 1), ("unitCost", 77253.12m), ("extendedPrice", 77253.12m), ("stockingUOM", "EA"))),
         "BillLine" => Group("BillLine"),
         "Bill" => Group("Bill"),
+        "BillBatch" => Group("BillBatch", Row(("id", 16296))),
         _ => throw new InvalidOperationException(objectName)
     };
+
+    private static ValueObjectsGroup DefaultPurchaseOrderValueObjects() =>
+        Group("PurchaseOrder", Row(("id", 1234), ("vendor", "77000-0000")));
 
     private static PaceInvoiceSubmission NewSubmission(string fieldsJson = InvoiceFieldsJson, string? paceVendoreAccountNumber = "76274-0000") =>
         new()
         {
             InvoiceId = 42,
+            ClientCode = "SANMAR",
+            ClientName = "SanMar",
             PaceVendoreAccountNumber = paceVendoreAccountNumber,
             Fields = PaceInvoiceFieldsParser.Parse(fieldsJson)
         };
 
+    [Fact]
+    public void PaceClient_JsonSerializerSettings_AllowsQuotedNumbersOnGeneratedTypes()
+    {
+        var settings = new SettingsExposingClient().ExposedJsonSerializerSettings;
+
+        var period = System.Text.Json.JsonSerializer.Deserialize<GLAccountingPeriod>(
+            """{"accountingPeriod":"9","fiscalYear":"2026","glPeriodStatus":"O"}""",
+            settings);
+
+        Assert.Equal(9, period!.AccountingPeriod);
+        Assert.Equal(2026, period.FiscalYear);
+        Assert.Equal("O", period.GlPeriodStatus);
+    }
+
+    [Fact]
+    public void PaceClient_JsonSerializerSettings_ParsesPaceGmtLastModifiedFormat()
+    {
+        var settings = new SettingsExposingClient().ExposedJsonSerializerSettings;
+
+        // The exact payload Pace staging returned for readGLAccountingPeriod?primaryKey=5203, which
+        // failed to deserialize before PaceDateTimeOffsetConverter was added: lastModified is
+        // "2025-12-29T18:57:36GMT-05:00" - a literal "GMT" between the time and the offset that .NET's
+        // built-in ISO-8601 DateTimeOffset parser rejects.
+        var period = System.Text.Json.JsonSerializer.Deserialize<GLAccountingPeriod>(
+            """
+            {"tags":null,"templateLine":0,"sourceOrganizationCompany":null,"ioID":null,"periodString":"09","id":5203,"lastModified":"2025-12-29T18:57:36GMT-05:00","month":null,"startDate":"2026-09-01","notes":null,"glPeriodStatus":"O","closingPeriod":false,"endDate":"2026-09-30","periodTitle":null,"mustRunTBPeriod":false,"accountingPeriod":9,"fiscalYear":2026}
+            """,
+            settings);
+
+        Assert.Equal(5203, period!.Id);
+        Assert.Equal("O", period.GlPeriodStatus);
+        Assert.Equal(new DateTimeOffset(2025, 12, 29, 18, 57, 36, TimeSpan.FromHours(-5)), period.LastModified);
+    }
+
+    [Fact]
+    public void PaceClient_JsonSerializerSettings_OmitsNullGeneratedPropertiesOnCreatePayloads()
+    {
+        var settings = new SettingsExposingClient().ExposedJsonSerializerSettings;
+
+        var json = System.Text.Json.JsonSerializer.Serialize(new Bill
+        {
+            BillBatch = 16297,
+            Vendor = "SANMAR",
+            InvoiceNumber = "163773573"
+        }, settings);
+
+        Assert.DoesNotContain("\"id\"", json);
+        Assert.DoesNotContain(":null", json);
+        Assert.Contains("\"billBatch\":16297", json);
+        Assert.Contains("\"vendor\":\"SANMAR\"", json);
+        Assert.Contains("\"invoiceNumber\":\"163773573\"", json);
+    }
+
+    private sealed class SettingsExposingClient() : PaceClient(new HttpClient())
+    {
+        public System.Text.Json.JsonSerializerOptions ExposedJsonSerializerSettings => JsonSerializerSettings;
+    }
+
     private sealed class FakePaceClient(Func<ValueObjectDescriptor, Task<ValueObjectsGroup>> loadValueObjects) : PaceClient(new HttpClient())
     {
+        public Func<string, Vendor>? OnReadVendor { get; set; }
+
         public override Task<ValueObjectsGroup> LoadValueObjectsAsync(ValueObjectDescriptor? valueObjectDescriptor = null, string? txnId = null, CancellationToken cancellationToken = default) =>
-            loadValueObjects(valueObjectDescriptor ?? new ValueObjectDescriptor());
+            LoadValueObjectsOrDefaultPurchaseOrder(loadValueObjects, valueObjectDescriptor ?? new ValueObjectDescriptor());
+
+        public override Task<Vendor> ReadVendorAsync(string primaryKey, string? txnId = null, CancellationToken cancellationToken = default) =>
+            Task.FromResult(OnReadVendor is null ? VendorDefault(primaryKey) : OnReadVendor(primaryKey));
     }
 
     private sealed class FakeWriteEnabledClient(Func<ValueObjectDescriptor, Task<ValueObjectsGroup>> loadValueObjects) : PaceClient(new HttpClient())
@@ -909,10 +1355,16 @@ public sealed class PaceIntegrationTests
 
         public Func<string, GLAccountingPeriod>? OnReadGlAccountingPeriod { get; set; }
 
+        public Func<string, Vendor>? OnReadVendor { get; set; }
+
         public Func<BillBatch?, BillBatch>? OnCreateBillBatch { get; set; }
 
+        public Func<Bill?, Bill>? OnCreateBill { get; set; }
+
+        public Func<BillLine?, BillLine>? OnCreateBillLine { get; set; }
+
         public override Task<ValueObjectsGroup> LoadValueObjectsAsync(ValueObjectDescriptor? valueObjectDescriptor = null, string? txnId = null, CancellationToken cancellationToken = default) =>
-            loadValueObjects(valueObjectDescriptor ?? new ValueObjectDescriptor());
+            LoadValueObjectsOrDefaultPurchaseOrder(loadValueObjects, valueObjectDescriptor ?? new ValueObjectDescriptor());
 
         public override Task<ICollection<string>> FindAsync(string type, string xpath, string? txnId = null, CancellationToken cancellationToken = default) =>
             Task.FromResult(OnFind is null ? throw new InvalidOperationException($"Unexpected FindAsync({type}).") : OnFind(type, xpath));
@@ -920,9 +1372,37 @@ public sealed class PaceIntegrationTests
         public override Task<GLAccountingPeriod> ReadGLAccountingPeriodAsync(string primaryKey, string? txnId = null, CancellationToken cancellationToken = default) =>
             Task.FromResult(OnReadGlAccountingPeriod is null ? throw new InvalidOperationException("Unexpected ReadGLAccountingPeriodAsync.") : OnReadGlAccountingPeriod(primaryKey));
 
+        public override Task<Vendor> ReadVendorAsync(string primaryKey, string? txnId = null, CancellationToken cancellationToken = default) =>
+            Task.FromResult(OnReadVendor is null ? VendorDefault(primaryKey) : OnReadVendor(primaryKey));
+
         public override Task<BillBatch> CreateBillBatchAsync(BillBatch? billBatch = null, string? txnId = null, CancellationToken cancellationToken = default) =>
             Task.FromResult(OnCreateBillBatch is null ? throw new InvalidOperationException("Unexpected CreateBillBatchAsync.") : OnCreateBillBatch(billBatch));
+
+        public override Task<Bill> CreateBillAsync(Bill? bill = null, string? txnId = null, CancellationToken cancellationToken = default) =>
+            OnCreateBill is null
+                ? throw new InvalidOperationException("Unexpected CreateBillAsync.")
+                : Task.FromResult(OnCreateBill(bill));
+
+        public override Task<BillLine> CreateBillLineAsync(BillLine? billLine = null, string? txnId = null, CancellationToken cancellationToken = default) =>
+            OnCreateBillLine is null
+                ? throw new InvalidOperationException("Unexpected CreateBillLineAsync.")
+                : Task.FromResult(OnCreateBillLine(billLine));
     }
+
+    private static Task<ValueObjectsGroup> LoadValueObjectsOrDefaultPurchaseOrder(Func<ValueObjectDescriptor, Task<ValueObjectsGroup>> loadValueObjects, ValueObjectDescriptor descriptor)
+    {
+        try
+        {
+            return loadValueObjects(descriptor);
+        }
+        catch (InvalidOperationException) when (string.Equals(descriptor.ObjectName, "PurchaseOrder", StringComparison.OrdinalIgnoreCase))
+        {
+            return Task.FromResult(DefaultPurchaseOrderValueObjects());
+        }
+    }
+
+    private static Vendor VendorDefault(string primaryKey) =>
+        new() { Id = primaryKey, Name = primaryKey, GlAccount = 40701, GlDepartment = 655 };
 
     private static ValueObjectsGroup Group(string objectName, params ValueObject[] rows) =>
         Group(objectName, rows.Length, rows);

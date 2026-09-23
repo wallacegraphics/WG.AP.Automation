@@ -44,7 +44,12 @@ public static class PaceServiceCollectionExtensions
 
             return new PaceClient(httpClientFactory.CreateClient(HttpClientName))
             {
-                BaseUrl = BuildPaceServiceBaseUrl(options.BaseUrl)
+                BaseUrl = BuildPaceServiceBaseUrl(options.BaseUrl),
+                // Default (false) reads the response as a stream and, on a JsonException, throws
+                // ApiException with Response = string.Empty - discarding whatever Pace actually sent.
+                // True reads it as a string first, so a deserialization failure still preserves the
+                // real body for logging/alerting instead of an empty "Response: " that can't be diagnosed.
+                ReadResponseAsString = true
             };
         });
 
