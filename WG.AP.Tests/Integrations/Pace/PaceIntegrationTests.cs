@@ -234,6 +234,77 @@ public sealed class PaceIntegrationTests
     }
 
     [Fact]
+    public async Task PaceInvoiceService_WithWriteEnabled_WhenBillExistsUnderPoVendor_ReturnsAlreadyEnteredAndDoesNotCreateBill()
+    {
+        var createBillCalled = false;
+        var client = new FakeWriteEnabledClient(descriptor => Task.FromResult(
+            descriptor.ObjectName == "Bill" && descriptor.XpathFilter!.Contains("77000-0000", StringComparison.Ordinal)
+                ? Group("Bill", Row(("id", 55555), ("vendor", "77000-0000"), ("invoiceNumber", "163939830"), ("billBatch", "16296"), ("postingStatus", "Open")))
+                : BillableInvoiceValueObjects(descriptor.ObjectName!)))
+        {
+            OnFind = (type, _) => type switch
+            {
+                "GLAccountingPeriod" => ["5201"],
+                "BillBatch" => ["16296"],
+                _ => throw new InvalidOperationException(type)
+            },
+            OnReadGlAccountingPeriod = _ => new GLAccountingPeriod { Id = 5201, GlPeriodStatus = "O" },
+            OnCreateBill = _ =>
+            {
+                createBillCalled = true;
+                return new Bill { Id = 1 };
+            }
+        };
+
+        var service = new PaceInvoiceService(
+            client,
+            new PaceBillBatchResolver(client, NullLogger<PaceBillBatchResolver>.Instance),
+            Options.Create(WriteEnabledPaceOptions()),
+            NullLogger<PaceInvoiceService>.Instance);
+
+        var result = await service.SubmitAsync(NewSubmission(), CancellationToken.None);
+
+        Assert.Equal(PaceInvoiceOutcomeStatus.AlreadyEntered, result.StatusCode);
+        Assert.Equal("55555", result.PaceBillId);
+        Assert.False(createBillCalled);
+    }
+
+    [Fact]
+    public async Task PaceInvoiceService_WithWriteEnabled_WhenPurchaseOrderHasNoVendor_ReturnsErrorAndDoesNotCreateBill()
+    {
+        var createBillCalled = false;
+        var client = new FakeWriteEnabledClient(descriptor => Task.FromResult(descriptor.ObjectName == "PurchaseOrder"
+            ? Group("PurchaseOrder", Row(("id", 1234)))
+            : BillableInvoiceValueObjects(descriptor.ObjectName!)))
+        {
+            OnFind = (type, _) => type switch
+            {
+                "GLAccountingPeriod" => ["5201"],
+                "BillBatch" => ["16296"],
+                _ => throw new InvalidOperationException(type)
+            },
+            OnReadGlAccountingPeriod = _ => new GLAccountingPeriod { Id = 5201, GlPeriodStatus = "O" },
+            OnCreateBill = _ =>
+            {
+                createBillCalled = true;
+                return new Bill { Id = 1 };
+            }
+        };
+
+        var service = new PaceInvoiceService(
+            client,
+            new PaceBillBatchResolver(client, NullLogger<PaceBillBatchResolver>.Instance),
+            Options.Create(WriteEnabledPaceOptions()),
+            NullLogger<PaceInvoiceService>.Instance);
+
+        var result = await service.SubmitAsync(NewSubmission(), CancellationToken.None);
+
+        Assert.Equal(PaceInvoiceOutcomeStatus.Error, result.StatusCode);
+        Assert.Contains("has no vendor", result.ErrorMessage);
+        Assert.False(createBillCalled);
+    }
+
+    [Fact]
     public async Task PaceInvoiceService_WithWriteEnabled_WhenNoExistingBatch_CreatesOneAndCreatesBillWithLines()
     {
         BillBatch? createdBatchRequest = null;
@@ -778,6 +849,7 @@ public sealed class PaceIntegrationTests
             {
                 "PurchaseOrderLine" => Group("PurchaseOrderLine", Row(("id", 163108), ("qtyReceived", 1))),
                 "PurchaseOrderReceipt" => Group("PurchaseOrderReceipt"),
+                "PurchaseOrder" => DefaultPurchaseOrderValueObjects(),
                 _ => Group(_.ObjectName!)
             })),
             UnusedBillBatchResolver,
@@ -1153,6 +1225,7 @@ public sealed class PaceIntegrationTests
             {
                 "PurchaseOrderLine" => Task.FromResult(Group("PurchaseOrderLine", Row(("id", 163108), ("qtyReceived", 1)))),
                 "PurchaseOrderReceipt" => Task.FromException<ValueObjectsGroup>(exception),
+                "PurchaseOrder" => Task.FromResult(DefaultPurchaseOrderValueObjects()),
                 _ => Task.FromResult(Group(_.ObjectName!))
             }),
             UnusedBillBatchResolver,

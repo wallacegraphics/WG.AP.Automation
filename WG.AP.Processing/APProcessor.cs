@@ -662,12 +662,36 @@ public sealed class APProcessor(
         var duplicate = await mailAttachmentRepository.FindDuplicateByHashAsync(mailAttachmentId, sha256, cancellationToken);
 
         // duplicate.StoredPath is never null here - see the invariant note on DuplicateAttachmentMatch.
-        var storedPath = duplicate?.StoredPath
-            ?? (await attachmentFileStore.SaveAsync(mailAttachmentId, fileName, receivedOn, content, cancellationToken)).RelativePath;
+        // Only share the duplicate's file if it is still there and intact; otherwise this row keeps its
+        // own copy of the bytes just fetched, so it never records a path to a missing/damaged file.
+        var storedPath = duplicate is not null && await IsReusableStoredFileAsync(duplicate.StoredPath, sha256, cancellationToken)
+            ? duplicate.StoredPath
+            : (await attachmentFileStore.SaveAsync(mailAttachmentId, fileName, receivedOn, content, cancellationToken)).RelativePath;
 
         await mailAttachmentRepository.SetStoredAsync(mailAttachmentId, storedPath, sha256, cancellationToken);
 
         return (storedPath, sha256, duplicate);
+    }
+
+    private async Task<bool> IsReusableStoredFileAsync(string storedPath, byte[] sha256, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var existing = await attachmentFileStore.LoadAsync(storedPath, cancellationToken);
+
+            if (StoredBytesMatchRecordedHash(existing, sha256))
+            {
+                return true;
+            }
+
+            logger.LogWarning("Duplicate attachment file {StoredPath} no longer matches its recorded SHA-256; storing a fresh copy instead of reusing it.", storedPath);
+        }
+        catch (Exception exception) when (exception is FileNotFoundException or DirectoryNotFoundException)
+        {
+            logger.LogWarning(exception, "Duplicate attachment file {StoredPath} is missing; storing a fresh copy instead of reusing it.", storedPath);
+        }
+
+        return false;
     }
 
     /// <summary>
