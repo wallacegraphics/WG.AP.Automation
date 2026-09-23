@@ -13,14 +13,14 @@ SET NOCOUNT ON;
 DECLARE @Client TABLE
 (
     ClientId                   INT           NOT NULL PRIMARY KEY,
-    PaceVendoreAccountNumber   NVARCHAR(50)  NULL,
+    PaceVendorAccountNumber   NVARCHAR(50)  NULL,
     Code                       VARCHAR(30)   NOT NULL,
     Name                       NVARCHAR(200) NOT NULL,
     EmailDomain                NVARCHAR(200) NULL,
     IsEnabled                  BIT           NOT NULL
 );
 
-INSERT INTO @Client (ClientId, PaceVendoreAccountNumber, Code, Name, EmailDomain, IsEnabled)
+INSERT INTO @Client (ClientId, PaceVendorAccountNumber, Code, Name, EmailDomain, IsEnabled)
 VALUES
     -- The sentinel for "sender domain matched no client". Never enabled, no domain, and
     -- excluded from UQ_Invoice_ClientNumber so unknown-client invoice numbers cannot
@@ -32,12 +32,12 @@ MERGE [dbo].[Client] AS target
 USING @Client AS source
     ON target.[ClientId] = source.[ClientId]
 WHEN MATCHED AND (target.[Code] <> source.[Code]
-               OR ISNULL(target.[PaceVendoreAccountNumber], N'') <> ISNULL(source.[PaceVendoreAccountNumber], N'')
+               OR ISNULL(target.[PaceVendorAccountNumber], N'') <> ISNULL(source.[PaceVendorAccountNumber], N'')
                OR target.[Name] <> source.[Name]
                OR ISNULL(target.[EmailDomain], N'')  <> ISNULL(source.[EmailDomain], N'')
                OR target.[IsEnabled] <> source.[IsEnabled])
     THEN UPDATE SET
-        target.[PaceVendoreAccountNumber] = source.[PaceVendoreAccountNumber],
+        target.[PaceVendorAccountNumber] = source.[PaceVendorAccountNumber],
         target.[Code]        = source.[Code],
         target.[Name]        = source.[Name],
         target.[EmailDomain] = source.[EmailDomain],
@@ -45,8 +45,8 @@ WHEN MATCHED AND (target.[Code] <> source.[Code]
         target.[ModifiedBy]  = SUSER_SNAME(),
         target.[ModifiedOn]  = SYSUTCDATETIME()
 WHEN NOT MATCHED BY TARGET
-    THEN INSERT ([ClientId], [PaceVendoreAccountNumber], [Code], [Name], [EmailDomain], [IsEnabled])
-         VALUES (source.[ClientId], source.[PaceVendoreAccountNumber], source.[Code], source.[Name],
+    THEN INSERT ([ClientId], [PaceVendorAccountNumber], [Code], [Name], [EmailDomain], [IsEnabled])
+         VALUES (source.[ClientId], source.[PaceVendorAccountNumber], source.[Code], source.[Name],
                  source.[EmailDomain], source.[IsEnabled]);
 
 DECLARE @ClientCount INT = (SELECT COUNT(*) FROM [dbo].[Client]);

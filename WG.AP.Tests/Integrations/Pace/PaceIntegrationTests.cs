@@ -303,7 +303,7 @@ public sealed class PaceIntegrationTests
         Assert.NotNull(createdBillRequest);
         Assert.Equal(16311, createdBillRequest!.BillBatch);
         Assert.Equal(5201, createdBillRequest.PaymentPeriod);
-        // The PO's own vendor ("77000-0000"), not the client's configured PaceVendoreAccountNumber
+        // The PO's own vendor ("77000-0000"), not the client's configured PaceVendorAccountNumber
         // ("76274-0000") - proves the bill is linked to the vendor on the actual PO, not just config.
         Assert.Equal("77000-0000", createdBillRequest.Vendor);
         Assert.Equal("163939830", createdBillRequest.InvoiceNumber);
@@ -1079,7 +1079,7 @@ public sealed class PaceIntegrationTests
     }
 
     [Fact]
-    public async Task PaceInvoiceService_WhenPaceVendoreAccountNumberIsMissing_ReturnsErrorBeforeDuplicateProbe()
+    public async Task PaceInvoiceService_WhenPaceVendorAccountNumberIsMissing_ReturnsErrorBeforeDuplicateProbe()
     {
         var billLookupCalled = false;
         var service = new PaceInvoiceService(
@@ -1103,7 +1103,7 @@ public sealed class PaceIntegrationTests
             Options.Create(NewPaceOptions()),
             NullLogger<PaceInvoiceService>.Instance);
 
-        var result = await service.SubmitAsync(NewSubmission(paceVendoreAccountNumber: null), CancellationToken.None);
+        var result = await service.SubmitAsync(NewSubmission(paceVendorAccountNumber: null), CancellationToken.None);
 
         Assert.Equal(PaceInvoiceOutcomeStatus.Error, result.StatusCode);
         Assert.Contains("Pace vendor account number", result.ErrorMessage);
@@ -1292,13 +1292,13 @@ public sealed class PaceIntegrationTests
     private static ValueObjectsGroup DefaultPurchaseOrderValueObjects() =>
         Group("PurchaseOrder", Row(("id", 1234), ("vendor", "77000-0000")));
 
-    private static PaceInvoiceSubmission NewSubmission(string fieldsJson = InvoiceFieldsJson, string? paceVendoreAccountNumber = "76274-0000") =>
+    private static PaceInvoiceSubmission NewSubmission(string fieldsJson = InvoiceFieldsJson, string? paceVendorAccountNumber = "76274-0000") =>
         new()
         {
             InvoiceId = 42,
             ClientCode = "SANMAR",
             ClientName = "SanMar",
-            PaceVendoreAccountNumber = paceVendoreAccountNumber,
+            PaceVendorAccountNumber = paceVendorAccountNumber,
             Fields = PaceInvoiceFieldsParser.Parse(fieldsJson)
         };
 

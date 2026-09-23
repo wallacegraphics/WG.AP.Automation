@@ -8,65 +8,6 @@
 PRINT '--- WG.AP.Database pre-deployment migration ---';
 GO
 
-IF OBJECT_ID(N'dbo.Client', N'U') IS NOT NULL
-   AND COL_LENGTH(N'dbo.Client', N'PaceVendorId') IS NOT NULL
-   AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE [object_id] = OBJECT_ID(N'dbo.Client') AND [name] = N'UQ_Client_PaceVendorId')
-BEGIN
-	EXEC sys.sp_executesql N'
-		CREATE UNIQUE NONCLUSTERED INDEX [UQ_Client_PaceVendorId]
-			ON [dbo].[Client] ([PaceVendorId])
-			WHERE [PaceVendorId] IS NOT NULL;';
-END;
-GO
-
-IF OBJECT_ID(N'dbo.Client', N'U') IS NOT NULL
-   AND COL_LENGTH(N'dbo.Client', N'PaceVendoreAccountNumber') IS NULL
-BEGIN
-	ALTER TABLE [dbo].[Client]
-		ADD [PaceVendoreAccountNumber] NVARCHAR(50) NULL;
-END;
-GO
-
-IF OBJECT_ID(N'dbo.Client', N'U') IS NOT NULL
-   AND COL_LENGTH(N'dbo.Client', N'PaceVendoreAccountNumber') IS NOT NULL
-   AND COL_LENGTH(N'dbo.Client', N'PaceVendorId') IS NOT NULL
-BEGIN
-	EXEC sys.sp_executesql N'
-		UPDATE [dbo].[Client]
-		   SET [PaceVendoreAccountNumber] = [PaceVendorId],
-			   [ModifiedBy] = SUSER_SNAME(),
-			   [ModifiedOn] = SYSUTCDATETIME()
-		 WHERE NULLIF(LTRIM(RTRIM([PaceVendoreAccountNumber])), N'''') IS NULL
-		   AND NULLIF(LTRIM(RTRIM([PaceVendorId])), N'''') IS NOT NULL;';
-END;
-GO
-
-IF OBJECT_ID(N'dbo.Client', N'U') IS NOT NULL
-   AND COL_LENGTH(N'dbo.Client', N'PaceVendoreAccountNumber') IS NOT NULL
-   AND COL_LENGTH(N'dbo.Client', N'PaceVendoreId') IS NOT NULL
-BEGIN
-	EXEC sys.sp_executesql N'
-		UPDATE [dbo].[Client]
-		   SET [PaceVendoreAccountNumber] = [PaceVendoreId],
-			   [ModifiedBy] = SUSER_SNAME(),
-			   [ModifiedOn] = SYSUTCDATETIME()
-		 WHERE NULLIF(LTRIM(RTRIM([PaceVendoreAccountNumber])), N'''') IS NULL
-		   AND NULLIF(LTRIM(RTRIM([PaceVendoreId])), N'''') IS NOT NULL;';
-END;
-GO
-
-IF OBJECT_ID(N'dbo.Client', N'U') IS NOT NULL
-   AND COL_LENGTH(N'dbo.Client', N'PaceVendoreAccountNumber') IS NOT NULL
-BEGIN
-	UPDATE [dbo].[Client]
-	   SET [PaceVendoreAccountNumber] = N'76274-0000',
-		   [ModifiedBy] = SUSER_SNAME(),
-		   [ModifiedOn] = SYSUTCDATETIME()
-	 WHERE [ClientId] = 1
-	   AND NULLIF(LTRIM(RTRIM([PaceVendoreAccountNumber])), N'') IS NULL;
-END;
-GO
-
 IF OBJECT_ID(N'intgr.PaceSubmission', N'U') IS NOT NULL
    AND COL_LENGTH(N'intgr.PaceSubmission', N'StatusCode') IS NOT NULL
 	  AND COL_LENGTH(N'intgr.PaceSubmission', N'StatusCodeId') IS NULL

@@ -77,7 +77,7 @@ public sealed class PaceInvoiceProcessor(
                 InvoiceId = claim.InvoiceId,
                 ClientCode = claim.ClientCode,
                 ClientName = claim.ClientName,
-                PaceVendoreAccountNumber = claim.PaceVendoreAccountNumber,
+                PaceVendorAccountNumber = claim.PaceVendorAccountNumber,
                 Fields = fields
             }, cancellationToken);
 
@@ -205,7 +205,7 @@ public sealed class PaceInvoiceProcessor(
             claim.InvoiceId,
             claim.InvoiceNumber,
             claim.CustomerPO,
-            claim.PaceVendoreAccountNumber,
+            claim.PaceVendorAccountNumber,
             result.StatusCode,
             result.PaceBillBatchId,
             result.PaceBillId));
@@ -219,7 +219,7 @@ public sealed class PaceInvoiceProcessor(
                 ? $"Bill {Html(entry.PaceBillId)} created in batch {Html(entry.PaceBillBatchId)} using the Pace vendor default GL account/department."
                 : "Pace writes are disabled; a bill would be created using the Pace vendor default GL account/department.";
 
-            return $"Invoice {Html(entry.InvoiceNumber ?? "unknown")} (PO {Html(entry.CustomerPO ?? "unknown")}, vendor {Html(entry.PaceVendoreAccountNumber ?? "unknown")}): "
+            return $"Invoice {Html(entry.InvoiceNumber ?? "unknown")} (PO {Html(entry.CustomerPO ?? "unknown")}, vendor {Html(entry.PaceVendorAccountNumber ?? "unknown")}): "
                 + "no matching Pace PO was found. "
                 + billDescription
                 + " Routed to NeedsReview.";
@@ -236,7 +236,7 @@ public sealed class PaceInvoiceProcessor(
         long InvoiceId,
         string? InvoiceNumber,
         string? CustomerPO,
-        string? PaceVendoreAccountNumber,
+        string? PaceVendorAccountNumber,
         string StatusCode,
         string? PaceBillBatchId,
         string? PaceBillId);

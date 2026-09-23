@@ -3,7 +3,7 @@
 -- index (see dbo.Invoice) so two different clients' identical invoice numbers can never
 -- be mistaken for one another.
 --
--- PaceVendoreAccountNumber stores Pace's vendor account number as printed on invoices
+-- PaceVendorAccountNumber stores Pace's vendor account number as printed on invoices
 -- and shown in Pace's Vendor screen.
 --
 -- Clients are retired with IsEnabled = 0, never DELETEd: historical invoices point at the
@@ -11,7 +11,7 @@
 CREATE TABLE [dbo].[Client]
 (
     [ClientId]                   INT           NOT NULL,   -- assigned constants: 0 = Unknown, 1 = SanMar
-    [PaceVendoreAccountNumber]   NVARCHAR(50)  NULL,
+    [PaceVendorAccountNumber]   NVARCHAR(50)  NULL,
     [Code]                       VARCHAR(30)   NOT NULL,
     [Name]                       NVARCHAR(200) NOT NULL,
     [EmailDomain]                NVARCHAR(200) NULL,       -- 'sanmar.com'; how a sender resolves to a client
@@ -34,6 +34,6 @@ CREATE UNIQUE NONCLUSTERED INDEX [UQ_Client_EmailDomain]
     WHERE [EmailDomain] IS NOT NULL;
 GO
 
-CREATE UNIQUE NONCLUSTERED INDEX [UQ_Client_PaceVendoreAccountNumber]
-    ON [dbo].[Client] ([PaceVendoreAccountNumber])
-    WHERE [PaceVendoreAccountNumber] IS NOT NULL;
+CREATE UNIQUE NONCLUSTERED INDEX [UQ_Client_PaceVendorAccountNumber]
+    ON [dbo].[Client] ([PaceVendorAccountNumber])
+    WHERE [PaceVendorAccountNumber] IS NOT NULL;

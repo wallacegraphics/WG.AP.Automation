@@ -57,13 +57,13 @@ public class SqlRepositoryTests
                 WHEN OBJECT_ID(N'intgr.PaceSubmission', N'U') IS NOT NULL
                  AND COL_LENGTH(N'intgr.PaceSubmission', N'StatusCodeId') IS NOT NULL
                  AND COL_LENGTH(N'intgr.PaceSubmissionStatus', N'StatusCodeId') IS NOT NULL
-                 AND COL_LENGTH(N'dbo.Client', N'PaceVendoreAccountNumber') IS NOT NULL
+                 AND COL_LENGTH(N'dbo.Client', N'PaceVendorAccountNumber') IS NOT NULL
                     THEN 1
                 ELSE 0
             END;
             """);
 
-        Skip.If(exists == 0, "Publish the WG.AP.Database project with the normalized Pace submission schema and Client.PaceVendoreAccountNumber before running Pace SQL repository tests.");
+        Skip.If(exists == 0, "Publish the WG.AP.Database project with the normalized Pace submission schema and Client.PaceVendorAccountNumber before running Pace SQL repository tests.");
     }
 
     [SkippableFact]
@@ -679,7 +679,7 @@ public class SqlRepositoryTests
             Total = 123.45m,
             ClientCode = "SANMAR",
             ClientName = "SanMar",
-            PaceVendoreAccountNumber = "76274-0000"
+            PaceVendorAccountNumber = "76274-0000"
         };
         var routeMethod = typeof(PaceInvoiceProcessor).GetMethod("RoutePaceErrorAsync", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
 
