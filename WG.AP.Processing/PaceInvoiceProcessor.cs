@@ -220,8 +220,10 @@ public sealed class PaceInvoiceProcessor(
             ? $"Pace invoice '{claim.InvoiceNumber}' for PO '{claim.CustomerPO}' requires review."
             : result.ErrorMessage;
 
-        // Added first: the submission is already completed and will not be claimed again, so a status-update
-        // or move failure below must not drop it from the digest.
+        await mailMessageRepository.SetStatusAsync(claim.MailMessageId, ApStatus.MailNeedsReview, reason, cancellationToken);
+
+        // Added after the status is committed (so the digest never reports an unsaved route) and before the
+        // move (so a move failure does not drop this finalized submission from the digest).
         needsReviewEntries.Add(new PaceNeedsReviewEntry(
             claim.InvoiceId,
             claim.InvoiceNumber,
@@ -231,8 +233,6 @@ public sealed class PaceInvoiceProcessor(
             result.PaceBillBatchId,
             result.PaceBillId,
             reason));
-
-        await mailMessageRepository.SetStatusAsync(claim.MailMessageId, ApStatus.MailNeedsReview, reason, cancellationToken);
 
         await mailSource.MoveMessageAsync(claim.GraphMessageId, MailDestinationFolder.NeedsReview, cancellationToken);
 

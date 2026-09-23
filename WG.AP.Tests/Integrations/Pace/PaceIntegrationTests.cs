@@ -195,6 +195,40 @@ public sealed class PaceIntegrationTests
     }
 
     [Fact]
+    public async Task PaceInvoiceService_WithWriteEnabled_WhenNoPoLines_AndPeriodClosed_ReturnsErrorNotNeedsReview()
+    {
+        var createBillCalled = false;
+        var client = new FakeWriteEnabledClient(_ => Task.FromResult(Group(_.ObjectName!)))
+        {
+            OnFind = (type, _) => type switch
+            {
+                "GLAccountingPeriod" => ["5201"],
+                _ => throw new InvalidOperationException($"Unexpected FindAsync({type}) once the period is known to be closed.")
+            },
+            OnReadGlAccountingPeriod = _ => new GLAccountingPeriod { Id = 5201, GlPeriodStatus = "F" },
+            OnCreateBill = _ =>
+            {
+                createBillCalled = true;
+                throw new InvalidOperationException("CreateBillAsync should not be called for a closed period.");
+            }
+        };
+
+        var service = new PaceInvoiceService(
+            client,
+            new PaceBillBatchResolver(client, NullLogger<PaceBillBatchResolver>.Instance),
+            Options.Create(WriteEnabledPaceOptions()),
+            NullLogger<PaceInvoiceService>.Instance);
+
+        var result = await service.SubmitAsync(NewSubmission(), CancellationToken.None);
+
+        // Same routing as the PO lane: a closed period is an Error (Errors folder), never NeedsReview.
+        Assert.Equal(PaceInvoiceOutcomeStatus.Error, result.StatusCode);
+        Assert.False(result.RequiresReview);
+        Assert.Contains("locked/closed", result.ErrorMessage);
+        Assert.False(createBillCalled);
+    }
+
+    [Fact]
     public async Task PaceInvoiceService_WhenReadGLAccountingPeriodThrowsWithHttp200_ReturnsRetryLater_NotError()
     {
         var createBillBatchCalled = false;

@@ -578,7 +578,8 @@ public sealed class PaceInvoiceService(
 
         if (batchError is not null)
         {
-            return batchError with { RequiresReview = true };
+            // Returned unchanged, as in the PO lane: batch failures (e.g. a closed GL period) route to Errors.
+            return batchError;
         }
 
         var (createdBill, duplicateResult) = await TryCreateBillAsync(submission, normalizedInvoiceNumber, defaultNoPoVendor, resolved.BillBatchId, resolved.GlAccountingPeriodId, batchDate, cancellationToken);
