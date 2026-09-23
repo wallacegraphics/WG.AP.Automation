@@ -913,6 +913,24 @@ public sealed class PaceInvoiceService(
         }
     }
 
+    /// <summary>
+    /// True when a 404 came from the web server itself (an HTML "Not Found" page for a missing or
+    /// misconfigured endpoint) rather than from Pace's value-object service reporting no matching rows.
+    /// </summary>
+    /// <remarks>
+    /// Only Pace's own no-match 404 may be read as "no duplicate bill": treating an endpoint failure the
+    /// same way would let createBill run blind and create a duplicate while hiding the integration fault.
+    /// </remarks>
+    private static bool IsEndpointNotFoundResponse(ApiException exception)
+    {
+        var body = exception.Response;
+
+        return !string.IsNullOrWhiteSpace(body)
+            && (body.Contains("<html", StringComparison.OrdinalIgnoreCase)
+                || body.Contains("<!DOCTYPE", StringComparison.OrdinalIgnoreCase)
+                || body.Contains("requested URL was not found", StringComparison.OrdinalIgnoreCase));
+    }
+
     private async Task<List<BillValue>> LoadBillsByPaceVendorAccountNumberAndInvoiceAsync(string paceVendorAccountNumber, string invoiceNumber, CancellationToken cancellationToken)
     {
         List<IReadOnlyDictionary<string, object?>> rows;
@@ -934,7 +952,8 @@ public sealed class PaceInvoiceService(
                 ]
             }, cancellationToken);
         }
-        catch (PaceValueObjectNotFoundException exception) when (string.Equals(exception.ObjectName, "Bill", StringComparison.OrdinalIgnoreCase))
+        catch (PaceValueObjectNotFoundException exception) when (string.Equals(exception.ObjectName, "Bill", StringComparison.OrdinalIgnoreCase)
+            && !IsEndpointNotFoundResponse(exception.ApiException))
         {
             logger.LogInformation(
                 "Pace bill duplicate probe found no bill for Pace vendor account number {PaceVendorAccountNumber} and invoice number {InvoiceNumber}. XPathFilter={XPathFilter}; Offset={Offset}.",

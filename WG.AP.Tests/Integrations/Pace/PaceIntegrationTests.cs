@@ -1121,6 +1121,33 @@ public sealed class PaceIntegrationTests
     }
 
     [Fact]
+    public async Task PaceInvoiceService_WhenDuplicateBillProbeHitsMissingEndpoint_ReturnsErrorInsteadOfTreatingAsNoMatch()
+    {
+        var exception = new ApiException("missing", 404, "<html><head><title>404 Not Found</title></head><body><p>The requested URL was not found on this server.</p></body></html>", new Dictionary<string, IEnumerable<string>>(), null);
+        var purchaseOrderLineLookupCalled = false;
+        var service = new PaceInvoiceService(
+            new FakePaceClient(_ =>
+            {
+                if (_.ObjectName == "Bill")
+                {
+                    return Task.FromException<ValueObjectsGroup>(exception);
+                }
+
+                purchaseOrderLineLookupCalled = true;
+                return Task.FromResult(Group(_.ObjectName!));
+            }),
+            UnusedBillBatchResolver,
+            Options.Create(NewPaceOptions()),
+            NullLogger<PaceInvoiceService>.Instance);
+
+        var result = await service.SubmitAsync(NewSubmission(), CancellationToken.None);
+
+        Assert.Equal(PaceInvoiceOutcomeStatus.Error, result.StatusCode);
+        Assert.Contains("Bill", result.ErrorMessage);
+        Assert.False(purchaseOrderLineLookupCalled);
+    }
+
+    [Fact]
     public async Task PaceInvoiceService_WhenPaceBillExists_ReturnsAlreadyEnteredBeforePoReceiptGates()
     {
         var purchaseOrderLineLookupCalled = false;
