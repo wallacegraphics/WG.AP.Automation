@@ -557,7 +557,7 @@ public sealed class PaceIntegrationTests
     }
 
     [Fact]
-    public async Task PaceInvoiceService_WithWriteEnabled_WhenNoPoVendorGlDefaultsMissing_ReturnsErrorAfterBillBatchResolution()
+    public async Task PaceInvoiceService_WithWriteEnabled_WhenNoPoVendorGlDefaultsMissing_ReturnsErrorBeforeBillBatchResolution()
     {
         var createBillCalled = false;
         string? billBatchXpath = null;
@@ -600,8 +600,7 @@ public sealed class PaceIntegrationTests
         Assert.Equal(PaceInvoiceOutcomeStatus.Error, result.StatusCode);
         Assert.True(result.RequiresReview);
         Assert.Contains("default GL account/department", result.ErrorMessage);
-        Assert.Contains("AUTO ", billBatchXpath);
-        Assert.DoesNotContain("AUTO-NOPO", billBatchXpath);
+        Assert.Null(billBatchXpath);
         Assert.False(createBillCalled);
 
         ICollection<string> CaptureBillBatchFind(string xpath)
@@ -659,6 +658,79 @@ public sealed class PaceIntegrationTests
         Assert.True(result.RequiresReview);
         Assert.Contains("no matching Pace PO", result.ErrorMessage);
         Assert.Contains("2887-2533", result.ResponseJson);
+    }
+
+    [Fact]
+    public async Task PaceInvoiceService_WhenNoPoLines_AndWriteDisabled_AndBillExistsForNoPoVendor_ReturnsAlreadyEntered()
+    {
+        var service = new PaceInvoiceService(
+            new FakePaceClient(_ => Task.FromResult(_.ObjectName == "Bill"
+                ? Group("Bill", Row(("id", 12345), ("invoiceNumber", "INV-163939830"), ("billBatch", "987")))
+                : Group(_.ObjectName!))),
+            UnusedBillBatchResolver,
+            Options.Create(NewPaceOptions()),
+            NullLogger<PaceInvoiceService>.Instance);
+
+        var result = await service.SubmitAsync(NewSubmission(), CancellationToken.None);
+
+        Assert.Equal(PaceInvoiceOutcomeStatus.AlreadyEntered, result.StatusCode);
+        Assert.Equal("12345", result.PaceBillId);
+    }
+
+    [Theory]
+    [InlineData("SANMAR", "INV-163939830", "163939830")]
+    [InlineData("sanmar", "INV 163-939-830", "163939830")]
+    [InlineData("SANMAR", "INV163939830", "163939830")]
+    [InlineData("SANMAR", "INVEST-123", null)]
+    [InlineData("SANMAR", "163939830", null)]
+    [InlineData("SANMAR", "INV-", null)]
+    [InlineData("OTHER", "INV-163939830", null)]
+    [InlineData(null, "INV-163939830", null)]
+    public void NormalizePaceInvoiceNumber_OnlyStripsConfirmedSanMarInvPrefix(string? clientCode, string invoiceNumber, string? expected)
+    {
+        Assert.Equal(expected, PaceInvoiceService.NormalizePaceInvoiceNumber(clientCode, invoiceNumber));
+    }
+
+    [Fact]
+    public async Task PaceInvoiceService_WhenClientIsNotSanMar_ReturnsErrorBeforeCallingPace()
+    {
+        var paceCalled = false;
+        var service = new PaceInvoiceService(
+            new FakePaceClient(_ =>
+            {
+                paceCalled = true;
+                return Task.FromResult(Group(_.ObjectName!));
+            }),
+            UnusedBillBatchResolver,
+            Options.Create(NewPaceOptions()),
+            NullLogger<PaceInvoiceService>.Instance);
+
+        var result = await service.SubmitAsync(NewSubmission() with { ClientCode = "OTHER" }, CancellationToken.None);
+
+        Assert.Equal(PaceInvoiceOutcomeStatus.Error, result.StatusCode);
+        Assert.Contains("not known yet for client 'OTHER'", result.ErrorMessage);
+        Assert.False(paceCalled);
+    }
+
+    [Theory]
+    [InlineData("{\"message\":\"Vendor not found\"}", true)]
+    [InlineData("<html><head><title>404 Not Found</title></head><body><p>The requested URL was not found on this server.</p></body></html>", false)]
+    public async Task PaceInvoiceService_WhenReadVendorReturns404_OnlyPaceNoMatchRoutesToNeedsReview(string responseBody, bool expectsReview)
+    {
+        var service = new PaceInvoiceService(
+            new FakePaceClient(_ => Task.FromResult(Group(_.ObjectName!)))
+            {
+                OnReadVendor = _ => throw new ApiException("not found", 404, responseBody, new Dictionary<string, IEnumerable<string>>(), null)
+            },
+            UnusedBillBatchResolver,
+            Options.Create(NewPaceOptions()),
+            NullLogger<PaceInvoiceService>.Instance);
+
+        var result = await service.SubmitAsync(NewSubmission(), CancellationToken.None);
+
+        Assert.Equal(PaceInvoiceOutcomeStatus.Error, result.StatusCode);
+        Assert.Equal(expectsReview, result.RequiresReview);
+        Assert.False(result.IsTransient);
     }
 
     [Theory]
@@ -1023,7 +1095,7 @@ public sealed class PaceIntegrationTests
     public async Task PaceInvoiceService_WhenPaceBillExistsForVendorAndInvoice_ReturnsAlreadyEntered()
     {
         ValueObjectDescriptor? billDescriptor = null;
-        var purchaseOrderLineLookupCalled = false;
+        var receiptLookupCalled = false;
         var service = new PaceInvoiceService(
             new FakePaceClient(_ =>
             {
@@ -1031,14 +1103,16 @@ public sealed class PaceIntegrationTests
                 {
                     billDescriptor = _;
                 }
-                else if (_.ObjectName == "PurchaseOrderLine")
+                else if (_.ObjectName == "PurchaseOrderReceipt")
                 {
-                    purchaseOrderLineLookupCalled = true;
+                    receiptLookupCalled = true;
                 }
 
                 return Task.FromResult(_.ObjectName switch
                 {
-                    "Bill" => Group("Bill", Row(("id", 12345), ("vendor", "76274-0000"), ("invoiceNumber", "INV-163939830"), ("poNumber", "2887-2533"), ("billBatch", "987"), ("postingStatus", "Open"))),
+                    "PurchaseOrderLine" => Group("PurchaseOrderLine", Row(("id", 163108), ("qtyReceived", 1))),
+                    "PurchaseOrder" => DefaultPurchaseOrderValueObjects(),
+                    "Bill" => Group("Bill", Row(("id", 12345), ("vendor", "77000-0000"), ("invoiceNumber", "INV-163939830"), ("poNumber", "2887-2533"), ("billBatch", "987"), ("postingStatus", "Open"))),
                     _ => throw new InvalidOperationException(_.ObjectName)
                 });
             }),
@@ -1052,8 +1126,43 @@ public sealed class PaceIntegrationTests
         Assert.Equal("12345", result.PaceBillId);
         Assert.Equal("987", result.PaceBillBatchId);
         Assert.Contains("INV-163939830", result.ResponseJson);
-        Assert.Equal("@vendor = '76274-0000' and @invoiceNumber = '163939830'", billDescriptor?.XpathFilter);
-        Assert.False(purchaseOrderLineLookupCalled);
+        Assert.Equal("@vendor = '77000-0000' and @invoiceNumber = '163939830'", billDescriptor?.XpathFilter);
+        Assert.False(receiptLookupCalled);
+    }
+
+    [Fact]
+    public async Task PaceInvoiceService_WhenBillExistsOnlyUnderConfiguredAccount_CreatesBillForPoVendor()
+    {
+        var billXpaths = new List<string?>();
+        var service = new PaceInvoiceService(
+            new FakePaceClient(_ =>
+            {
+                if (_.ObjectName == "Bill")
+                {
+                    billXpaths.Add(_.XpathFilter);
+                }
+
+                return Task.FromResult(_.ObjectName switch
+                {
+                    "PurchaseOrderLine" => Group("PurchaseOrderLine", Row(("id", 163108), ("qtyReceived", 1))),
+                    "PurchaseOrder" => DefaultPurchaseOrderValueObjects(),
+                    "PurchaseOrderReceipt" => Group("PurchaseOrderReceipt", Row(("id", 144841), ("purchaseOrderLine", 163108), ("quantity", 1), ("unitCost", 1234.56), ("extendedPrice", 1234.56), ("stockingUOM", "EA"))),
+                    "BillLine" => Group("BillLine"),
+                    // A bill under the configured client account (76274-0000) must not block the PO vendor bill.
+                    "Bill" => _.XpathFilter!.Contains("76274-0000", StringComparison.Ordinal)
+                        ? Group("Bill", Row(("id", 1), ("vendor", "76274-0000"), ("invoiceNumber", "INV-163939830")))
+                        : Group("Bill"),
+                    _ => throw new InvalidOperationException(_.ObjectName)
+                });
+            }),
+            UnusedBillBatchResolver,
+            Options.Create(NewPaceOptions()),
+            NullLogger<PaceInvoiceService>.Instance);
+
+        var result = await service.SubmitAsync(NewSubmission(), CancellationToken.None);
+
+        Assert.NotEqual(PaceInvoiceOutcomeStatus.AlreadyEntered, result.StatusCode);
+        Assert.All(billXpaths, xpath => Assert.DoesNotContain("76274-0000", xpath));
     }
 
     [Fact]
@@ -1070,8 +1179,9 @@ public sealed class PaceIntegrationTests
 
                 return Task.FromResult(_.ObjectName switch
                 {
-                    "Bill" => Group("Bill"),
-                    "PurchaseOrderLine" => Group("PurchaseOrderLine", Row(("id", 163108), ("qtyReceived", 0))),
+                    "Bill" => Group("Bill", Row(("id", 12345), ("vendor", "77000-0000"))),
+                    "PurchaseOrderLine" => Group("PurchaseOrderLine", Row(("id", 163108), ("qtyReceived", 1))),
+                    "PurchaseOrder" => DefaultPurchaseOrderValueObjects(),
                     _ => throw new InvalidOperationException(_.ObjectName)
                 });
             }),
@@ -1081,8 +1191,8 @@ public sealed class PaceIntegrationTests
 
         var result = await service.SubmitAsync(NewSubmission(InvoiceFieldsJson.Replace("INV-163939830", "INV 163-939-830", StringComparison.Ordinal)), CancellationToken.None);
 
-        Assert.Equal(PaceInvoiceOutcomeStatus.PoNotReceived, result.StatusCode);
-        Assert.Equal("@vendor = '76274-0000' and @invoiceNumber = '163939830'", billDescriptor?.XpathFilter);
+        Assert.Equal(PaceInvoiceOutcomeStatus.AlreadyEntered, result.StatusCode);
+        Assert.Equal("@vendor = '77000-0000' and @invoiceNumber = '163939830'", billDescriptor?.XpathFilter);
     }
 
     [Fact]
@@ -1124,7 +1234,7 @@ public sealed class PaceIntegrationTests
     public async Task PaceInvoiceService_WhenDuplicateBillProbeHitsMissingEndpoint_ReturnsErrorInsteadOfTreatingAsNoMatch()
     {
         var exception = new ApiException("missing", 404, "<html><head><title>404 Not Found</title></head><body><p>The requested URL was not found on this server.</p></body></html>", new Dictionary<string, IEnumerable<string>>(), null);
-        var purchaseOrderLineLookupCalled = false;
+        var receiptLookupCalled = false;
         var service = new PaceInvoiceService(
             new FakePaceClient(_ =>
             {
@@ -1133,8 +1243,12 @@ public sealed class PaceIntegrationTests
                     return Task.FromException<ValueObjectsGroup>(exception);
                 }
 
-                purchaseOrderLineLookupCalled = true;
-                return Task.FromResult(Group(_.ObjectName!));
+                return Task.FromResult(_.ObjectName switch
+                {
+                    "PurchaseOrderLine" => Group("PurchaseOrderLine", Row(("id", 163108), ("qtyReceived", 1))),
+                    "PurchaseOrder" => DefaultPurchaseOrderValueObjects(),
+                    _ => MarkReceipt(_.ObjectName!)
+                });
             }),
             UnusedBillBatchResolver,
             Options.Create(NewPaceOptions()),
@@ -1144,24 +1258,32 @@ public sealed class PaceIntegrationTests
 
         Assert.Equal(PaceInvoiceOutcomeStatus.Error, result.StatusCode);
         Assert.Contains("Bill", result.ErrorMessage);
-        Assert.False(purchaseOrderLineLookupCalled);
+        Assert.False(receiptLookupCalled);
+
+        ValueObjectsGroup MarkReceipt(string objectName)
+        {
+            receiptLookupCalled = true;
+            return Group(objectName);
+        }
     }
 
     [Fact]
     public async Task PaceInvoiceService_WhenPaceBillExists_ReturnsAlreadyEnteredBeforePoReceiptGates()
     {
-        var purchaseOrderLineLookupCalled = false;
+        var receiptLookupCalled = false;
         var service = new PaceInvoiceService(
             new FakePaceClient(_ =>
             {
-                if (_.ObjectName == "PurchaseOrderLine")
+                if (_.ObjectName == "PurchaseOrderReceipt")
                 {
-                    purchaseOrderLineLookupCalled = true;
+                    receiptLookupCalled = true;
                 }
 
                 return Task.FromResult(_.ObjectName switch
                 {
-                    "Bill" => Group("Bill", Row(("id", 12345), ("vendor", "76274-0000"), ("invoiceNumber", "INV-163939830"), ("poNumber", "2887-2533"), ("billBatch", "987"), ("postingStatus", "Open"))),
+                    "PurchaseOrderLine" => Group("PurchaseOrderLine", Row(("id", 163108), ("qtyReceived", 1))),
+                    "PurchaseOrder" => DefaultPurchaseOrderValueObjects(),
+                    "Bill" => Group("Bill", Row(("id", 12345), ("vendor", "77000-0000"), ("invoiceNumber", "INV-163939830"), ("poNumber", "2887-2533"), ("billBatch", "987"), ("postingStatus", "Open"))),
                     _ => throw new InvalidOperationException(_.ObjectName)
                 });
             }),
@@ -1174,7 +1296,7 @@ public sealed class PaceIntegrationTests
         Assert.Equal(PaceInvoiceOutcomeStatus.AlreadyEntered, result.StatusCode);
         Assert.Equal("12345", result.PaceBillId);
         Assert.Equal("987", result.PaceBillBatchId);
-        Assert.False(purchaseOrderLineLookupCalled);
+        Assert.False(receiptLookupCalled);
     }
 
     [Fact]

@@ -49,36 +49,24 @@ public sealed class PaceInvoiceService(
     {
         try
         {
-            // No PaceVendorAccountNumber precondition: the bill vendor is resolved per lane (the PO's own vendor,
-            // or the ClientCode vendor for no-PO bills), and each lane validates the identity it actually uses.
-            var normalizedInvoiceNumber = NormalizePaceInvoiceNumber(submission.Fields.InvoiceNumber);
-            var existingBills = string.IsNullOrWhiteSpace(submission.PaceVendorAccountNumber)
-                ? []
-                : await LoadBillsByPaceVendorAccountNumberAndInvoiceAsync(submission.PaceVendorAccountNumber, normalizedInvoiceNumber, cancellationToken);
+            // The duplicate probe runs per lane against the vendor actually sent to createBill (the PO's own
+            // vendor, or the ClientCode vendor for no-PO bills), and the bill batch is resolved only after that
+            // probe passes so duplicates never create an empty daily batch.
+            var normalizedInvoiceNumber = NormalizePaceInvoiceNumber(submission.ClientCode, submission.Fields.InvoiceNumber);
 
-            if (existingBills.Count > 0)
+            if (normalizedInvoiceNumber is null)
             {
-                return BuildAlreadyEnteredResult(submission, submission.PaceVendorAccountNumber, existingBills);
-            }
+                var errorMessage = string.Equals(submission.ClientCode, SanMarClientCode, StringComparison.OrdinalIgnoreCase)
+                    ? $"Pace invoice '{submission.Fields.InvoiceNumber}' for PO '{submission.Fields.CustomerPO}': SanMar invoice number does not start with the expected 'INV' prefix followed by a separator or digit; cannot normalize it for Pace."
+                    : $"Pace invoice '{submission.Fields.InvoiceNumber}' for PO '{submission.Fields.CustomerPO}': invoice number normalization rules are not known yet for client '{submission.ClientCode ?? "unknown"}'.";
 
-            DateOnly? resolvedBatchDate = null;
-            BillBatchResolution.Resolved? resolvedBatch = null;
+                logger.LogError("{ErrorMessage} InvoiceId={InvoiceId}; ClientCode={ClientCode}.", errorMessage, submission.InvoiceId, submission.ClientCode);
 
-            if (options.Value.WriteEnabled)
-            {
-                var accountingPeriodDate = submission.Fields.InvoiceDate;
-                var dailyBatchDate = DateOnly.FromDateTime(DateTime.Today);
-                var batchDescription = BuildBillBatchDescription(dailyBatchDate, "AUTO");
-                var batchResolution = await billBatchResolver.ResolveOrCreateAsync(accountingPeriodDate, dailyBatchDate, batchDescription, cancellationToken);
-                var batchErrorResult = HandleUnresolvedBatch(submission, batchResolution);
-
-                if (batchErrorResult is not null)
+                return new PaceInvoiceSubmissionResult
                 {
-                    return batchErrorResult;
-                }
-
-                resolvedBatchDate = dailyBatchDate;
-                resolvedBatch = (BillBatchResolution.Resolved)batchResolution;
+                    StatusCode = PaceInvoiceOutcomeStatus.Error,
+                    ErrorMessage = errorMessage
+                };
             }
 
             var purchaseOrderLines = await LoadPurchaseOrderLinesOrNoPoAsync(submission, cancellationToken);
@@ -90,7 +78,7 @@ public sealed class PaceInvoiceService(
 
             if (purchaseOrderLines.PurchaseOrderLines is null || purchaseOrderLines.PurchaseOrderLines.Count == 0)
             {
-                return await CreateNoPoBillAsync(submission, normalizedInvoiceNumber, resolvedBatch, resolvedBatchDate, cancellationToken);
+                return await CreateNoPoBillAsync(submission, normalizedInvoiceNumber, cancellationToken);
             }
 
             var receivedLines = purchaseOrderLines.PurchaseOrderLines.Where(line => line.QtyReceived > 0).ToList();
@@ -139,7 +127,7 @@ public sealed class PaceInvoiceService(
                 return poVendorError;
             }
 
-            var poVendorExistingBills = await LoadBillsForBillVendorAsync(submission, poVendor!, normalizedInvoiceNumber, cancellationToken);
+            var poVendorExistingBills = await LoadBillsForBillVendorAsync(poVendor!, normalizedInvoiceNumber, cancellationToken);
 
             if (poVendorExistingBills.Count > 0)
             {
@@ -282,8 +270,13 @@ public sealed class PaceInvoiceService(
                 };
             }
 
-            var billBatchDate = resolvedBatchDate ?? throw new InvalidOperationException("Pace write-enabled bill creation reached without a resolved bill batch date.");
-            var resolved = resolvedBatch ?? throw new InvalidOperationException("Pace write-enabled bill creation reached without a resolved bill batch.");
+            var (batchError, resolved, billBatchDate) = await ResolveBillBatchAsync(submission, cancellationToken);
+
+            if (batchError is not null)
+            {
+                return batchError;
+            }
+
             var (createdBill, duplicateResult) = await TryCreateBillAsync(submission, normalizedInvoiceNumber, poVendor, resolved.BillBatchId, resolved.GlAccountingPeriodId, billBatchDate, cancellationToken);
 
             if (duplicateResult is not null)
@@ -475,8 +468,6 @@ public sealed class PaceInvoiceService(
     private async Task<PaceInvoiceSubmissionResult> CreateNoPoBillAsync(
         PaceInvoiceSubmission submission,
         string normalizedInvoiceNumber,
-        BillBatchResolution.Resolved? resolvedBatch,
-        DateOnly? resolvedBatchDate,
         CancellationToken cancellationToken)
     {
         var noPoVendorCode = submission.ClientCode;
@@ -528,6 +519,28 @@ public sealed class PaceInvoiceService(
             };
         }
 
+        var defaultNoPoVendor = vendorDefaultCoding.Id ?? vendorDefaultCoding.Name;
+
+        if (string.IsNullOrWhiteSpace(defaultNoPoVendor))
+        {
+            var errorMessage = $"Pace invoice '{submission.Fields.InvoiceNumber}' for PO '{submission.Fields.CustomerPO}': Pace vendor '{vendorDefaultCoding.Name}' did not include a usable id for no-PO bill creation.";
+            logger.LogError("{ErrorMessage} InvoiceId={InvoiceId}; PaceVendorName={PaceVendorName}.", errorMessage, submission.InvoiceId, vendorDefaultCoding.Name);
+
+            return new PaceInvoiceSubmissionResult
+            {
+                StatusCode = PaceInvoiceOutcomeStatus.Error,
+                ErrorMessage = errorMessage,
+                RequiresReview = true
+            };
+        }
+
+        var noPoVendorExistingBills = await LoadBillsForBillVendorAsync(defaultNoPoVendor, normalizedInvoiceNumber, cancellationToken);
+
+        if (noPoVendorExistingBills.Count > 0)
+        {
+            return BuildAlreadyEnteredResult(submission, defaultNoPoVendor, noPoVendorExistingBills);
+        }
+
         if (!options.Value.WriteEnabled)
         {
             logger.LogInformation(
@@ -561,29 +574,11 @@ public sealed class PaceInvoiceService(
             };
         }
 
-        var batchDate = resolvedBatchDate ?? throw new InvalidOperationException("Pace write-enabled no-PO bill creation reached without a resolved bill batch date.");
-        var resolved = resolvedBatch ?? throw new InvalidOperationException("Pace write-enabled no-PO bill creation reached without a resolved bill batch.");
-        var defaultNoPoVendor = vendorDefaultCoding.Id ?? vendorDefaultCoding.Name;
+        var (batchError, resolved, batchDate) = await ResolveBillBatchAsync(submission, cancellationToken);
 
-        if (string.IsNullOrWhiteSpace(defaultNoPoVendor))
+        if (batchError is not null)
         {
-            var errorMessage = $"Pace invoice '{submission.Fields.InvoiceNumber}' for PO '{submission.Fields.CustomerPO}': Pace vendor '{vendorDefaultCoding.Name}' did not include a usable id for no-PO bill creation.";
-            logger.LogError("{ErrorMessage} InvoiceId={InvoiceId}; PaceVendorName={PaceVendorName}; BillBatchId={BillBatchId}.", errorMessage, submission.InvoiceId, vendorDefaultCoding.Name, resolved.BillBatchId);
-
-            return new PaceInvoiceSubmissionResult
-            {
-                StatusCode = PaceInvoiceOutcomeStatus.Error,
-                PaceBillBatchId = resolved.BillBatchId.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                ErrorMessage = errorMessage,
-                RequiresReview = true
-            };
-        }
-
-        var noPoVendorExistingBills = await LoadBillsForBillVendorAsync(submission, defaultNoPoVendor, normalizedInvoiceNumber, cancellationToken);
-
-        if (noPoVendorExistingBills.Count > 0)
-        {
-            return BuildAlreadyEnteredResult(submission, defaultNoPoVendor, noPoVendorExistingBills);
+            return batchError with { RequiresReview = true };
         }
 
         var (createdBill, duplicateResult) = await TryCreateBillAsync(submission, normalizedInvoiceNumber, defaultNoPoVendor, resolved.BillBatchId, resolved.GlAccountingPeriodId, batchDate, cancellationToken);
@@ -651,13 +646,22 @@ public sealed class PaceInvoiceService(
     }
 
     /// <summary>
-    /// Re-probes for an existing bill under the vendor that will actually be sent to createBill, when it
-    /// differs from the configured PaceVendorAccountNumber already probed up front.
+    /// Probes for an existing bill under the vendor that will actually be sent to createBill.
     /// </summary>
-    private async Task<List<BillValue>> LoadBillsForBillVendorAsync(PaceInvoiceSubmission submission, string billVendor, string normalizedInvoiceNumber, CancellationToken cancellationToken) =>
-        string.Equals(billVendor, submission.PaceVendorAccountNumber, StringComparison.OrdinalIgnoreCase)
-            ? []
-            : await LoadBillsByPaceVendorAccountNumberAndInvoiceAsync(billVendor, normalizedInvoiceNumber, cancellationToken);
+    private Task<List<BillValue>> LoadBillsForBillVendorAsync(string billVendor, string normalizedInvoiceNumber, CancellationToken cancellationToken) =>
+        LoadBillsByPaceVendorAccountNumberAndInvoiceAsync(billVendor, normalizedInvoiceNumber, cancellationToken);
+
+    private async Task<(PaceInvoiceSubmissionResult? Error, BillBatchResolution.Resolved Batch, DateOnly BatchDate)> ResolveBillBatchAsync(PaceInvoiceSubmission submission, CancellationToken cancellationToken)
+    {
+        var dailyBatchDate = DateOnly.FromDateTime(DateTime.Today);
+        var batchDescription = BuildBillBatchDescription(dailyBatchDate, "AUTO");
+        var batchResolution = await billBatchResolver.ResolveOrCreateAsync(submission.Fields.InvoiceDate, dailyBatchDate, batchDescription, cancellationToken);
+        var batchErrorResult = HandleUnresolvedBatch(submission, batchResolution);
+
+        return batchErrorResult is not null
+            ? (batchErrorResult, null!, dailyBatchDate)
+            : (null, (BillBatchResolution.Resolved)batchResolution, dailyBatchDate);
+    }
 
     private PaceInvoiceSubmissionResult BuildAlreadyEnteredResult(PaceInvoiceSubmission submission, string? vendor, List<BillValue> existingBills)
     {
@@ -898,7 +902,9 @@ public sealed class PaceInvoiceService(
                 vendor.GlAccount,
                 vendor.GlDepartment);
         }
-        catch (ApiException exception) when (exception.StatusCode == 404)
+        // Only Pace's own "vendor not found" 404 is a data problem; an endpoint-level 404 (missing or
+        // misconfigured readVendor route) must reach the integration error path instead of NeedsReview.
+        catch (ApiException exception) when (exception.StatusCode == 404 && !IsEndpointNotFoundResponse(exception))
         {
             logger.LogError(
                 "Pace Vendor {VendorCode} was not found while loading the Pace vendor default GL account/department.",
@@ -1108,15 +1114,34 @@ public sealed class PaceInvoiceService(
     private static string OrFilter(string field, IEnumerable<int> values) =>
         string.Join(" or ", values.Select(value => $"{field} = {value}"));
 
-    private static string NormalizePaceInvoiceNumber(string invoiceNumber)
+    private const string SanMarClientCode = "SANMAR";
+
+    /// <summary>
+    /// Returns the Pace invoice number, or null when it cannot be normalized. Only SanMar's format is
+    /// known today: its invoice numbers always carry an "INV" prefix, which is stripped only when followed
+    /// by a separator or digit so values like "INVEST-123" are never corrupted.
+    /// </summary>
+    internal static string? NormalizePaceInvoiceNumber(string? clientCode, string invoiceNumber)
     {
-        var normalized = new string(invoiceNumber
+        if (!string.Equals(clientCode, SanMarClientCode, StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        var trimmed = invoiceNumber.Trim();
+
+        if (trimmed.Length <= 3
+            || !trimmed.StartsWith("INV", StringComparison.OrdinalIgnoreCase)
+            || !(trimmed[3] == '-' || char.IsWhiteSpace(trimmed[3]) || trimmed[3] == '\u00A0' || char.IsDigit(trimmed[3])))
+        {
+            return null;
+        }
+
+        var normalized = new string(trimmed[3..]
             .Where(character => character != '-' && !char.IsWhiteSpace(character) && character != '\u00A0')
             .ToArray());
 
-        return normalized.StartsWith("INV", StringComparison.OrdinalIgnoreCase)
-            ? normalized[3..]
-            : normalized;
+        return normalized.Length > 0 && normalized.All(char.IsDigit) ? normalized : null;
     }
 
     private static string NormalizePacePurchaseOrderNumber(string poNumber)
