@@ -848,6 +848,50 @@ public class SqlRepositoryTests
     }
 
     [SkippableFact]
+    public async Task PaceInvoiceProcessor_WhenNeedsReviewMoveFails_StillSendsDigestWithActualBillVendor()
+    {
+        SkipUnlessConfigured();
+
+        var factory = CreateFactory();
+        await SkipUnlessPaceSchemaPublishedAsync(factory);
+
+        var invoices = new InvoiceRepository(factory, NullLogger<InvoiceRepository>.Instance);
+        var paceSubmissions = new PaceSubmissionRepository(factory, NullLogger<PaceSubmissionRepository>.Instance);
+        var (mailMessageId, mailAttachmentId) = await CreateRecordedPdfAsync(factory);
+        var invoiceNumber = $"INV-{Guid.NewGuid():N}"[..20];
+        await invoices.RecordAsync(NewInvoice(mailMessageId, mailAttachmentId, invoiceNumber), CancellationToken.None);
+
+        var mailSource = new RecordingMailSource { MoveFailure = new HttpRequestException("Graph move failed") };
+        var mailSender = new RecordingMailSender();
+        var processor = new PaceInvoiceProcessor(
+            mailSource,
+            new MailMessageRepository(factory, NullLogger<MailMessageRepository>.Instance),
+            paceSubmissions,
+            new StubPaceInvoiceService(new PaceInvoiceSubmissionResult
+            {
+                StatusCode = PaceInvoiceOutcomeStatus.BillCreated,
+                PaceBillBatchId = "111",
+                PaceBillId = "222",
+                BillVendor = "SANMAR",
+                RequiresReview = true
+            }),
+            new ErrorNotifier(
+                mailSender,
+                Options.Create(new AlertOptions { Recipients = ["errors@wallacegraphics.com"] }),
+                NullLogger<ErrorNotifier>.Instance),
+            NullLogger<PaceInvoiceProcessor>.Instance);
+
+        await Assert.ThrowsAsync<HttpRequestException>(() => processor.ProcessPendingAsync(processingRunId: null, CancellationToken.None));
+
+        var mailStatus = await LoadMailStatusAsync(factory, mailMessageId);
+        Assert.Equal((int)ApStatus.MailNeedsReview, mailStatus.StatusId);
+
+        var digest = Assert.Single(mailSender.Requests, request => request.Subject == "AP Automation - Pace invoices needing review (no PO found)");
+        Assert.Contains(invoiceNumber, digest.Body);
+        Assert.Contains("vendor SANMAR", digest.Body);
+    }
+
+    [SkippableFact]
     public async Task PaceInvoiceProcessor_WhenNoInvoiceRequiresReview_SendsNoDigestEmail()
     {
         SkipUnlessConfigured();
@@ -1131,8 +1175,15 @@ public class SqlRepositoryTests
 
         public Task<byte[]> GetAttachmentContentAsync(string messageId, string attachmentId, CancellationToken cancellationToken) => Task.FromResult(Array.Empty<byte>());
 
+        public Exception? MoveFailure { get; init; }
+
         public Task<string> MoveMessageAsync(string messageId, MailDestinationFolder destination, CancellationToken cancellationToken)
         {
+            if (MoveFailure is not null)
+            {
+                return Task.FromException<string>(MoveFailure);
+            }
+
             Moves.Add((messageId, destination));
             return Task.FromResult(messageId);
         }

@@ -221,22 +221,25 @@ public sealed class PaceInvoiceProcessor(
             : result.ErrorMessage;
 
         await mailMessageRepository.SetStatusAsync(claim.MailMessageId, ApStatus.MailNeedsReview, reason, cancellationToken);
+
+        // Added before the move: once the status is committed this submission is final and will not be
+        // claimed again, so a move failure below must not drop it from the digest.
+        needsReviewEntries.Add(new PaceNeedsReviewEntry(
+            claim.InvoiceId,
+            claim.InvoiceNumber,
+            claim.CustomerPO,
+            result.BillVendor ?? claim.PaceVendorAccountNumber,
+            result.StatusCode,
+            result.PaceBillBatchId,
+            result.PaceBillId,
+            reason));
+
         await mailSource.MoveMessageAsync(claim.GraphMessageId, MailDestinationFolder.NeedsReview, cancellationToken);
 
         logger.LogInformation(
             "Pace invoice {InvoiceId} (no matching PO) routed message {GraphMessageId} to NeedsReview.",
             claim.InvoiceId,
             claim.GraphMessageId);
-
-        needsReviewEntries.Add(new PaceNeedsReviewEntry(
-            claim.InvoiceId,
-            claim.InvoiceNumber,
-            claim.CustomerPO,
-            claim.PaceVendorAccountNumber,
-            result.StatusCode,
-            result.PaceBillBatchId,
-            result.PaceBillId,
-            reason));
     }
 
     private static string BuildNeedsReviewDigestBody(IReadOnlyList<PaceNeedsReviewEntry> entries)

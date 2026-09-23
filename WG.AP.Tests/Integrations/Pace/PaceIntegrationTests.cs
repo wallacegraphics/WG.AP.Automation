@@ -1178,20 +1178,21 @@ public sealed class PaceIntegrationTests
     }
 
     [Fact]
-    public async Task PaceInvoiceService_WhenPaceVendorAccountNumberIsMissing_ReturnsErrorBeforeDuplicateProbe()
+    public async Task PaceInvoiceService_WhenPaceVendorAccountNumberIsMissing_SkipsUpfrontProbeAndUsesPoVendor()
     {
-        var billLookupCalled = false;
+        var billXpaths = new List<string?>();
         var service = new PaceInvoiceService(
             new FakePaceClient(_ =>
             {
                 if (_.ObjectName == "Bill")
                 {
-                    billLookupCalled = true;
+                    billXpaths.Add(_.XpathFilter);
                 }
 
                 return Task.FromResult(_.ObjectName switch
                 {
                     "PurchaseOrderLine" => Group("PurchaseOrderLine", Row(("id", 163108), ("qtyReceived", 1))),
+                    "PurchaseOrder" => DefaultPurchaseOrderValueObjects(),
                     "PurchaseOrderReceipt" => Group("PurchaseOrderReceipt", Row(("id", 144841), ("purchaseOrderLine", 163108), ("quantity", 1), ("unitCost", 40), ("extendedPrice", 40), ("stockingUOM", "EA"))),
                     "BillLine" => Group("BillLine"),
                     "Bill" => Group("Bill"),
@@ -1204,9 +1205,10 @@ public sealed class PaceIntegrationTests
 
         var result = await service.SubmitAsync(NewSubmission(paceVendorAccountNumber: null), CancellationToken.None);
 
-        Assert.Equal(PaceInvoiceOutcomeStatus.Error, result.StatusCode);
-        Assert.Contains("Pace vendor account number", result.ErrorMessage);
-        Assert.False(billLookupCalled);
+        Assert.DoesNotContain("Pace vendor account number", result.ErrorMessage ?? string.Empty);
+        // Only the PO-vendor probe ran; the configured-account probe was skipped.
+        Assert.Single(billXpaths);
+        Assert.Contains("77000-0000", billXpaths[0]);
     }
 
     [Fact]

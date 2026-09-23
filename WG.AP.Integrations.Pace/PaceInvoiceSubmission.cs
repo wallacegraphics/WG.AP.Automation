@@ -24,6 +24,9 @@ public sealed record PaceInvoiceSubmissionResult
 
     public string? PaceBillLineId { get; init; }
 
+    /// <summary>The Pace vendor the bill was (or in dry-run would be) created against, when known.</summary>
+    public string? BillVendor { get; init; }
+
     public string? ErrorMessage { get; init; }
 
     public bool RequiresReview { get; init; }

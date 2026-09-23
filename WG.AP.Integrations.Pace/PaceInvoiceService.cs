@@ -49,20 +49,12 @@ public sealed class PaceInvoiceService(
     {
         try
         {
-            if (string.IsNullOrWhiteSpace(submission.PaceVendorAccountNumber))
-            {
-                var errorMessage = $"Pace invoice '{submission.Fields.InvoiceNumber}' for PO '{submission.Fields.CustomerPO}': client has no Pace vendor account number configured.";
-                logger.LogError("{ErrorMessage} InvoiceId={InvoiceId}.", errorMessage, submission.InvoiceId);
-
-                return new PaceInvoiceSubmissionResult
-                {
-                    StatusCode = PaceInvoiceOutcomeStatus.Error,
-                    ErrorMessage = errorMessage
-                };
-            }
-
+            // No PaceVendorAccountNumber precondition: the bill vendor is resolved per lane (the PO's own vendor,
+            // or the ClientCode vendor for no-PO bills), and each lane validates the identity it actually uses.
             var normalizedInvoiceNumber = NormalizePaceInvoiceNumber(submission.Fields.InvoiceNumber);
-            var existingBills = await LoadBillsByPaceVendorAccountNumberAndInvoiceAsync(submission.PaceVendorAccountNumber, normalizedInvoiceNumber, cancellationToken);
+            var existingBills = string.IsNullOrWhiteSpace(submission.PaceVendorAccountNumber)
+                ? []
+                : await LoadBillsByPaceVendorAccountNumberAndInvoiceAsync(submission.PaceVendorAccountNumber, normalizedInvoiceNumber, cancellationToken);
 
             if (existingBills.Count > 0)
             {
@@ -344,6 +336,7 @@ public sealed class PaceInvoiceService(
                 PaceBillBatchId = resolved.BillBatchId.ToString(System.Globalization.CultureInfo.InvariantCulture),
                 PaceBillId = createdBill.Id.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
                 PaceBillLineId = string.Join(",", createdLineIds),
+                BillVendor = poVendor,
                 ResponseJson = SerializeResponse(new
                 {
                     submission.Fields.InvoiceNumber,
@@ -563,6 +556,7 @@ public sealed class PaceInvoiceService(
                     VendorDefaultGlDepartment = vendorDefaultCoding.GlDepartment
                 }),
                 ErrorMessage = $"Pace invoice '{submission.Fields.InvoiceNumber}' for PO '{submission.Fields.CustomerPO}': no matching Pace PO found; Pace writes are disabled, a bill would be created using the Pace vendor default GL account/department.",
+                BillVendor = vendorDefaultCoding.Id ?? vendorDefaultCoding.Name,
                 RequiresReview = true
             };
         }
@@ -636,6 +630,7 @@ public sealed class PaceInvoiceService(
             PaceBillBatchId = resolved.BillBatchId.ToString(System.Globalization.CultureInfo.InvariantCulture),
             PaceBillId = createdBill.Id.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
             PaceBillLineId = createdLine.Id.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            BillVendor = defaultNoPoVendor,
             ResponseJson = SerializeResponse(new
             {
                 submission.Fields.InvoiceNumber,
