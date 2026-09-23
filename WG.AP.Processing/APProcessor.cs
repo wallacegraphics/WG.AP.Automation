@@ -513,9 +513,36 @@ public sealed class APProcessor(
             try
             {
                 pdfBytes = await attachmentFileStore.LoadAsync(pdf.StoredPath, cancellationToken);
-                storedPath = pdf.StoredPath;
-                sha256 = pdf.ContentSha256;
-                duplicate = await mailAttachmentRepository.FindDuplicateByHashAsync(pdf.MailAttachmentId, sha256, cancellationToken);
+
+                if (StoredBytesMatchRecordedHash(pdfBytes, pdf.ContentSha256))
+                {
+                    storedPath = pdf.StoredPath;
+                    sha256 = pdf.ContentSha256;
+                    duplicate = await mailAttachmentRepository.FindDuplicateByHashAsync(pdf.MailAttachmentId, sha256, cancellationToken);
+                }
+                else
+                {
+                    // The file exists but no longer hashes to what was recorded (partial write, overwrite,
+                    // share corruption). Extracting from it would put data in Pace that the ledger's hash
+                    // does not describe. Re-fetch the original from Graph into a fresh file of this row's
+                    // own: the damaged path may be shared by other rows, so it is neither overwritten nor
+                    // reused here.
+                    logger.LogWarning(
+                        "Message {MessageId}: attachment '{FileName}' stored at {StoredPath} no longer matches its recorded " +
+                        "SHA-256; re-fetching from Graph.",
+                        message.Id, pdf.Attachment.Name, pdf.StoredPath);
+
+                    pdfBytes = await mailSource.GetAttachmentContentAsync(message.Id, pdf.Attachment.Id, cancellationToken);
+                    sha256 = SHA256.HashData(pdfBytes);
+                    storedPath = (await attachmentFileStore.SaveAsync(
+                        pdf.MailAttachmentId,
+                        pdf.Attachment.Name,
+                        message.ReceivedDateTime ?? DateTimeOffset.UtcNow,
+                        pdfBytes,
+                        cancellationToken)).RelativePath;
+                    await mailAttachmentRepository.SetStoredAsync(pdf.MailAttachmentId, storedPath, sha256, cancellationToken);
+                    duplicate = await mailAttachmentRepository.FindDuplicateByHashAsync(pdf.MailAttachmentId, sha256, cancellationToken);
+                }
             }
             catch (Exception exception) when (exception is FileNotFoundException or DirectoryNotFoundException)
             {
@@ -606,7 +633,14 @@ public sealed class APProcessor(
     }
 
     /// <summary>
-    /// Points a never-stored-before attachment at an existing file with identical content if one
+    /// True when bytes loaded from the attachment store still hash to the SHA-256 recorded when they
+    /// were first written.
+    /// </summary>
+    internal static bool StoredBytesMatchRecordedHash(byte[] content, byte[] recordedSha256) =>
+        CryptographicOperations.FixedTimeEquals(SHA256.HashData(content), recordedSha256);
+
+    /// <summary>
+    /// Points a never-stored-before attachment
     /// exists, or writes a new one if not - either way, records the row.
     /// </summary>
     /// <remarks>
