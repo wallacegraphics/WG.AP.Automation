@@ -276,7 +276,7 @@ public sealed class PaceIntegrationTests
             "Bill" when descriptor.XpathFilter!.Contains("77000-0000", StringComparison.Ordinal) =>
                 Group("Bill", Row(("id", 55555), ("vendor", "77000-0000"), ("invoiceNumber", "163939830"), ("billBatch", "16296"), ("postingStatus", "Open"))),
             // The existing bill already has its line for this receipt, so it's fully entered, not just found.
-            "BillLine" => Group("BillLine", Row(("id", 9001), ("purchaseOrderReceipt", 144841), ("bill", "55555"))),
+            "BillLine" => Group("BillLine", Row(("id", 9001), ("purchaseOrderReceipt", 144841), ("bill", "55555"), ("invoiceAmount", 77253.12m))),
             _ => BillableInvoiceValueObjects(descriptor.ObjectName!)
         }))
         {
@@ -706,7 +706,7 @@ public sealed class PaceIntegrationTests
             {
                 "Bill" => Group("Bill", Row(("id", 12345), ("invoiceNumber", "INV-163939830"), ("billBatch", "987"))),
                 // The existing no-PO bill already has its single line, so it's fully entered.
-                "BillLine" => Group("BillLine", Row(("id", 9001), ("bill", "12345"))),
+                "BillLine" => Group("BillLine", Row(("id", 9001), ("bill", "12345"), ("invoiceAmount", 77253.12m))),
                 _ => Group(_.ObjectName!)
             })),
             UnusedBillBatchResolver,
@@ -1155,7 +1155,7 @@ public sealed class PaceIntegrationTests
                     "PurchaseOrderLine" => Group("PurchaseOrderLine", Row(("id", 163108), ("qtyReceived", 1))),
                     "PurchaseOrder" => DefaultPurchaseOrderValueObjects(),
                     "Bill" => Group("Bill", Row(("id", 12345), ("vendor", "77000-0000"), ("invoiceNumber", "INV-163939830"), ("poNumber", "2887-2533"), ("billBatch", "987"), ("postingStatus", "Open"))),
-                    "BillLine" => Group("BillLine", Row(("id", 5001), ("purchaseOrderReceipt", 144841), ("bill", "12345"))),
+                    "BillLine" => Group("BillLine", Row(("id", 5001), ("purchaseOrderReceipt", 144841), ("bill", "12345"), ("invoiceAmount", 77253.12m))),
                     _ => throw new InvalidOperationException(_.ObjectName)
                 });
             }),
@@ -1227,7 +1227,7 @@ public sealed class PaceIntegrationTests
                     "PurchaseOrder" => DefaultPurchaseOrderValueObjects(),
                     "PurchaseOrderReceipt" => Group("PurchaseOrderReceipt",
                         Row(("id", 144841), ("purchaseOrderLine", 163108), ("quantity", 1), ("unitCost", 77253.12m), ("extendedPrice", 77253.12m), ("stockingUOM", "EA"))),
-                    "BillLine" => Group("BillLine", Row(("id", 5001), ("purchaseOrderReceipt", 144841), ("bill", "12345"))),
+                    "BillLine" => Group("BillLine", Row(("id", 5001), ("purchaseOrderReceipt", 144841), ("bill", "12345"), ("invoiceAmount", 77253.12m))),
                     _ => throw new InvalidOperationException(_.ObjectName)
                 });
             }),
@@ -1274,6 +1274,43 @@ public sealed class PaceIntegrationTests
         Assert.Equal(PaceInvoiceOutcomeStatus.PoNotReceived, result.StatusCode);
         Assert.True(purchaseOrderLineLookupCalled);
         Assert.DoesNotContain("was not found using normalized invoice number", result.ErrorMessage);
+    }
+
+    [Fact]
+    public async Task PaceInvoiceService_WithWriteEnabled_WhenDuplicateBillProbeReturns404OnALaterPage_ReturnsErrorAndDoesNotCreateBill()
+    {
+        // Page 1 already returned bills, so a 404 on page 2 cannot mean "no matching bill". Reading it that way
+        // would throw away the bills found and let createBill write a duplicate.
+        var createBillCalled = false;
+        var firstPage = Enumerable.Range(1, 500)
+            .Select(id => Row(("id", id), ("vendor", "77000-0000"), ("invoiceNumber", "163939830"), ("billBatch", "987"), ("postingStatus", "Open")))
+            .ToArray();
+        var client = new FakeWriteEnabledClient(descriptor => descriptor.ObjectName switch
+        {
+            "Bill" when descriptor.Offset > 0 =>
+                Task.FromException<ValueObjectsGroup>(new ApiException("missing bill", 404, "not found", new Dictionary<string, IEnumerable<string>>(), null)),
+            "Bill" => Task.FromResult(Group("Bill", 501, firstPage)),
+            _ => Task.FromResult(BillableInvoiceValueObjects(descriptor.ObjectName!))
+        })
+        {
+            OnCreateBill = _ =>
+            {
+                createBillCalled = true;
+                return new Bill { Id = 1 };
+            }
+        };
+
+        var service = new PaceInvoiceService(
+            client,
+            new PaceBillBatchResolver(client, NullLogger<PaceBillBatchResolver>.Instance),
+            Options.Create(WriteEnabledPaceOptions()),
+            NullLogger<PaceInvoiceService>.Instance);
+
+        var result = await service.SubmitAsync(NewSubmission(), CancellationToken.None);
+
+        Assert.Equal(PaceInvoiceOutcomeStatus.Error, result.StatusCode);
+        Assert.Contains("Bill", result.ErrorMessage);
+        Assert.False(createBillCalled);
     }
 
     [Fact]
@@ -1343,7 +1380,7 @@ public sealed class PaceIntegrationTests
                     "PurchaseOrderReceipt" => Group("PurchaseOrderReceipt",
                         Row(("id", 144841), ("purchaseOrderLine", 163108), ("quantity", 1), ("unitCost", 77253.12m), ("extendedPrice", 77253.12m), ("billedQuantity", 1), ("billedAmount", 77253.12m), ("stockingUOM", "EA"))),
                     "Bill" => Group("Bill", Row(("id", 12345), ("vendor", "77000-0000"), ("invoiceNumber", "INV-163939830"), ("poNumber", "2887-2533"), ("billBatch", "987"), ("postingStatus", "Open"))),
-                    "BillLine" => Group("BillLine", Row(("id", 5001), ("purchaseOrderReceipt", 144841), ("bill", "12345"))),
+                    "BillLine" => Group("BillLine", Row(("id", 5001), ("purchaseOrderReceipt", 144841), ("bill", "12345"), ("invoiceAmount", 77253.12m))),
                     _ => throw new InvalidOperationException(_.ObjectName)
                 });
             }),
@@ -1358,6 +1395,57 @@ public sealed class PaceIntegrationTests
         Assert.Equal("987", result.PaceBillBatchId);
         Assert.Equal("@bill = 12345", billLineXpath);
         Assert.False(receiptLookupCalled);
+    }
+
+    [Theory]
+    [InlineData(40000.00)]
+    [InlineData(null)]
+    public async Task PaceInvoiceService_WithWriteEnabled_WhenExistingBillLinesDoNotCoverInvoiceTotal_ReturnsReviewErrorWithoutWriting(double? existingLineAmount)
+    {
+        // A prior attempt's createBillLine loop stopped part way: the bill has some lines, but not all of them.
+        // Appending the rest cannot be done safely (the posted receipts no longer look billable), and reporting
+        // AlreadyEntered would file the invoice as Processed with a partial bill in Pace - so it goes to review.
+        var createBillCalled = false;
+        var createBillLineCalled = false;
+        var existingLine = existingLineAmount is null
+            ? Row(("id", 5001), ("purchaseOrderReceipt", 144841), ("bill", "12345"))
+            : Row(("id", 5001), ("purchaseOrderReceipt", 144841), ("bill", "12345"), ("invoiceAmount", (decimal)existingLineAmount.Value));
+        var client = new FakeWriteEnabledClient(_ => Task.FromResult(_.ObjectName switch
+        {
+            "PurchaseOrderLine" => Group("PurchaseOrderLine", Row(("id", 163108), ("qtyReceived", 1))),
+            "PurchaseOrder" => DefaultPurchaseOrderValueObjects(),
+            "Bill" => Group("Bill", Row(("id", 12345), ("vendor", "77000-0000"), ("invoiceNumber", "163939830"), ("billBatch", "987"), ("postingStatus", "Open"))),
+            "BillLine" => Group("BillLine", existingLine),
+            _ => throw new InvalidOperationException(_.ObjectName!)
+        }))
+        {
+            OnCreateBill = _ =>
+            {
+                createBillCalled = true;
+                return new Bill { Id = 1 };
+            },
+            OnCreateBillLine = _ =>
+            {
+                createBillLineCalled = true;
+                return new BillLine { Id = 1 };
+            }
+        };
+
+        var service = new PaceInvoiceService(
+            client,
+            new PaceBillBatchResolver(client, NullLogger<PaceBillBatchResolver>.Instance),
+            Options.Create(WriteEnabledPaceOptions()),
+            NullLogger<PaceInvoiceService>.Instance);
+
+        var result = await service.SubmitAsync(NewSubmission(), CancellationToken.None);
+
+        Assert.Equal(PaceInvoiceOutcomeStatus.Error, result.StatusCode);
+        Assert.True(result.RequiresReview);
+        Assert.Contains("12345", result.ErrorMessage);
+        Assert.Contains("manual review", result.ErrorMessage);
+        Assert.Null(result.PaceBillId);
+        Assert.False(createBillCalled);
+        Assert.False(createBillLineCalled);
     }
 
     [Fact]

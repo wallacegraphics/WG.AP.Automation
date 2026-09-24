@@ -133,7 +133,12 @@ public sealed class PaceInvoiceService(
             // an error instead of AlreadyEntered (docs/references/project-plan.md: an existing Pace bill for
             // (vendor, invoiceNumber) means ALREADY ENTERED).
             var poVendorExistingBills = await LoadBillsForBillVendorAsync(poVendor!, normalizedInvoiceNumber, cancellationToken);
-            var reconciliationTarget = await SelectIncompleteBillToResumeAsync(submission, poVendorExistingBills, poVendor, cancellationToken);
+            var (reconciliationTarget, partialEntryError) = await SelectIncompleteBillToResumeAsync(submission, poVendorExistingBills, poVendor, cancellationToken);
+
+            if (partialEntryError is not null)
+            {
+                return partialEntryError;
+            }
 
             if (poVendorExistingBills.Count > 0 && reconciliationTarget is null)
             {
@@ -561,7 +566,12 @@ public sealed class PaceInvoiceService(
         }
 
         var noPoVendorExistingBills = await LoadBillsForBillVendorAsync(defaultNoPoVendor, normalizedInvoiceNumber, cancellationToken);
-        var noPoReconciliationTarget = await SelectIncompleteBillToResumeAsync(submission, noPoVendorExistingBills, defaultNoPoVendor, cancellationToken);
+        var (noPoReconciliationTarget, noPoPartialEntryError) = await SelectIncompleteBillToResumeAsync(submission, noPoVendorExistingBills, defaultNoPoVendor, cancellationToken);
+
+        if (noPoPartialEntryError is not null)
+        {
+            return noPoPartialEntryError;
+        }
 
         if (noPoVendorExistingBills.Count > 0 && noPoReconciliationTarget is null)
         {
@@ -701,12 +711,15 @@ public sealed class PaceInvoiceService(
     /// <summary>
     /// Decides whether an existing bill for this vendor/invoice is a completed entry (the ordinary duplicate
     /// case) or the debris of an attempt whose createBill succeeded and whose createBillLine never landed.
-    /// Returns null when there is nothing to resume - no bill at all, or a bill that already carries lines.
-    /// A bill carrying *some* lines is deliberately left alone: Pace raises a receipt's billedQuantity as each
-    /// line is posted, so the receipts behind those lines no longer look billable and the remainder cannot be
-    /// reconstructed here without double-billing. That case belongs to a human, and reports as AlreadyEntered.
+    /// Returns no resume target when there is nothing to resume - no bill at all, or a bill that already carries
+    /// lines. A bill carrying lines is never appended to: Pace raises a receipt's billedQuantity as each line is
+    /// posted, so the receipts behind those lines no longer look billable and the remainder cannot be
+    /// reconstructed here without double-billing. Its lines are summed against the invoice total instead - a
+    /// match is the ordinary duplicate (AlreadyEntered); a shortfall, or a line whose amount Pace did not return,
+    /// means a prior attempt's createBillLine loop stopped part way, and is returned as PartialEntryError so a
+    /// human hears about it rather than the invoice being filed as Processed.
     /// </summary>
-    private async Task<BillValue?> SelectIncompleteBillToResumeAsync(
+    private async Task<(BillValue? ResumeTarget, PaceInvoiceSubmissionResult? PartialEntryError)> SelectIncompleteBillToResumeAsync(
         PaceInvoiceSubmission submission,
         List<BillValue> existingBills,
         string? billVendor,
@@ -714,14 +727,20 @@ public sealed class PaceInvoiceService(
     {
         if (existingBills.Count == 0)
         {
-            return null;
+            return (null, null);
         }
 
         var existingLines = await LoadBillLinesForBillsAsync(existingBills.Select(bill => bill.Id), cancellationToken);
 
         if (existingLines.Count > 0)
         {
-            return null;
+            var linesTotal = existingLines.Sum(line => line.InvoiceAmount ?? 0m);
+            var allAmountsKnown = existingLines.All(line => line.InvoiceAmount is not null);
+
+            // Pace stores BillLine.invoiceAmount as a double, so compare at cents rather than exact decimal.
+            return allAmountsKnown && decimal.Round(linesTotal, 2) == decimal.Round(submission.Fields.Total, 2)
+                ? (null, null)
+                : (null, BuildPartiallyEnteredError(submission, billVendor, existingBills, existingLines, linesTotal, allAmountsKnown));
         }
 
         var target = existingBills[0];
@@ -735,7 +754,36 @@ public sealed class PaceInvoiceService(
             existingBills.Count,
             submission.InvoiceId);
 
-        return target;
+        return (target, null);
+    }
+
+    private PaceInvoiceSubmissionResult BuildPartiallyEnteredError(
+        PaceInvoiceSubmission submission,
+        string? billVendor,
+        List<BillValue> existingBills,
+        List<BillLineValue> existingLines,
+        decimal linesTotal,
+        bool allAmountsKnown)
+    {
+        var amountDetail = allAmountsKnown
+            ? $"its {existingLines.Count} bill line(s) total {linesTotal:0.####}, not the invoice total {submission.Fields.Total:0.####}"
+            : $"Pace did not return an amount for every one of its {existingLines.Count} bill line(s), so it cannot be confirmed to match the invoice total {submission.Fields.Total:0.####}";
+        var errorMessage = $"Pace invoice '{submission.Fields.InvoiceNumber}' for PO '{submission.Fields.CustomerPO}': Pace bill(s) {string.Join(", ", existingBills.Select(bill => bill.Id))} for vendor {billVendor} already exist, but {amountDetail}. Bill line ids: {string.Join(", ", existingLines.Select(line => line.Id))}. The bill may be only partly entered; no lines were added and it needs manual review.";
+
+        logger.LogError(
+            "{ErrorMessage} InvoiceId={InvoiceId}; PaceVendorAccountNumber={PaceVendorAccountNumber}.",
+            errorMessage,
+            submission.InvoiceId,
+            submission.PaceVendorAccountNumber);
+
+        return new PaceInvoiceSubmissionResult
+        {
+            StatusCode = PaceInvoiceOutcomeStatus.Error,
+            ResponseJson = SerializeResponse(new { submission.Fields.InvoiceNumber, submission.Fields.CustomerPO, InvoiceTotal = submission.Fields.Total, Vendor = billVendor, Bills = existingBills, BillLines = existingLines }),
+            ErrorMessage = errorMessage,
+            RequiresReview = true,
+            BillVendor = billVendor
+        };
     }
 
     /// <summary>
@@ -1066,15 +1114,19 @@ public sealed class PaceInvoiceService(
                 ]
             }, cancellationToken);
         }
+        // Only a 404 on the first page means "no matching bill". A 404 after a page already returned rows is not
+        // a no-match - swallowing it would discard the bills found so far and let createBill write a duplicate.
         catch (PaceValueObjectNotFoundException exception) when (string.Equals(exception.ObjectName, "Bill", StringComparison.OrdinalIgnoreCase)
+            && exception.Offset == 0
             && !IsEndpointNotFoundResponse(exception.ApiException))
         {
             logger.LogInformation(
-                "Pace bill duplicate probe found no bill for Pace vendor account number {PaceVendorAccountNumber} and invoice number {InvoiceNumber}. XPathFilter={XPathFilter}; Offset={Offset}.",
+                "Pace bill duplicate probe found no bill for Pace vendor account number {PaceVendorAccountNumber} and invoice number {InvoiceNumber}. XPathFilter={XPathFilter}; Offset={Offset}; ResponseBody={ResponseBody}.",
                 paceVendorAccountNumber,
                 invoiceNumber,
                 exception.XpathFilter,
-                exception.Offset);
+                exception.Offset,
+                exception.ApiException.Response);
 
             return [];
         }
@@ -1153,7 +1205,8 @@ public sealed class PaceInvoiceService(
             [
                 Field("id", "@id"),
                 Field("purchaseOrderReceipt", "@purchaseOrderReceipt"),
-                Field("bill", "@bill")
+                Field("bill", "@bill"),
+                Field("invoiceAmount", "@invoiceAmount")
             ]
         }, cancellationToken);
 
@@ -1165,7 +1218,8 @@ public sealed class PaceInvoiceService(
             .Select(fields => new BillLineValue(
                 GetRequiredInt(fields, "id"),
                 GetNullableInt(fields, "purchaseOrderReceipt"),
-                GetString(fields, "bill")))
+                GetString(fields, "bill"),
+                GetDecimal(fields, "invoiceAmount")))
             .ToList();
 
     private async Task<List<IReadOnlyDictionary<string, object?>>> LoadAllValueObjectRowsAsync(ValueObjectDescriptor descriptor, CancellationToken cancellationToken)
@@ -1495,7 +1549,7 @@ public sealed class PaceInvoiceService(
 
     private sealed record PurchaseOrderReceiptValue(int Id, int PurchaseOrderLine, decimal Quantity, decimal UnitCost, decimal? ExtendedPrice, decimal BilledQuantity, decimal? BilledAmount, string? StockingUom);
 
-    private sealed record BillLineValue(int Id, int? PurchaseOrderReceipt, string? Bill);
+    private sealed record BillLineValue(int Id, int? PurchaseOrderReceipt, string? Bill, decimal? InvoiceAmount = null);
 
     private sealed record BillValue(int Id, string? Vendor, string? InvoiceNumber, string? PoNumber, string? BillBatch, string? PostingStatus);
 
