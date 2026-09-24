@@ -18,6 +18,10 @@ public sealed class SqlConnectionFactory(IOptions<DatabaseOptions> options)
 
     public string AppIdentity => options.Value.AppIdentity;
 
+    public int PaceRoutingLeaseMinutes => options.Value.PaceRoutingLeaseMinutes;
+
+    public int PaceRecoveryWindowDays => options.Value.PaceRecoveryWindowDays;
+
     public async Task<SqlConnection> OpenAsync(CancellationToken cancellationToken)
     {
         var connection = new SqlConnection(options.Value.ConnectionString);

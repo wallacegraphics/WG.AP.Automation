@@ -242,6 +242,48 @@ an idempotency key.
 claim recovery: a crashed `InProgress` row becomes claimable again after the repository lease window,
 while stale claim-token updates are ignored.
 
+### Mail routing after the Pace outcome
+
+A submission can be Pace-final, and so never claimed again, while its mail routing is still outstanding:
+the mail status update, the move to Errors or NeedsReview, and the line in the run's summary email.
+That state is tracked separately from `StatusCodeId`:
+
+| Column | Meaning |
+|---|---|
+| `RequiresReview` | The outcome belongs in the NeedsReview lane rather than Errors. |
+| `MailRoutedOn` | Routing is fully done: status set, message moved **and** its summary line sent. NULL = still outstanding. |
+| `NotifiedOn` | The summary line went out, so a redone move is not reported a second time. |
+| `BillVendor` | The vendor the bill was actually created under, used when a summary line is rebuilt from the row. |
+| `RoutingClaimedOn` | Routing lease: which run currently owns this row's routing. |
+
+`ClaimUnroutedFinalSubmissionsAsync` runs at the start of every run and **claims** (not just reads)
+Error, PoNotReceived and RequiresReview rows whose `MailRoutedOn` is NULL, completed within
+`Database:PaceRecoveryWindowDays`. It renews their lease in the same statement, so two overlapping runs
+get disjoint rows. `CompleteAsync` starts the lease, so a sweep never takes a row that another run has
+just completed and is still routing. At the end of a run, every row that run failed to route has its
+lease handed back (set to an already-expired time), so the very next run redoes it.
+`Database:PaceRoutingLeaseMinutes` therefore only matters when a run crashes before it gets that far.
+Routing bookkeeping never bumps `ModifiedOn`, because the recovery window is measured from the Pace
+outcome.
+
+Two traps:
+
+- **Rows that existed before these columns have `RoutingClaimedOn` NULL, and the sweep never touches
+  them.** That is the only thing keeping recent history from being re-routed and re-reported on the
+  first run after deploy; the time window alone is not enough. It is also why a released lease is an
+  expired time and never NULL. Do not replace this with a PreDeployment backfill: sqlpackage plans the
+  column's own `ADD` from a pre-script snapshot, so the backfill either fails as a duplicate column or
+  is silently discarded by a table rebuild.
+- **`CompleteAsync` clears `MailRoutedOn` and `NotifiedOn`.** A completion is a new outcome, so a row
+  requeued with `Scripts/Operations/RequeuePaceDryRunPrepared.sql` starts a fresh routing cycle. Without
+  the reset, a stale `MailRoutedOn` would hide a failed second route from the sweep for good.
+
+There are no per-invoice Pace alert emails. Each run sends one **"AP Automation - Pace summary"**
+email with an Errors section (PoNotReceived lines labelled "PO not received") and a NeedsReview
+section. Each line ends with the folder the email was moved to, or says it could not be moved and is
+still in the Inbox. Rows are marked notified only after that email is actually sent, so a failed send
+puts them in the next run's summary.
+
 `intgr.PaceSubmissionStatus` is a lookup table rather than a text column on the outbox row. The
 normalization keeps deployed status ids stable and lets the code store `StatusCodeId` while still
 reporting readable status names in queries.
@@ -335,7 +377,7 @@ enforced by the database, not by C# — "a message is never claimed twice" is a 
   is the honest gap in duplicate coverage. Adding it needs a deliberate deployment step, because
   **`$select` is baked into the returned `deltaLink`** — the column stays NULL until a one-time full
   resync.
-  by probing rather than guessing. `dbo.Client.PaceVendorId` is the seam.
+  by probing rather than guessing. `dbo.Client.PaceVendorAccountNumber` is the seam.
 - **No status history**, so "how long was this in NeedsReview" is not answerable. A message sees at
   most two transitions today and `ApplicationLog` carries the trail.
 - **No scored format detection.** A client with two enabled formats is a configuration error rather

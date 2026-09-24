@@ -11,6 +11,8 @@ public sealed class MailAttachmentRepository(
     SqlConnectionFactory connectionFactory,
     ILogger<MailAttachmentRepository> logger)
 {
+    private sealed record AttachmentRow(long MailAttachmentId, string? StoredPath, byte[]? ContentSha256);
+
     /// <summary>
     /// Records every attachment on a message, including the ones nothing will read.
     /// </summary>
@@ -41,7 +43,7 @@ public sealed class MailAttachmentRepository(
 
             foreach (var attachment in attachments)
             {
-                var mailAttachmentId = await connection.QuerySingleAsync<long>(new CommandDefinition(
+                var row = await connection.QuerySingleAsync<AttachmentRow>(new CommandDefinition(
                     """
                     INSERT INTO [dbo].[MailAttachment]
                         ([MailMessageId], [GraphAttachmentId], [FileName], [ContentType], [SizeInBytes], [CreatedBy])
@@ -50,7 +52,7 @@ public sealed class MailAttachmentRepository(
                                         WHERE [MailMessageId] = @MailMessageId
                                           AND [GraphAttachmentId] = @GraphAttachmentId);
 
-                    SELECT [MailAttachmentId]
+                    SELECT [MailAttachmentId], [StoredPath], [ContentSha256]
                       FROM [dbo].[MailAttachment]
                      WHERE [MailMessageId] = @MailMessageId
                        AND [GraphAttachmentId] = @GraphAttachmentId;
@@ -67,7 +69,7 @@ public sealed class MailAttachmentRepository(
                     commandTimeout: connectionFactory.CommandTimeoutSeconds,
                     cancellationToken: cancellationToken));
 
-                recorded.Add(new RecordedAttachment(mailAttachmentId, attachment));
+                recorded.Add(new RecordedAttachment(row.MailAttachmentId, attachment, row.StoredPath, row.ContentSha256));
             }
 
             return recorded;
@@ -79,11 +81,14 @@ public sealed class MailAttachmentRepository(
         }
     }
 
-    /// <summary>Records where an attachment's bytes were written, and their hash.</summary>
+    /// <summary>Records where an attachment's bytes live, and their hash.</summary>
     /// <remarks>
-    /// Called only after the file has actually been written. <c>CK_MailAttachment_Stored</c> requires
-    /// the path and the hash together, and the ordering matters: file first, then the row. An orphan
-    /// file is harmless; a row pointing at a file that does not exist is not.
+    /// Called once the bytes are durably available at <c>storedPath</c> - either just-written by
+    /// <see cref="AttachmentFileStore.SaveAsync"/>, or, when a content-duplicate already exists,
+    /// already durable there from an earlier attachment (see <see cref="FindDuplicateByHashAsync"/>).
+    /// <c>CK_MailAttachment_Stored</c> requires the path and the hash together, and either way the
+    /// ordering matters: the bytes must already exist at that path before this call. An orphan file is
+    /// harmless; a row pointing at a file that does not exist is not.
     /// </remarks>
     public async Task SetStoredAsync(
         long mailAttachmentId,
@@ -141,7 +146,7 @@ public sealed class MailAttachmentRepository(
 
             return await connection.QuerySingleOrDefaultAsync<DuplicateAttachmentMatch?>(new CommandDefinition(
                 """
-                SELECT TOP (1) ma.[MailAttachmentId], ma.[MailMessageId], mm.[Subject]
+                SELECT TOP (1) ma.[MailAttachmentId], ma.[MailMessageId], mm.[Subject], ma.[StoredPath]
                  FROM [dbo].[MailAttachment] AS ma
                  JOIN [dbo].[MailMessage] AS mm ON mm.[MailMessageId] = ma.[MailMessageId]
                 WHERE ma.[ContentSha256] = @ContentSha256

@@ -58,6 +58,11 @@ builder.Services
     .Bind(builder.Configuration.GetSection(DatabaseOptions.SectionName))
     .Validate(options => !string.IsNullOrWhiteSpace(options.ConnectionString), $"{DatabaseOptions.SectionName}:ConnectionString is required.")
     .Validate(options => options.MaxAttempts >= 1, $"{DatabaseOptions.SectionName}:MaxAttempts must be 1 or greater.")
+    // 0 would make every live route immediately sweepable by an overlapping run - the double alert the lease exists to stop.
+    // Both Pace settings below have no code default, so a key missing from config binds as 0 and fails here.
+    .Validate(options => options.PaceRoutingLeaseMinutes >= 1, $"{DatabaseOptions.SectionName}:PaceRoutingLeaseMinutes is required and must be 1 or greater.")
+    // Capped as a sanity bound: a message still failing to route after a month needs a person, not another retry.
+    .Validate(options => options.PaceRecoveryWindowDays is >= 1 and <= 30, $"{DatabaseOptions.SectionName}:PaceRecoveryWindowDays is required and must be between 1 and 30.")
     .Validate(options => !string.IsNullOrWhiteSpace(options.AppIdentity), $"{DatabaseOptions.SectionName}:AppIdentity is required.")
     .ValidateOnStart();
 

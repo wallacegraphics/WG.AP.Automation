@@ -10,13 +10,19 @@ namespace WG.AP.Processor;
 /// </summary>
 public sealed class ErrorNotifier(IMailSender mailSender, IOptions<AlertOptions> alertOptions, ILogger<ErrorNotifier> logger)
 {
-    public async Task NotifyAsync(string subject, string body, CancellationToken cancellationToken)
+    /// <returns>
+    /// True when the alert was sent. Failures are still swallowed, but callers that must not send the same
+    /// alert twice (Pace mail-routing recovery) record delivery only on true.
+    /// </returns>
+    public async Task<bool> NotifyAsync(string subject, string body, CancellationToken cancellationToken)
     {
         try
         {
             await mailSender.SendMailAsync(
                 new MailSendRequest(subject, body, alertOptions.Value.Recipients),
                 cancellationToken);
+
+            return true;
         }
         catch (Exception exception)
         {
@@ -25,6 +31,7 @@ public sealed class ErrorNotifier(IMailSender mailSender, IOptions<AlertOptions>
             // setting the exit code) regardless of whether the alert itself could be sent - a
             // broken mail send must not mask or replace the original failure.
             logger.LogError(exception, "Failed to send alert email '{Subject}'.", subject);
+            return false;
         }
     }
 }

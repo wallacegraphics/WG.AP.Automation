@@ -22,12 +22,19 @@ public static class PaceServiceCollectionExtensions
             .ValidateOnStart();
 
         services.AddTransient<PaceBasicAuthHandler>();
+        services.AddTransient<PaceHttpLoggingHandler>();
 
         services.AddHttpClient(HttpClientName, (serviceProvider, httpClient) =>
             {
                 var options = serviceProvider.GetRequiredService<IOptions<PaceOptions>>().Value;
                 httpClient.Timeout = TimeSpan.FromSeconds(options.TimeoutSeconds);
             })
+            // The framework's default logging handlers only ever print the bare numeric status code
+            // with no indication of what it means - removed here so PaceHttpLoggingHandler (which
+            // reproduces the same four log lines, enriched with the status description) is the only
+            // one logging this client's requests, rather than both firing and doubling every line.
+            .RemoveAllLoggers()
+            .AddHttpMessageHandler<PaceHttpLoggingHandler>()
             .AddHttpMessageHandler<PaceBasicAuthHandler>();
 
         services.AddTransient<IPaceClient>(serviceProvider =>
@@ -37,10 +44,16 @@ public static class PaceServiceCollectionExtensions
 
             return new PaceClient(httpClientFactory.CreateClient(HttpClientName))
             {
-                BaseUrl = BuildPaceServiceBaseUrl(options.BaseUrl)
+                BaseUrl = BuildPaceServiceBaseUrl(options.BaseUrl),
+                // Default (false) reads the response as a stream and, on a JsonException, throws
+                // ApiException with Response = string.Empty - discarding whatever Pace actually sent.
+                // True reads it as a string first, so a deserialization failure still preserves the
+                // real body for logging/alerting instead of an empty "Response: " that can't be diagnosed.
+                ReadResponseAsString = true
             };
         });
 
+        services.AddTransient<PaceBillBatchResolver>();
         services.AddTransient<IPaceInvoiceService, PaceInvoiceService>();
 
         return services;
