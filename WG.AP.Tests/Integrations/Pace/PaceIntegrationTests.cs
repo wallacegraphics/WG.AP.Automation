@@ -271,10 +271,14 @@ public sealed class PaceIntegrationTests
     public async Task PaceInvoiceService_WithWriteEnabled_WhenBillExistsUnderPoVendor_ReturnsAlreadyEnteredAndDoesNotCreateBill()
     {
         var createBillCalled = false;
-        var client = new FakeWriteEnabledClient(descriptor => Task.FromResult(
-            descriptor.ObjectName == "Bill" && descriptor.XpathFilter!.Contains("77000-0000", StringComparison.Ordinal)
-                ? Group("Bill", Row(("id", 55555), ("vendor", "77000-0000"), ("invoiceNumber", "163939830"), ("billBatch", "16296"), ("postingStatus", "Open")))
-                : BillableInvoiceValueObjects(descriptor.ObjectName!)))
+        var client = new FakeWriteEnabledClient(descriptor => Task.FromResult(descriptor.ObjectName switch
+        {
+            "Bill" when descriptor.XpathFilter!.Contains("77000-0000", StringComparison.Ordinal) =>
+                Group("Bill", Row(("id", 55555), ("vendor", "77000-0000"), ("invoiceNumber", "163939830"), ("billBatch", "16296"), ("postingStatus", "Open"))),
+            // The existing bill already has its line for this receipt, so it's fully entered, not just found.
+            "BillLine" => Group("BillLine", Row(("id", 9001), ("purchaseOrderReceipt", 144841), ("bill", "55555"))),
+            _ => BillableInvoiceValueObjects(descriptor.ObjectName!)
+        }))
         {
             OnFind = (type, _) => type switch
             {
@@ -698,9 +702,13 @@ public sealed class PaceIntegrationTests
     public async Task PaceInvoiceService_WhenNoPoLines_AndWriteDisabled_AndBillExistsForNoPoVendor_ReturnsAlreadyEntered()
     {
         var service = new PaceInvoiceService(
-            new FakePaceClient(_ => Task.FromResult(_.ObjectName == "Bill"
-                ? Group("Bill", Row(("id", 12345), ("invoiceNumber", "INV-163939830"), ("billBatch", "987")))
-                : Group(_.ObjectName!))),
+            new FakePaceClient(_ => Task.FromResult(_.ObjectName switch
+            {
+                "Bill" => Group("Bill", Row(("id", 12345), ("invoiceNumber", "INV-163939830"), ("billBatch", "987"))),
+                // The existing no-PO bill already has its single line, so it's fully entered.
+                "BillLine" => Group("BillLine", Row(("id", 9001), ("bill", "12345"))),
+                _ => Group(_.ObjectName!)
+            })),
             UnusedBillBatchResolver,
             Options.Create(NewPaceOptions()),
             NullLogger<PaceInvoiceService>.Instance);
@@ -1147,6 +1155,7 @@ public sealed class PaceIntegrationTests
                     "PurchaseOrderLine" => Group("PurchaseOrderLine", Row(("id", 163108), ("qtyReceived", 1))),
                     "PurchaseOrder" => DefaultPurchaseOrderValueObjects(),
                     "Bill" => Group("Bill", Row(("id", 12345), ("vendor", "77000-0000"), ("invoiceNumber", "INV-163939830"), ("poNumber", "2887-2533"), ("billBatch", "987"), ("postingStatus", "Open"))),
+                    "BillLine" => Group("BillLine", Row(("id", 5001), ("purchaseOrderReceipt", 144841), ("bill", "12345"))),
                     _ => throw new InvalidOperationException(_.ObjectName)
                 });
             }),
@@ -1216,6 +1225,9 @@ public sealed class PaceIntegrationTests
                     "Bill" => Group("Bill", Row(("id", 12345), ("vendor", "77000-0000"))),
                     "PurchaseOrderLine" => Group("PurchaseOrderLine", Row(("id", 163108), ("qtyReceived", 1))),
                     "PurchaseOrder" => DefaultPurchaseOrderValueObjects(),
+                    "PurchaseOrderReceipt" => Group("PurchaseOrderReceipt",
+                        Row(("id", 144841), ("purchaseOrderLine", 163108), ("quantity", 1), ("unitCost", 77253.12m), ("extendedPrice", 77253.12m), ("stockingUOM", "EA"))),
+                    "BillLine" => Group("BillLine", Row(("id", 5001), ("purchaseOrderReceipt", 144841), ("bill", "12345"))),
                     _ => throw new InvalidOperationException(_.ObjectName)
                 });
             }),
@@ -1302,13 +1314,23 @@ public sealed class PaceIntegrationTests
     }
 
     [Fact]
-    public async Task PaceInvoiceService_WhenPaceBillExists_ReturnsAlreadyEnteredBeforePoReceiptGates()
+    public async Task PaceInvoiceService_WhenPaceBillWithLinesExists_ReturnsAlreadyEnteredEvenThoughEveryReceiptIsBilled()
     {
+        // Regression guard for where the duplicate probe sits. Pace raises a receipt's billedQuantity as each
+        // BillLine is posted, so on a re-submission of an invoice that was already billed no receipt looks
+        // billable. If the probe runs after the receipt gates, this returns Error instead of AlreadyEntered -
+        // routing a correctly-billed invoice to the Errors folder and alerting AP. See
+        // docs/references/project-plan.md: an existing Pace bill for (vendor, invoiceNumber) is ALREADY ENTERED.
+        string? billLineXpath = null;
         var receiptLookupCalled = false;
         var service = new PaceInvoiceService(
             new FakePaceClient(_ =>
             {
-                if (_.ObjectName == "PurchaseOrderReceipt")
+                if (_.ObjectName == "BillLine")
+                {
+                    billLineXpath = _.XpathFilter;
+                }
+                else if (_.ObjectName == "PurchaseOrderReceipt")
                 {
                     receiptLookupCalled = true;
                 }
@@ -1317,7 +1339,11 @@ public sealed class PaceIntegrationTests
                 {
                     "PurchaseOrderLine" => Group("PurchaseOrderLine", Row(("id", 163108), ("qtyReceived", 1))),
                     "PurchaseOrder" => DefaultPurchaseOrderValueObjects(),
+                    // Fully billed, exactly as Pace reports it once the bill line below exists.
+                    "PurchaseOrderReceipt" => Group("PurchaseOrderReceipt",
+                        Row(("id", 144841), ("purchaseOrderLine", 163108), ("quantity", 1), ("unitCost", 77253.12m), ("extendedPrice", 77253.12m), ("billedQuantity", 1), ("billedAmount", 77253.12m), ("stockingUOM", "EA"))),
                     "Bill" => Group("Bill", Row(("id", 12345), ("vendor", "77000-0000"), ("invoiceNumber", "INV-163939830"), ("poNumber", "2887-2533"), ("billBatch", "987"), ("postingStatus", "Open"))),
+                    "BillLine" => Group("BillLine", Row(("id", 5001), ("purchaseOrderReceipt", 144841), ("bill", "12345"))),
                     _ => throw new InvalidOperationException(_.ObjectName)
                 });
             }),
@@ -1330,7 +1356,81 @@ public sealed class PaceIntegrationTests
         Assert.Equal(PaceInvoiceOutcomeStatus.AlreadyEntered, result.StatusCode);
         Assert.Equal("12345", result.PaceBillId);
         Assert.Equal("987", result.PaceBillBatchId);
+        Assert.Equal("@bill = 12345", billLineXpath);
         Assert.False(receiptLookupCalled);
+    }
+
+    [Fact]
+    public async Task PaceInvoiceService_WhenExistingBillWithNoLinesIsAlreadyPosted_ReturnsErrorWithoutAddingLines()
+    {
+        var service = new PaceInvoiceService(
+            new FakePaceClient(_ => Task.FromResult(_.ObjectName switch
+            {
+                "PurchaseOrderLine" => Group("PurchaseOrderLine", Row(("id", 163108), ("qtyReceived", 1))),
+                "PurchaseOrder" => DefaultPurchaseOrderValueObjects(),
+                // Resuming skips the GL-period and batch checks createBill would have enforced, so a bill that
+                // is no longer Open must not have lines appended to it behind a human's back.
+                "Bill" => Group("Bill", Row(("id", 12345), ("vendor", "77000-0000"), ("invoiceNumber", "163939830"), ("billBatch", "987"), ("postingStatus", "Posted"))),
+                "BillLine" => Group("BillLine"),
+                _ => throw new InvalidOperationException(_.ObjectName)
+            })),
+            UnusedBillBatchResolver,
+            Options.Create(WriteEnabledPaceOptions()),
+            NullLogger<PaceInvoiceService>.Instance);
+
+        var result = await service.SubmitAsync(NewSubmission(), CancellationToken.None);
+
+        Assert.Equal(PaceInvoiceOutcomeStatus.Error, result.StatusCode);
+        Assert.Contains("posting status", result.ErrorMessage);
+        Assert.Contains("Posted", result.ErrorMessage);
+    }
+
+    [Fact]
+    public async Task PaceInvoiceService_WithWriteEnabled_WhenExistingBillIsMissingLines_ResumesAgainstExistingBillInsteadOfReportingAlreadyEntered()
+    {
+        var createBillCalled = false;
+        var createdBillLineRequests = new List<BillLine>();
+        var client = new FakeWriteEnabledClient(_ => Task.FromResult(_.ObjectName switch
+        {
+            "PurchaseOrderLine" => Group("PurchaseOrderLine",
+                Row(("id", 163108), ("qtyReceived", 1), ("glAccount", 5609), ("glDepartment", 5024), ("job", "222260"), ("jobPart", "05"), ("activityCode", "13030"))),
+            "PurchaseOrder" => Group("PurchaseOrder", Row(("id", 1234), ("vendor", "77000-0000"))),
+            "PurchaseOrderReceipt" => Group("PurchaseOrderReceipt",
+                Row(("id", 144841), ("purchaseOrderLine", 163108), ("quantity", 1), ("unitCost", 77253.12m), ("extendedPrice", 77253.12m), ("stockingUOM", "EA"))),
+            // A prior attempt's createBill succeeded (bill 12345) but createBillLine never ran (or its
+            // response was lost) - the bill exists with no lines at all.
+            "Bill" => Group("Bill", Row(("id", 12345), ("vendor", "77000-0000"), ("invoiceNumber", "163939830"), ("poNumber", "2887-2533"), ("billBatch", "987"), ("postingStatus", "Open"))),
+            "BillLine" => Group("BillLine"),
+            _ => throw new InvalidOperationException(_.ObjectName!)
+        }))
+        {
+            OnCreateBill = _ =>
+            {
+                createBillCalled = true;
+                throw new InvalidOperationException("CreateBillAsync should not be called when an incomplete existing bill can be reconciled instead.");
+            },
+            OnCreateBillLine = request =>
+            {
+                createdBillLineRequests.Add(request!);
+                return new BillLine { Id = 5551 };
+            }
+        };
+
+        var service = new PaceInvoiceService(
+            client,
+            new PaceBillBatchResolver(client, NullLogger<PaceBillBatchResolver>.Instance),
+            Options.Create(WriteEnabledPaceOptions()),
+            NullLogger<PaceInvoiceService>.Instance);
+
+        var result = await service.SubmitAsync(NewSubmission(), CancellationToken.None);
+
+        Assert.Equal(PaceInvoiceOutcomeStatus.BillCreated, result.StatusCode);
+        Assert.Equal("987", result.PaceBillBatchId);
+        Assert.Equal("12345", result.PaceBillId);
+        Assert.False(createBillCalled);
+        Assert.Single(createdBillLineRequests);
+        Assert.Equal(12345, createdBillLineRequests[0].Bill);
+        Assert.Equal(144841, createdBillLineRequests[0].PurchaseOrderReceipt);
     }
 
     [Fact]
