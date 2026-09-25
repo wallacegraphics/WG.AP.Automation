@@ -870,7 +870,7 @@ public class SqlRepositoryTests
         var (mailMessageId, mailAttachmentId) = await CreateRecordedPdfAsync(factory);
         var graphMessageId = await LoadGraphMessageIdAsync(factory, mailMessageId);
         var invoiceNumber = $"INV-{Guid.NewGuid():N}"[..20];
-        await invoices.RecordAsync(NewInvoice(mailMessageId, mailAttachmentId, invoiceNumber), CancellationToken.None);
+        var invoice = await invoices.RecordAsync(NewInvoice(mailMessageId, mailAttachmentId, invoiceNumber), CancellationToken.None);
         var mailSource = new RecordingMailSource();
         var mailSender = new RecordingMailSender();
 
@@ -884,18 +884,20 @@ public class SqlRepositoryTests
         var mailStatus = await LoadMailStatusAsync(factory, mailMessageId);
         Assert.Equal((int)ApStatus.MailError, mailStatus.StatusId);
         Assert.Contains("no unpaid PO receipts", mailStatus.ErrorMessage);
-        Assert.Contains((graphMessageId, MailDestinationFolder.Errors), mailSource.Moves);
+        Assert.Single(mailSource.Moves, move => move == (graphMessageId, MailDestinationFolder.Errors));
 
-        // No alert of its own: the error is one line in the run's single Pace summary, with the redundant
-        // "Pace invoice '...' for PO '...':" lead-in dropped and the folder it was moved to.
-        var summary = Assert.Single(mailSender.Requests);
-        Assert.StartsWith(PaceInvoiceProcessor.PaceSummarySubjectPrefix, summary.Subject);
+        // One summary for this vendor email: the error under Errors, with the redundant
+        // "Pace invoice '...' for PO '...':" lead-in dropped, and the folder it went to as the last line.
+        var summary = Assert.Single(mailSender.Requests, request => request.Body.Contains(invoiceNumber));
+        Assert.StartsWith(RunSummaryEmailBuilder.SubjectPrefix, summary.Subject);
+        Assert.EndsWith("Routed to Errors", summary.Subject);
         Assert.Equal(["errors@wallacegraphics.com"], summary.ToAddresses);
-        Assert.Contains("=== Errors (", summary.Body);
-        Assert.Contains($"<b>Invoice {invoiceNumber}</b> (PO PO-1): No unpaid PO receipts were found.<br>\nMoved to: Errors", summary.Body);
-
-        // A real error carries no "PO not received" label.
-        Assert.DoesNotContain($"<b>Invoice {invoiceNumber}</b> (PO PO-1): PO not received", summary.Body);
+        Assert.Contains("=== 4. Errors (1) ===", summary.Body);
+        Assert.Contains($"<b>Invoice {invoiceNumber}</b> | PO PO-1 | Vendor ", summary.Body);
+        Assert.Contains("Invoice date 09/01/2026 | Invoice total $1,234.56", summary.Body);
+        Assert.Contains("No unpaid PO receipts were found.", summary.Body);
+        Assert.EndsWith("<p><b>Routed to: Errors</b></p>", summary.Body);
+        Assert.True(await IsPaceSubmissionMailRoutedAsync(factory, invoice.InvoiceId!.Value));
     }
 
     [SkippableFact]
@@ -907,7 +909,6 @@ public class SqlRepositoryTests
         await SkipUnlessPaceSchemaPublishedAsync(factory);
 
         var invoices = new InvoiceRepository(factory, NullLogger<InvoiceRepository>.Instance);
-        var paceSubmissions = new PaceSubmissionRepository(factory, NullLogger<PaceSubmissionRepository>.Instance);
         var (mailMessageId, mailAttachmentId) = await CreateRecordedPdfAsync(factory);
         var graphMessageId = await LoadGraphMessageIdAsync(factory, mailMessageId);
         var invoiceNumber = $"INV-{Guid.NewGuid():N}"[..20];
@@ -917,18 +918,9 @@ public class SqlRepositoryTests
         }, CancellationToken.None);
         var mailSource = new RecordingMailSource();
         var mailSender = new RecordingMailSender();
-        var processor = new PaceInvoiceProcessor(
-            mailSource,
-            new MailMessageRepository(factory, NullLogger<MailMessageRepository>.Instance),
-            paceSubmissions,
-            new StubPaceInvoiceService(new PaceInvoiceSubmissionResult { StatusCode = PaceInvoiceOutcomeStatus.DryRunPrepared }),
-            new ErrorNotifier(
-                mailSender,
-                Options.Create(new AlertOptions { Recipients = ["errors@wallacegraphics.com"] }),
-                NullLogger<ErrorNotifier>.Instance),
-            NullLogger<PaceInvoiceProcessor>.Instance);
 
-        await processor.ProcessPendingAsync(processingRunId: null, CancellationToken.None);
+        await CreatePaceRun(factory, mailSource, mailSender, new StubPaceInvoiceService(new PaceInvoiceSubmissionResult { StatusCode = PaceInvoiceOutcomeStatus.DryRunPrepared }))
+            .ProcessPendingAsync(processingRunId: null, CancellationToken.None);
 
         var claim = await LoadPaceSubmissionByInvoiceAsync(factory, invoice.InvoiceId!.Value);
         var mailStatus = await LoadMailStatusAsync(factory, mailMessageId);
@@ -938,11 +930,42 @@ public class SqlRepositoryTests
         Assert.Contains("stored invoice fields could not be processed", mailStatus.ErrorMessage);
         Assert.Contains((graphMessageId, MailDestinationFolder.Errors), mailSource.Moves);
 
-        var summary = Assert.Single(mailSender.Requests);
-        Assert.StartsWith(PaceInvoiceProcessor.PaceSummarySubjectPrefix, summary.Subject);
+        var summary = Assert.Single(mailSender.Requests, request => request.Body.Contains(invoiceNumber));
+        Assert.StartsWith(RunSummaryEmailBuilder.SubjectPrefix, summary.Subject);
         Assert.Contains($"<b>Invoice {invoiceNumber}</b>", summary.Body);
         Assert.Contains("Stored invoice fields could not be processed", summary.Body);
         Assert.Equal(["errors@wallacegraphics.com"], summary.ToAddresses);
+    }
+
+    [SkippableFact]
+    public async Task PaceInvoiceProcessor_WhenPaceServiceThrows_RecordsAPaceFailureNotAFieldsError()
+    {
+        SkipUnlessConfigured();
+
+        var factory = CreateFactory();
+        await SkipUnlessPaceSchemaPublishedAsync(factory);
+
+        var invoices = new InvoiceRepository(factory, NullLogger<InvoiceRepository>.Instance);
+        var (mailMessageId, mailAttachmentId) = await CreateRecordedPdfAsync(factory);
+        var graphMessageId = await LoadGraphMessageIdAsync(factory, mailMessageId);
+        var invoiceNumber = $"INV-{Guid.NewGuid():N}"[..20];
+        var invoice = await invoices.RecordAsync(NewInvoice(mailMessageId, mailAttachmentId, invoiceNumber), CancellationToken.None);
+        var mailSource = new RecordingMailSource();
+        var mailSender = new RecordingMailSender();
+
+        // The stored fields are fine; Pace itself failed. That must not be reported as a bad invoice.
+        await CreatePaceRun(factory, mailSource, mailSender, new ThrowingPaceInvoiceService(new InvalidOperationException("Pace createBill did not return an id.")))
+            .ProcessPendingAsync(processingRunId: null, CancellationToken.None);
+
+        var submission = await LoadPaceSubmissionByInvoiceAsync(factory, invoice.InvoiceId!.Value);
+        Assert.Equal(PaceSubmissionStatus.Error, submission.StatusCode);
+        Assert.Contains("Pace processing failed: Pace createBill did not return an id.", submission.ErrorMessage);
+        Assert.DoesNotContain("stored invoice fields", submission.ErrorMessage);
+        Assert.Contains((graphMessageId, MailDestinationFolder.Errors), mailSource.Moves);
+
+        var summary = Assert.Single(mailSender.Requests, request => request.Body.Contains(invoiceNumber));
+        Assert.Contains("Pace processing failed: Pace createBill did not return an id.", summary.Body);
+        Assert.EndsWith("<p><b>Routed to: Errors</b></p>", summary.Body);
     }
 
     [SkippableFact]
@@ -954,7 +977,6 @@ public class SqlRepositoryTests
         await SkipUnlessPaceSchemaPublishedAsync(factory);
 
         var invoices = new InvoiceRepository(factory, NullLogger<InvoiceRepository>.Instance);
-        var paceSubmissions = new PaceSubmissionRepository(factory, NullLogger<PaceSubmissionRepository>.Instance);
         var (mailMessageId, mailAttachmentId) = await CreateRecordedPdfAsync(factory);
         var graphMessageId = await LoadGraphMessageIdAsync(factory, mailMessageId);
         var invoiceNumber = $"INV-{Guid.NewGuid():N}"[..20];
@@ -962,22 +984,15 @@ public class SqlRepositoryTests
         var mailSource = new RecordingMailSource();
         var mailSender = new RecordingMailSender();
         var poNotReceivedMessage = "Pace invoice 'INV-1' for PO 'PO-1': no received PO lines were found.";
-        var processor = new PaceInvoiceProcessor(
-            mailSource,
-            new MailMessageRepository(factory, NullLogger<MailMessageRepository>.Instance),
-            paceSubmissions,
-            new StubPaceInvoiceService(new PaceInvoiceSubmissionResult
+
+        // PoNotReceived is no longer returned (a PO with no approved receipt is billed with default coding),
+        // but rows completed with it before this change must still route to Errors.
+        await CreatePaceProcessor(factory, mailSource, mailSender, new PaceInvoiceSubmissionResult
             {
                 StatusCode = PaceInvoiceOutcomeStatus.PoNotReceived,
                 ErrorMessage = poNotReceivedMessage
-            }),
-            new ErrorNotifier(
-                mailSender,
-                Options.Create(new AlertOptions { Recipients = ["errors@wallacegraphics.com"] }),
-                NullLogger<ErrorNotifier>.Instance),
-            NullLogger<PaceInvoiceProcessor>.Instance);
-
-        await processor.ProcessPendingAsync(processingRunId: null, CancellationToken.None);
+            })
+            .ProcessPendingAsync(processingRunId: null, CancellationToken.None);
 
         var claim = await LoadPaceSubmissionByInvoiceAsync(factory, invoice.InvoiceId!.Value);
         var mailStatus = await LoadMailStatusAsync(factory, mailMessageId);
@@ -987,15 +1002,14 @@ public class SqlRepositoryTests
         Assert.Contains(poNotReceivedMessage, mailStatus.ErrorMessage);
         Assert.Contains((graphMessageId, MailDestinationFolder.Errors), mailSource.Moves);
 
-        var summary = Assert.Single(mailSender.Requests);
-        Assert.StartsWith(PaceInvoiceProcessor.PaceSummarySubjectPrefix, summary.Subject);
-        Assert.Contains($"<b>Invoice {invoiceNumber}</b>", summary.Body);
-        Assert.Contains($"<b>Invoice {invoiceNumber}</b> (PO PO-1): PO not received: No received PO lines were found.<br>\nMoved to: Errors", summary.Body);
-        Assert.Equal(["errors@wallacegraphics.com"], summary.ToAddresses);
+        var summary = Assert.Single(mailSender.Requests, request => request.Body.Contains(invoiceNumber));
+        Assert.Contains("=== 4. Errors (1) ===", summary.Body);
+        Assert.Contains("No received PO lines were found.", summary.Body);
+        Assert.EndsWith("<p><b>Routed to: Errors</b></p>", summary.Body);
     }
 
     [SkippableFact]
-    public async Task PaceInvoiceProcessor_WhenMultipleInvoicesRequireReview_MovesEachToNeedsReviewAndSendsOneDigestEmail()
+    public async Task PaceInvoiceProcessor_WhenPaceSucceeds_MovesTheEmailToProcessedAndReportsItAsASuccess()
     {
         SkipUnlessConfigured();
 
@@ -1003,7 +1017,142 @@ public class SqlRepositoryTests
         await SkipUnlessPaceSchemaPublishedAsync(factory);
 
         var invoices = new InvoiceRepository(factory, NullLogger<InvoiceRepository>.Instance);
-        var paceSubmissions = new PaceSubmissionRepository(factory, NullLogger<PaceSubmissionRepository>.Instance);
+        var (mailMessageId, mailAttachmentId) = await CreateRecordedPdfAsync(factory);
+        var graphMessageId = await LoadGraphMessageIdAsync(factory, mailMessageId);
+        var invoiceNumber = $"INV-{Guid.NewGuid():N}"[..20];
+        var invoice = await invoices.RecordAsync(NewInvoice(mailMessageId, mailAttachmentId, invoiceNumber), CancellationToken.None);
+        var mailSource = new RecordingMailSource();
+        var mailSender = new RecordingMailSender();
+
+        await CreatePaceProcessor(factory, mailSource, mailSender, new PaceInvoiceSubmissionResult
+            {
+                StatusCode = PaceInvoiceOutcomeStatus.BillCreated,
+                PaceBillBatchId = "812",
+                PaceBillId = "4521",
+                PaceBillLineId = "1,2",
+                BillVendor = "SANMAR",
+                Summary = new PaceBillSummary
+                {
+                    Case = PaceInvoiceCase.NotBilled,
+                    VendorId = "SANMAR",
+                    VendorName = "SanMar Corporation",
+                    InvoiceTotal = 1234.56m,
+                    BillTotal = 1234.56m,
+                    BillBatchDescription = "AUTO 9-25-26",
+                    ReceiptIdsAdded = [90011, 90012]
+                }
+            })
+            .ProcessPendingAsync(processingRunId: null, CancellationToken.None);
+
+        // The mailbox step no longer moves a parsed email; the Pace step's success moves it to Processed, once.
+        Assert.Single(mailSource.Moves, move => move.MessageId == graphMessageId);
+        Assert.Contains((graphMessageId, MailDestinationFolder.Processed), mailSource.Moves);
+        Assert.Equal((int)ApStatus.MailProcessed, (await LoadMailStatusAsync(factory, mailMessageId)).StatusId);
+        Assert.True(await IsPaceSubmissionNotifiedAsync(factory, invoice.InvoiceId!.Value));
+        Assert.True(await IsPaceSubmissionMailRoutedAsync(factory, invoice.InvoiceId.Value));
+
+        var summary = Assert.Single(mailSender.Requests, request => request.Body.Contains(invoiceNumber));
+        Assert.EndsWith("Pace: 1 succeeded, 0 need review, 0 errors | Routed to Processed", summary.Subject);
+        Assert.Contains("=== 2. Pace – Success (1) ===", summary.Body);
+        Assert.Contains("Vendor SANMAR (SanMar Corporation)", summary.Body);
+        Assert.Contains("Bill 4521 created in batch 812 (AUTO 9-25-26) with 2 PO receipt line(s) (receipts 90011, 90012).", summary.Body);
+        Assert.Contains("Bill total $1,234.56 matches the invoice total.", summary.Body);
+        Assert.EndsWith("<p><b>Routed to: Processed</b></p>", summary.Body);
+    }
+
+    [SkippableFact]
+    public async Task PaceInvoiceProcessor_EmailWithSeveralInvoices_IsMovedOnceAfterTheLastOne_ToTheWorstFolder()
+    {
+        SkipUnlessConfigured();
+
+        var factory = CreateFactory();
+        await SkipUnlessPaceSchemaPublishedAsync(factory);
+
+        var invoices = new InvoiceRepository(factory, NullLogger<InvoiceRepository>.Instance);
+        var (mailMessageId, firstAttachmentId) = await CreateRecordedPdfAsync(factory);
+        var secondAttachmentId = await AddRecordedPdfAsync(factory, mailMessageId);
+        var graphMessageId = await LoadGraphMessageIdAsync(factory, mailMessageId);
+        var successNumber = $"INV-{Guid.NewGuid():N}"[..20];
+        var reviewNumber = $"INV-{Guid.NewGuid():N}"[..20];
+        var successInvoice = await invoices.RecordAsync(NewInvoice(mailMessageId, firstAttachmentId, successNumber), CancellationToken.None);
+        var reviewInvoice = await invoices.RecordAsync(NewInvoice(mailMessageId, secondAttachmentId, reviewNumber), CancellationToken.None);
+        var mailSource = new RecordingMailSource();
+        var mailSender = new RecordingMailSender();
+
+        await CreatePaceRun(factory, mailSource, mailSender, new PerInvoiceStubPaceInvoiceService(new Dictionary<long, PaceInvoiceSubmissionResult>
+            {
+                [successInvoice.InvoiceId!.Value] = new() { StatusCode = PaceInvoiceOutcomeStatus.BillCreated, PaceBillBatchId = "812", PaceBillId = "4521" },
+                [reviewInvoice.InvoiceId!.Value] = new() { StatusCode = PaceInvoiceOutcomeStatus.BillCreated, PaceBillBatchId = "812", PaceBillId = "4523", RequiresReview = true }
+            }, fallback: new PaceInvoiceSubmissionResult { StatusCode = PaceInvoiceOutcomeStatus.Error }))
+            .ProcessPendingAsync(processingRunId: null, CancellationToken.None);
+
+        // One move, after both invoices were decided, to the worse of the two outcomes.
+        Assert.Equal([(graphMessageId, MailDestinationFolder.NeedsReview)], mailSource.Moves.Where(move => move.MessageId == graphMessageId));
+        Assert.Equal((int)ApStatus.MailNeedsReview, (await LoadMailStatusAsync(factory, mailMessageId)).StatusId);
+
+        var summary = Assert.Single(mailSender.Requests, request => request.Body.Contains(successNumber));
+        Assert.Contains(reviewNumber, summary.Body);
+        Assert.Contains("Pace: 1 succeeded, 1 needs review, 0 errors.", summary.Body);
+        Assert.True(summary.Body.IndexOf("=== 2. Pace – Success", StringComparison.Ordinal) < summary.Body.IndexOf("=== 3. Pace –", StringComparison.Ordinal));
+        Assert.EndsWith("<p><b>Routed to: NeedsReview</b></p>", summary.Body);
+        Assert.True(await IsPaceSubmissionMailRoutedAsync(factory, successInvoice.InvoiceId.Value));
+        Assert.True(await IsPaceSubmissionMailRoutedAsync(factory, reviewInvoice.InvoiceId.Value));
+    }
+
+    [SkippableFact]
+    public async Task PaceInvoiceProcessor_WhenPaceIsUnreachable_LeavesTheEmailInTheInbox_ThenGivesUpAtMaxAttemptsAndRoutesToErrors()
+    {
+        SkipUnlessConfigured();
+
+        var factory = CreateFactory();
+        await SkipUnlessPaceSchemaPublishedAsync(factory);
+
+        var invoices = new InvoiceRepository(factory, NullLogger<InvoiceRepository>.Instance);
+        var (mailMessageId, mailAttachmentId) = await CreateRecordedPdfAsync(factory);
+        var graphMessageId = await LoadGraphMessageIdAsync(factory, mailMessageId);
+        var invoiceNumber = $"INV-{Guid.NewGuid():N}"[..20];
+        var invoice = await invoices.RecordAsync(NewInvoice(mailMessageId, mailAttachmentId, invoiceNumber), CancellationToken.None);
+        var unreachable = new StubPaceInvoiceService(new PaceInvoiceSubmissionResult
+        {
+            StatusCode = PaceInvoiceOutcomeStatus.RetryLater,
+            IsTransient = true,
+            ErrorMessage = "Pace request timed out."
+        });
+
+        // First attempt of two: retried later, and the email stays where it is.
+        var firstMailSource = new RecordingMailSource();
+        await CreatePaceRun(factory, firstMailSource, new RecordingMailSender(), unreachable, maxAttempts: 2)
+            .ProcessPendingAsync(processingRunId: null, CancellationToken.None);
+
+        Assert.Equal(PaceSubmissionStatus.RetryLater, (await LoadPaceSubmissionByInvoiceAsync(factory, invoice.InvoiceId!.Value)).StatusCode);
+        Assert.DoesNotContain(firstMailSource.Moves, move => move.MessageId == graphMessageId);
+
+        // Second and last attempt: given up on as an Error, so the email goes to Errors and is reported.
+        await MakePaceSubmissionRetryDueAsync(factory, invoice.InvoiceId.Value);
+        var secondMailSource = new RecordingMailSource();
+        var secondSender = new RecordingMailSender();
+        await CreatePaceRun(factory, secondMailSource, secondSender, unreachable, maxAttempts: 2)
+            .ProcessPendingAsync(processingRunId: null, CancellationToken.None);
+
+        var submission = await LoadPaceSubmissionByInvoiceAsync(factory, invoice.InvoiceId.Value);
+        Assert.Equal(PaceSubmissionStatus.Error, submission.StatusCode);
+        Assert.Contains("Pace could not be reached after 2 attempts: Pace request timed out.", submission.ErrorMessage);
+        Assert.Contains((graphMessageId, MailDestinationFolder.Errors), secondMailSource.Moves);
+
+        var summary = Assert.Single(secondSender.Requests, request => request.Body.Contains(invoiceNumber));
+        Assert.Contains("Pace could not be reached after 2 attempts", summary.Body);
+        Assert.EndsWith("<p><b>Routed to: Errors</b></p>", summary.Body);
+    }
+
+    [SkippableFact]
+    public async Task PaceInvoiceProcessor_WhenMultipleInvoicesRequireReview_MovesEachToNeedsReviewWithItsOwnSummary()
+    {
+        SkipUnlessConfigured();
+
+        var factory = CreateFactory();
+        await SkipUnlessPaceSchemaPublishedAsync(factory);
+
+        var invoices = new InvoiceRepository(factory, NullLogger<InvoiceRepository>.Instance);
 
         var (firstMailMessageId, firstMailAttachmentId) = await CreateRecordedPdfAsync(factory);
         var firstGraphMessageId = await LoadGraphMessageIdAsync(factory, firstMailMessageId);
@@ -1017,50 +1166,40 @@ public class SqlRepositoryTests
 
         var mailSource = new RecordingMailSource();
         var mailSender = new RecordingMailSender();
-        var paceInvoiceService = new PerInvoiceStubPaceInvoiceService(new Dictionary<long, PaceInvoiceSubmissionResult>
-        {
-            [firstInvoice.InvoiceId!.Value] = new PaceInvoiceSubmissionResult
-            {
-                StatusCode = PaceInvoiceOutcomeStatus.BillCreated,
-                PaceBillBatchId = "111",
-                PaceBillId = "222",
-                RequiresReview = true
-            },
-            [secondInvoice.InvoiceId!.Value] = new PaceInvoiceSubmissionResult
-            {
-                StatusCode = PaceInvoiceOutcomeStatus.DryRunPrepared,
-                RequiresReview = true
-            }
-        });
-        var processor = new PaceInvoiceProcessor(
-            mailSource,
-            new MailMessageRepository(factory, NullLogger<MailMessageRepository>.Instance),
-            paceSubmissions,
-            paceInvoiceService,
-            new ErrorNotifier(
-                mailSender,
-                Options.Create(new AlertOptions { Recipients = ["errors@wallacegraphics.com"] }),
-                NullLogger<ErrorNotifier>.Instance),
-            NullLogger<PaceInvoiceProcessor>.Instance);
 
-        await processor.ProcessPendingAsync(processingRunId: null, CancellationToken.None);
+        await CreatePaceRun(factory, mailSource, mailSender, new PerInvoiceStubPaceInvoiceService(new Dictionary<long, PaceInvoiceSubmissionResult>
+            {
+                [firstInvoice.InvoiceId!.Value] = new PaceInvoiceSubmissionResult
+                {
+                    StatusCode = PaceInvoiceOutcomeStatus.BillCreated,
+                    PaceBillBatchId = "111",
+                    PaceBillId = "222",
+                    RequiresReview = true
+                },
+                [secondInvoice.InvoiceId!.Value] = new PaceInvoiceSubmissionResult
+                {
+                    StatusCode = PaceInvoiceOutcomeStatus.DryRunPrepared,
+                    RequiresReview = true
+                }
+            }))
+            .ProcessPendingAsync(processingRunId: null, CancellationToken.None);
 
-        var firstMailStatus = await LoadMailStatusAsync(factory, firstMailMessageId);
-        var secondMailStatus = await LoadMailStatusAsync(factory, secondMailMessageId);
-        Assert.Equal((int)ApStatus.MailNeedsReview, firstMailStatus.StatusId);
-        Assert.Equal((int)ApStatus.MailNeedsReview, secondMailStatus.StatusId);
+        Assert.Equal((int)ApStatus.MailNeedsReview, (await LoadMailStatusAsync(factory, firstMailMessageId)).StatusId);
+        Assert.Equal((int)ApStatus.MailNeedsReview, (await LoadMailStatusAsync(factory, secondMailMessageId)).StatusId);
         Assert.Contains((firstGraphMessageId, MailDestinationFolder.NeedsReview), mailSource.Moves);
         Assert.Contains((secondGraphMessageId, MailDestinationFolder.NeedsReview), mailSource.Moves);
 
-        var digest = Assert.Single(mailSender.Requests, request => request.Subject.StartsWith(PaceInvoiceProcessor.PaceSummarySubjectPrefix));
-        Assert.Contains("=== NeedsReview (", digest.Body);
-        Assert.Contains(firstInvoiceNumber, digest.Body);
-        Assert.Contains(secondInvoiceNumber, digest.Body);
-        Assert.Contains("Moved to: NeedsReview", digest.Body);
+        // One summary per vendor email.
+        foreach (var invoiceNumber in new[] { firstInvoiceNumber, secondInvoiceNumber })
+        {
+            var summary = Assert.Single(mailSender.Requests, request => request.Body.Contains(invoiceNumber));
+            Assert.Contains("=== 3. Pace – Bill created with default GL account/department – Needs review (1) ===", summary.Body);
+            Assert.EndsWith("<p><b>Routed to: NeedsReview</b></p>", summary.Body);
+        }
     }
 
     [SkippableFact]
-    public async Task PaceInvoiceProcessor_WhenNeedsReviewMoveFails_StillSendsDigestAndLeavesSubmissionUnroutedForRecovery()
+    public async Task PaceInvoiceProcessor_WhenNeedsReviewMoveFails_StillSendsSummaryAndLeavesSubmissionUnroutedForRecovery()
     {
         SkipUnlessConfigured();
 
@@ -1068,47 +1207,35 @@ public class SqlRepositoryTests
         await SkipUnlessPaceSchemaPublishedAsync(factory);
 
         var invoices = new InvoiceRepository(factory, NullLogger<InvoiceRepository>.Instance);
-        var paceSubmissions = new PaceSubmissionRepository(factory, NullLogger<PaceSubmissionRepository>.Instance);
         var (mailMessageId, mailAttachmentId) = await CreateRecordedPdfAsync(factory);
         var invoiceNumber = $"INV-{Guid.NewGuid():N}"[..20];
         var invoice = await invoices.RecordAsync(NewInvoice(mailMessageId, mailAttachmentId, invoiceNumber), CancellationToken.None);
 
         var mailSource = new RecordingMailSource { MoveFailure = new HttpRequestException("Graph move failed") };
         var mailSender = new RecordingMailSender();
-        var processor = new PaceInvoiceProcessor(
-            mailSource,
-            new MailMessageRepository(factory, NullLogger<MailMessageRepository>.Instance),
-            paceSubmissions,
-            new StubPaceInvoiceService(new PaceInvoiceSubmissionResult
+
+        // A routing failure must not escape the Pace step - the Pace submission is already final by the time
+        // the move fails, so the rest of the batch (and the summary) must not be lost with it.
+        await CreatePaceProcessor(factory, mailSource, mailSender, new PaceInvoiceSubmissionResult
             {
                 StatusCode = PaceInvoiceOutcomeStatus.BillCreated,
                 PaceBillBatchId = "111",
                 PaceBillId = "222",
                 BillVendor = "SANMAR",
                 RequiresReview = true
-            }),
-            new ErrorNotifier(
-                mailSender,
-                Options.Create(new AlertOptions { Recipients = ["errors@wallacegraphics.com"] }),
-                NullLogger<ErrorNotifier>.Instance),
-            NullLogger<PaceInvoiceProcessor>.Instance);
-
-        // A routing failure must not escape ProcessPendingAsync - the Pace submission is already final by the
-        // time the move fails, so the rest of the batch (and the digest for entries already added) must not
-        // be lost with it.
-        await processor.ProcessPendingAsync(processingRunId: null, CancellationToken.None);
+            })
+            .ProcessPendingAsync(processingRunId: null, CancellationToken.None);
 
         var mailStatus = await LoadMailStatusAsync(factory, mailMessageId);
         Assert.Equal((int)ApStatus.MailNeedsReview, mailStatus.StatusId);
 
-        var digest = Assert.Single(mailSender.Requests, request => request.Subject.StartsWith(PaceInvoiceProcessor.PaceSummarySubjectPrefix));
-        Assert.Contains(invoiceNumber, digest.Body);
-        Assert.Contains("vendor SANMAR", digest.Body);
+        var summary = Assert.Single(mailSender.Requests, request => request.Body.Contains(invoiceNumber));
+        Assert.Contains("Vendor SANMAR", summary.Body);
 
-        // The summary is sent after the move was attempted, so it says where the email really is.
-        Assert.Contains("Could not be moved to NeedsReview, still in Inbox", digest.Body);
+        // The email was not moved, so the summary does not claim it was.
+        Assert.DoesNotContain("Routed to:", summary.Body);
 
-        // The digest went out, so the notification half is done and only the move is left for the sweep.
+        // The summary went out, so the notification half is done and only the move is left for the sweep.
         Assert.True(await IsPaceSubmissionNotifiedAsync(factory, invoice.InvoiceId!.Value));
         Assert.False(await IsPaceSubmissionMailRoutedAsync(factory, invoice.InvoiceId!.Value));
 
@@ -1120,7 +1247,7 @@ public class SqlRepositoryTests
 
         // Left unrouted on purpose to prove the point above, but this database is shared across the test
         // run - an unrouted row would otherwise get swept up and re-routed by RecoverUnroutedSubmissionsAsync
-        // inside an unrelated later test's ProcessPendingAsync call.
+        // inside an unrelated later test's run.
         await MarkPaceSubmissionMailRoutedForCleanupAsync(factory, invoice.InvoiceId!.Value);
     }
 
@@ -1133,33 +1260,22 @@ public class SqlRepositoryTests
         await SkipUnlessPaceSchemaPublishedAsync(factory);
 
         var invoices = new InvoiceRepository(factory, NullLogger<InvoiceRepository>.Instance);
-        var paceSubmissions = new PaceSubmissionRepository(factory, NullLogger<PaceSubmissionRepository>.Instance);
         var (mailMessageId, mailAttachmentId) = await CreateRecordedPdfAsync(factory);
         var graphMessageId = await LoadGraphMessageIdAsync(factory, mailMessageId);
         var invoiceNumber = $"INV-{Guid.NewGuid():N}"[..20];
         var invoice = await invoices.RecordAsync(NewInvoice(mailMessageId, mailAttachmentId, invoiceNumber), CancellationToken.None);
+        var needsReviewResult = new PaceInvoiceSubmissionResult
+        {
+            StatusCode = PaceInvoiceOutcomeStatus.BillCreated,
+            PaceBillBatchId = "111",
+            PaceBillId = "222",
+            BillVendor = "SANMAR",
+            RequiresReview = true
+        };
 
-        var failingMailSource = new RecordingMailSource { MoveFailure = new HttpRequestException("Graph move failed") };
         var firstRunSender = new RecordingMailSender();
-        var firstRunProcessor = new PaceInvoiceProcessor(
-            failingMailSource,
-            new MailMessageRepository(factory, NullLogger<MailMessageRepository>.Instance),
-            paceSubmissions,
-            new StubPaceInvoiceService(new PaceInvoiceSubmissionResult
-            {
-                StatusCode = PaceInvoiceOutcomeStatus.BillCreated,
-                PaceBillBatchId = "111",
-                PaceBillId = "222",
-                BillVendor = "SANMAR",
-                RequiresReview = true
-            }),
-            new ErrorNotifier(
-                firstRunSender,
-                Options.Create(new AlertOptions { Recipients = ["errors@wallacegraphics.com"] }),
-                NullLogger<ErrorNotifier>.Instance),
-            NullLogger<PaceInvoiceProcessor>.Instance);
-
-        await firstRunProcessor.ProcessPendingAsync(processingRunId: null, CancellationToken.None);
+        await CreatePaceProcessor(factory, new RecordingMailSource { MoveFailure = new HttpRequestException("Graph move failed") }, firstRunSender, needsReviewResult)
+            .ProcessPendingAsync(processingRunId: null, CancellationToken.None);
         Assert.False(await IsPaceSubmissionMailRoutedAsync(factory, invoice.InvoiceId!.Value));
         Assert.Single(firstRunSender.Requests, request => request.Body.Contains(invoiceNumber));
 
@@ -1169,23 +1285,13 @@ public class SqlRepositoryTests
         // handed the lease back when it ended, so the retry must not wait for the lease to lapse.
         var recoveredMailSource = new RecordingMailSource();
         var recoveredSender = new RecordingMailSender();
-        var recoveryProcessor = new PaceInvoiceProcessor(
-            recoveredMailSource,
-            new MailMessageRepository(factory, NullLogger<MailMessageRepository>.Instance),
-            paceSubmissions,
-            new StubPaceInvoiceService(new PaceInvoiceSubmissionResult { StatusCode = PaceInvoiceOutcomeStatus.Error }),
-            new ErrorNotifier(
-                recoveredSender,
-                Options.Create(new AlertOptions { Recipients = ["errors@wallacegraphics.com"] }),
-                NullLogger<ErrorNotifier>.Instance),
-            NullLogger<PaceInvoiceProcessor>.Instance);
-
-        await recoveryProcessor.ProcessPendingAsync(processingRunId: null, CancellationToken.None);
+        await CreatePaceProcessor(factory, recoveredMailSource, recoveredSender, new PaceInvoiceSubmissionResult { StatusCode = PaceInvoiceOutcomeStatus.Error })
+            .ProcessPendingAsync(processingRunId: null, CancellationToken.None);
 
         Assert.Contains((graphMessageId, MailDestinationFolder.NeedsReview), recoveredMailSource.Moves);
         Assert.True(await IsPaceSubmissionMailRoutedAsync(factory, invoice.InvoiceId!.Value));
 
-        // The first run's digest already reported this invoice; retrying the move must not report it again.
+        // The first run's summary already reported this invoice; retrying the move must not report it again.
         Assert.DoesNotContain(recoveredSender.Requests, request => request.Body.Contains(invoiceNumber));
     }
 
@@ -1212,11 +1318,12 @@ public class SqlRepositoryTests
         await CreatePaceProcessor(factory, new RecordingMailSource { MoveFailure = new HttpRequestException("Graph move failed") }, firstRunSender, errorResult)
             .ProcessPendingAsync(processingRunId: null, CancellationToken.None);
 
-        // The summary entry is recorded before the move, so a failed move can't leave a failed invoice
-        // unreported - and the line says the email is still in the Inbox rather than claiming it is in Errors.
-        var firstSummary = Assert.Single(firstRunSender.Requests);
-        Assert.StartsWith(PaceInvoiceProcessor.PaceSummarySubjectPrefix, firstSummary.Subject);
-        Assert.Contains($"<b>Invoice {invoiceNumber}</b> (PO PO-1): Pace rejected the bill.<br>\nCould not be moved to Errors, still in Inbox", firstSummary.Body);
+        // The summary line is recorded before the move, so a failed move can't leave a failed invoice
+        // unreported - and the summary does not claim a move that did not happen.
+        var firstSummary = Assert.Single(firstRunSender.Requests, request => request.Body.Contains(invoiceNumber));
+        Assert.StartsWith(RunSummaryEmailBuilder.SubjectPrefix, firstSummary.Subject);
+        Assert.Contains("Pace rejected the bill.", firstSummary.Body);
+        Assert.DoesNotContain("Routed to:", firstSummary.Body);
         Assert.True(await IsPaceSubmissionNotifiedAsync(factory, invoice.InvoiceId!.Value));
         Assert.False(await IsPaceSubmissionMailRoutedAsync(factory, invoice.InvoiceId.Value));
 
@@ -1232,7 +1339,7 @@ public class SqlRepositoryTests
     }
 
     [SkippableFact]
-    public async Task PaceInvoiceProcessor_ErrorsAndNeedsReviewInOneRun_SendOneSummaryEmail()
+    public async Task PaceInvoiceProcessor_ErrorAndNeedsReviewOnDifferentEmails_EachGetsItsOwnSummary()
     {
         SkipUnlessConfigured();
 
@@ -1248,11 +1355,7 @@ public class SqlRepositoryTests
         var reviewInvoice = await invoices.RecordAsync(NewInvoice(reviewMailMessageId, reviewMailAttachmentId, reviewInvoiceNumber), CancellationToken.None);
 
         var mailSender = new RecordingMailSender();
-        var processor = new PaceInvoiceProcessor(
-            new RecordingMailSource(),
-            new MailMessageRepository(factory, NullLogger<MailMessageRepository>.Instance),
-            new PaceSubmissionRepository(factory, NullLogger<PaceSubmissionRepository>.Instance),
-            new PerInvoiceStubPaceInvoiceService(new Dictionary<long, PaceInvoiceSubmissionResult>
+        await CreatePaceRun(factory, new RecordingMailSource(), mailSender, new PerInvoiceStubPaceInvoiceService(new Dictionary<long, PaceInvoiceSubmissionResult>
             {
                 [errorInvoice.InvoiceId!.Value] = new()
                 {
@@ -1267,28 +1370,22 @@ public class SqlRepositoryTests
                     BillVendor = "SANMAR",
                     RequiresReview = true
                 }
-            }, fallback: new PaceInvoiceSubmissionResult { StatusCode = PaceInvoiceOutcomeStatus.Error }),
-            new ErrorNotifier(
-                mailSender,
-                Options.Create(new AlertOptions { Recipients = ["errors@wallacegraphics.com"] }),
-                NullLogger<ErrorNotifier>.Instance),
-            NullLogger<PaceInvoiceProcessor>.Instance);
+            }, fallback: new PaceInvoiceSubmissionResult { StatusCode = PaceInvoiceOutcomeStatus.Error }))
+            .ProcessPendingAsync(processingRunId: null, CancellationToken.None);
 
-        await processor.ProcessPendingAsync(processingRunId: null, CancellationToken.None);
+        var errorSummary = Assert.Single(mailSender.Requests, request => request.Body.Contains(errorInvoiceNumber));
+        Assert.Contains("=== 4. Errors (1) ===", errorSummary.Body);
+        Assert.Contains("Invoice number does not start with INV - review manually.", errorSummary.Body);
+        Assert.EndsWith("<p><b>Routed to: Errors</b></p>", errorSummary.Body);
+        Assert.DoesNotContain(reviewInvoiceNumber, errorSummary.Body);
 
-        // One email for the whole run - no per-invoice Pace alert, errors and needs-review side by side.
-        var summary = Assert.Single(mailSender.Requests);
-        Assert.StartsWith(PaceInvoiceProcessor.PaceSummarySubjectPrefix, summary.Subject);
-        Assert.Contains("=== Errors (", summary.Body);
-        Assert.Contains("=== NeedsReview (", summary.Body);
-        Assert.Contains($"<b>Invoice {errorInvoiceNumber}</b> (PO PO-1): Invoice number does not start with INV - review manually.<br>\nMoved to: Errors", summary.Body);
-        Assert.Contains($"<b>Invoice {reviewInvoiceNumber}</b>", summary.Body);
-        Assert.Contains("Moved to: NeedsReview", summary.Body);
-        Assert.True(summary.Body.IndexOf("=== Errors (", StringComparison.Ordinal) < summary.Body.IndexOf("=== NeedsReview (", StringComparison.Ordinal));
+        var reviewSummary = Assert.Single(mailSender.Requests, request => request.Body.Contains(reviewInvoiceNumber));
+        Assert.Contains("=== 3. Pace – Bill created with default GL account/department – Needs review (1) ===", reviewSummary.Body);
+        Assert.EndsWith("<p><b>Routed to: NeedsReview</b></p>", reviewSummary.Body);
     }
 
     [SkippableFact]
-    public async Task PaceInvoiceProcessor_WhenDigestSendFails_NextRunResendsItNamingThePersistedBillVendor()
+    public async Task PaceInvoiceProcessor_WhenSummarySendFails_NextRunResendsItNamingThePersistedBillVendor()
     {
         SkipUnlessConfigured();
 
@@ -1304,7 +1401,7 @@ public class SqlRepositoryTests
             StatusCode = PaceInvoiceOutcomeStatus.BillCreated,
             PaceBillBatchId = "111",
             PaceBillId = "222",
-            // Deliberately not the client's configured account number: a recovered digest used to fall back to it.
+            // Deliberately not the client's configured account number: a recovered summary used to fall back to it.
             BillVendor = "NOPO-DEFAULT-VENDOR",
             RequiresReview = true
         };
@@ -1312,55 +1409,20 @@ public class SqlRepositoryTests
         await CreatePaceProcessor(factory, new RecordingMailSource(), new RecordingMailSender { SendFailure = new HttpRequestException("Graph send failed") }, needsReviewResult)
             .ProcessPendingAsync(processingRunId: null, CancellationToken.None);
 
-        // Moved, but the digest never arrived - so the row is not done.
+        // Moved, but the summary never arrived - so the row is not done.
         Assert.False(await IsPaceSubmissionNotifiedAsync(factory, invoice.InvoiceId!.Value));
         Assert.False(await IsPaceSubmissionMailRoutedAsync(factory, invoice.InvoiceId.Value));
 
         // No lease expiry: the next run retries straight away, even inside the lease.
-
         var recoveredSender = new RecordingMailSender();
         await CreatePaceProcessor(factory, new RecordingMailSource(), recoveredSender, needsReviewResult)
             .ProcessPendingAsync(processingRunId: null, CancellationToken.None);
 
-        var digest = Assert.Single(recoveredSender.Requests, request => request.Body.Contains(invoiceNumber));
-        Assert.Contains("vendor NOPO-DEFAULT-VENDOR", digest.Body);
+        var summary = Assert.Single(recoveredSender.Requests, request => request.Body.Contains(invoiceNumber));
+        Assert.Contains("Vendor NOPO-DEFAULT-VENDOR", summary.Body);
+        Assert.EndsWith("<p><b>Routed to: NeedsReview</b></p>", summary.Body);
         Assert.True(await IsPaceSubmissionNotifiedAsync(factory, invoice.InvoiceId.Value));
         Assert.True(await IsPaceSubmissionMailRoutedAsync(factory, invoice.InvoiceId.Value));
-    }
-
-    [SkippableFact]
-    public async Task PaceInvoiceProcessor_WhenNoInvoiceRequiresReview_SendsNoDigestEmail()
-    {
-        SkipUnlessConfigured();
-
-        var factory = CreateFactory();
-        await SkipUnlessPaceSchemaPublishedAsync(factory);
-
-        var invoices = new InvoiceRepository(factory, NullLogger<InvoiceRepository>.Instance);
-        var paceSubmissions = new PaceSubmissionRepository(factory, NullLogger<PaceSubmissionRepository>.Instance);
-        var (mailMessageId, mailAttachmentId) = await CreateRecordedPdfAsync(factory);
-        await invoices.RecordAsync(NewInvoice(mailMessageId, mailAttachmentId, $"INV-{Guid.NewGuid():N}"[..20]), CancellationToken.None);
-
-        var mailSource = new RecordingMailSource();
-        var mailSender = new RecordingMailSender();
-        var processor = new PaceInvoiceProcessor(
-            mailSource,
-            new MailMessageRepository(factory, NullLogger<MailMessageRepository>.Instance),
-            paceSubmissions,
-            new StubPaceInvoiceService(new PaceInvoiceSubmissionResult
-            {
-                StatusCode = PaceInvoiceOutcomeStatus.AlreadyEntered
-            }),
-            new ErrorNotifier(
-                mailSender,
-                Options.Create(new AlertOptions { Recipients = ["errors@wallacegraphics.com"] }),
-                NullLogger<ErrorNotifier>.Instance),
-            NullLogger<PaceInvoiceProcessor>.Instance);
-
-        await processor.ProcessPendingAsync(processingRunId: null, CancellationToken.None);
-
-        Assert.Empty(mailSender.Requests);
-        Assert.Empty(mailSource.Moves);
     }
 
     private static async Task AssertPaceSubmissionUsesStatusLookupIdAsync(SqlConnectionFactory factory)
@@ -1598,21 +1660,80 @@ public class SqlRepositoryTests
             new { InvoiceId = invoiceId });
     }
 
-    private static PaceInvoiceProcessor CreatePaceProcessor(
+    private static PaceRun CreatePaceProcessor(
         SqlConnectionFactory factory,
         RecordingMailSource mailSource,
         RecordingMailSender mailSender,
         PaceInvoiceSubmissionResult result) =>
-        new(
-            mailSource,
-            new MailMessageRepository(factory, NullLogger<MailMessageRepository>.Instance),
-            new PaceSubmissionRepository(factory, NullLogger<PaceSubmissionRepository>.Instance),
-            new StubPaceInvoiceService(result),
-            new ErrorNotifier(
-                mailSender,
-                Options.Create(new AlertOptions { Recipients = ["errors@wallacegraphics.com"] }),
-                NullLogger<ErrorNotifier>.Instance),
-            NullLogger<PaceInvoiceProcessor>.Instance);
+        CreatePaceRun(factory, mailSource, mailSender, new StubPaceInvoiceService(result));
+
+    private static PaceRun CreatePaceRun(
+        SqlConnectionFactory factory,
+        RecordingMailSource mailSource,
+        RecordingMailSender mailSender,
+        IPaceInvoiceService paceInvoiceService,
+        int maxAttempts = 5) =>
+        new(factory, mailSource, mailSender, paceInvoiceService, maxAttempts);
+
+    /// <summary>
+    /// One run's Pace step the way Program.cs drives it: process the queue, send the run's summary emails,
+    /// then record which summary lines were delivered and which emails were routed.
+    /// </summary>
+    private sealed class PaceRun(
+        SqlConnectionFactory factory,
+        RecordingMailSource mailSource,
+        RecordingMailSender mailSender,
+        IPaceInvoiceService paceInvoiceService,
+        int maxAttempts)
+    {
+        public RunSummary Summary { get; } = new();
+
+        public async Task ProcessPendingAsync(long? processingRunId, CancellationToken cancellationToken)
+        {
+            var alertOptions = Options.Create(new AlertOptions { Recipients = ["errors@wallacegraphics.com"] });
+            var processor = new PaceInvoiceProcessor(
+                mailSource,
+                new MailMessageRepository(factory, NullLogger<MailMessageRepository>.Instance),
+                new PaceSubmissionRepository(factory, NullLogger<PaceSubmissionRepository>.Instance),
+                paceInvoiceService,
+                Summary,
+                Options.Create(new PaceOptions { BaseUrl = "https://pace.test", UserName = "user", Password = "password", MaxAttempts = maxAttempts }),
+                NullLogger<PaceInvoiceProcessor>.Instance);
+            var notifier = new RunSummaryNotifier(
+                Summary,
+                new ErrorNotifier(mailSender, alertOptions, NullLogger<ErrorNotifier>.Instance),
+                alertOptions,
+                NullLogger<RunSummaryNotifier>.Instance);
+
+            try
+            {
+                await processor.ProcessPendingAsync(processingRunId, cancellationToken);
+            }
+            finally
+            {
+                await processor.FinalizeSummaryAsync(await notifier.SendAsync(CancellationToken.None));
+            }
+        }
+    }
+
+    private static async Task<long> AddRecordedPdfAsync(SqlConnectionFactory factory, long mailMessageId)
+    {
+        var attachments = new MailAttachmentRepository(factory, NullLogger<MailAttachmentRepository>.Instance);
+        var summary = new MailAttachmentSummary($"att-{Guid.NewGuid():N}", "invoice-2.pdf", 1024, "application/pdf");
+        var recorded = await attachments.RecordAsync(mailMessageId, [summary], CancellationToken.None);
+
+        return recorded.Single(item => item.Attachment.Id == summary.Id).MailAttachmentId;
+    }
+
+    /// <summary>Stands in for the backoff delay passing: the RetryLater row becomes claimable again now.</summary>
+    private static async Task MakePaceSubmissionRetryDueAsync(SqlConnectionFactory factory, long invoiceId)
+    {
+        await using var connection = await factory.OpenAsync(CancellationToken.None);
+
+        await connection.ExecuteAsync(
+            "UPDATE [intgr].[PaceSubmission] SET [NextAttemptOn] = DATEADD(MINUTE, -1, SYSUTCDATETIME()) WHERE [InvoiceId] = @InvoiceId;",
+            new { InvoiceId = invoiceId });
+    }
 
     private static async Task BackdatePaceSubmissionAsync(SqlConnectionFactory factory, long paceSubmissionId, int days)
     {
@@ -1777,6 +1898,11 @@ public class SqlRepositoryTests
     private sealed class StubPaceInvoiceService(PaceInvoiceSubmissionResult result) : IPaceInvoiceService
     {
         public Task<PaceInvoiceSubmissionResult> SubmitAsync(PaceInvoiceSubmission submission, CancellationToken cancellationToken) => Task.FromResult(result);
+    }
+
+    private sealed class ThrowingPaceInvoiceService(Exception exception) : IPaceInvoiceService
+    {
+        public Task<PaceInvoiceSubmissionResult> SubmitAsync(PaceInvoiceSubmission submission, CancellationToken cancellationToken) => Task.FromException<PaceInvoiceSubmissionResult>(exception);
     }
 
     /// <summary>

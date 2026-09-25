@@ -153,6 +153,8 @@ builder.Services.AddHttpClient<OllamaClient>((serviceProvider, httpClient) =>
 builder.Services.AddSingleton<IInvoiceFieldExtractor, PdfInvoiceFieldExtractor>();
 
 builder.Services.AddSingleton<ErrorNotifier>();
+builder.Services.AddSingleton<RunSummary>();
+builder.Services.AddSingleton<RunSummaryNotifier>();
 builder.Services.AddSingleton<APProcessor>();
 builder.Services.AddSingleton<PaceInvoiceProcessor>();
 
@@ -212,10 +214,33 @@ try
     }
 
     var apProcessor = host.Services.GetRequiredService<APProcessor>();
-    var processingRunId = await apProcessor.ProcessInvoicesAsync(CancellationToken.None);
-
     var paceInvoiceProcessor = host.Services.GetRequiredService<PaceInvoiceProcessor>();
-    await paceInvoiceProcessor.ProcessPendingAsync(processingRunId, CancellationToken.None);
+    var runSummary = host.Services.GetRequiredService<RunSummary>();
+    var runSummaryNotifier = host.Services.GetRequiredService<RunSummaryNotifier>();
+
+    try
+    {
+        var processingRunId = await apProcessor.ProcessInvoicesAsync(CancellationToken.None);
+
+        try
+        {
+            await paceInvoiceProcessor.ProcessPendingAsync(processingRunId, CancellationToken.None);
+        }
+        catch (Exception exception)
+        {
+            // Logged by the outer handler too; recorded here so it is in the run's summary email.
+            runSummary.AddFailure($"Pace processing failed: {exception.Message}");
+            throw;
+        }
+    }
+    finally
+    {
+        // One summary email per vendor email, sent only now that both steps have run - so it carries the
+        // parsing result, every Pace outcome and the folder the email finally went to - and sent even when
+        // a step failed part way, with whatever that step had already finished.
+        var delivered = await runSummaryNotifier.SendAsync(CancellationToken.None);
+        await paceInvoiceProcessor.FinalizeSummaryAsync(delivered);
+    }
 }
 catch (Exception exception)
 {

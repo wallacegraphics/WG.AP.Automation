@@ -54,7 +54,7 @@ public sealed class APProcessor(
     ClientRepository clientRepository,
     ExtractionPromptRepository extractionPromptRepository,
     AttachmentFileStore attachmentFileStore,
-    ErrorNotifier errorNotifier,
+    RunSummary runSummary,
     IOptions<MailboxOptions> mailboxOptions,
     IOptions<DatabaseOptions> databaseOptions,
     IOptions<AlertOptions> alertOptions,
@@ -132,6 +132,10 @@ public sealed class APProcessor(
                                         BuildDigestErrorDetail(duplicateReplayOutcome),
                                         Status: ApStatus.MailNeedsReview,
                                         Subject: message.Subject));
+
+                                    var replayEmail = runSummary.Email(duplicateReplay.MailMessageId, message.Subject, message.SenderAddress, message.ReceivedDateTime);
+                                    replayEmail.Parse = BuildParseResult(duplicateReplayOutcome);
+                                    replayEmail.RoutedTo = destination;
                                 }
 
                                 continue;
@@ -170,7 +174,28 @@ public sealed class APProcessor(
                     else
                     {
                         await mailMessageRepository.SetStatusAsync(claim.MailMessageId, result.Status, result.ErrorMessage, cancellationToken);
-                        var destination = await MoveIfRoutedAsync(message.Id, result.Status, mailFolders, cancellationToken);
+
+                        var email = runSummary.Email(claim.MailMessageId, message.Subject, message.SenderAddress, message.ReceivedDateTime);
+                        email.Parse = BuildParseResult(result);
+
+                        // An email with at least one extracted invoice is not moved here: its invoices still go to
+                        // Pace, and the Pace step moves it once, to the folder the worst of both steps calls for.
+                        // Moving it now would mean moving it twice - to Processed, then again on a Pace error.
+                        MailDestinationFolder? destination;
+
+                        if (result.SuccessCount > 0)
+                        {
+                            destination = ResolveDestination(result.Status, mailFolders);
+                            email.AwaitingPace = true;
+                            logger.LogInformation(
+                                "Message {MessageId}: {InvoiceCount} extracted invoice(s) go to Pace; the email stays in the Inbox until the Pace step routes it.",
+                                message.Id, result.SuccessCount);
+                        }
+                        else
+                        {
+                            destination = await MoveIfRoutedAsync(message.Id, result.Status, mailFolders, cancellationToken);
+                            email.RoutedTo = destination;
+                        }
 
                         if (destination is not null)
                         {
@@ -225,13 +250,8 @@ public sealed class APProcessor(
                 }
             }
 
-            if (digestEntries.Count > 0)
-            {
-                await errorNotifier.NotifyAsync(
-                    $"AP Automation - Processing Summary ({mailbox.MailboxUser})",
-                    BuildDigestBody(digestEntries, outcomes),
-                    cancellationToken);
-            }
+            // No summary email is sent from here: each email's parsing result is in runSummary, and goes out in the
+            // one summary per email that RunSummaryNotifier sends after the Pace step has run too.
 
             if (processingRunId is not null)
             {
@@ -242,14 +262,10 @@ public sealed class APProcessor(
         {
             logger.LogError(exception, "Mailbox processing failed.");
 
-            // Sent first, before FinishAsync: the team should still hear about the failure even if
-            // recording it against dbo.ProcessingRun also fails (e.g. the database is what's down).
-            // HTML-encoded because SendMailAsync sends BodyType.Html, and exception.Message is not
-            // guaranteed free of '<'/'&'.
-            await errorNotifier.NotifyAsync(
-                "AP Automation - Mailbox processing failed",
-                $"<p>{Html(exception.Message)}</p>\n<p>Processed {messageCount} message(s), {invoiceCount} invoice(s) before failing.</p>",
-                cancellationToken);
+            // Recorded first, before FinishAsync: the team should still hear about the failure even if
+            // recording it against dbo.ProcessingRun also fails (e.g. the database is what's down). It goes
+            // out in the run's summary email, sent after the Pace step.
+            runSummary.AddFailure($"Processing failed: {exception.Message}. Processed {messageCount} message(s), {invoiceCount} invoice(s) before failing.");
 
             if (processingRunId is not null)
             {
@@ -276,9 +292,9 @@ public sealed class APProcessor(
         IReadOnlyList<(string FileName, ApStatus MailStatus, string? Reason)>? PdfOutcomes = null);
 
     /// <summary>
-    /// One entry in the per-run summary email: the routed destination and received time (used to
-    /// group and order entries), the one-line summary (see <see cref="BuildDigestLine"/>), and any
-    /// per-PDF failure detail lines (see <see cref="BuildDigestErrorDetail"/>) to render under it.
+    /// One classified message, for the completion log line's outcomes summary: the folder its mailbox status
+    /// routes to and its received time, the one-line summary (see <see cref="BuildDigestLine"/>), and any
+    /// per-PDF failure detail lines (see <see cref="BuildDigestErrorDetail"/>).
     /// </summary>
     internal sealed record DigestEntry(
         MailDestinationFolder Destination,
@@ -472,7 +488,7 @@ public sealed class APProcessor(
     /// <remarks>
     /// Shared by <see cref="BuildMessageErrorSummary"/> (feeding <c>dbo.MailMessage.ErrorMessage</c>,
     /// and via it the file log line built by <see cref="BuildErrorLogLine"/>) and
-    /// <see cref="BuildDigestErrorDetail"/> (the summary email), so both places agree on what counts
+    /// <see cref="BuildParseResult"/> (the summary email), so both places agree on what counts
     /// as "the same reason".
     /// </remarks>
     private static IReadOnlyList<string> RenderProblems(
@@ -592,7 +608,7 @@ public sealed class APProcessor(
                 + $"identical content already received on \"{duplicate.Subject ?? "(no subject)"}\" (mail message {duplicate.MailMessageId}).";
 
             // No Invoice row for this one - identical bytes mean there is nothing new to record, and
-            // the verdict already lives on the mail message's own status/reason and the digest email.
+            // the verdict already lives on the mail message's own status/reason and the summary email.
             return (ApStatus.InvoicePdfDuplicate, ApStatus.MailNeedsReview, duplicateReason);
         }
 
@@ -829,6 +845,19 @@ public sealed class APProcessor(
         IReadOnlyDictionary<ApStatus, string?> mailFolders,
         CancellationToken cancellationToken)
     {
+        if (ResolveDestination(status, mailFolders) is not { } destination)
+        {
+            return null;
+        }
+
+        await mailSource.MoveMessageAsync(graphMessageId, destination, cancellationToken);
+        logger.LogInformation("Message {MessageId} routed to {Destination}.", graphMessageId, destination);
+        return destination;
+    }
+
+    /// <summary>The folder <c>lkup.Status</c> routes this status to, or null to leave the message in the Inbox.</summary>
+    private MailDestinationFolder? ResolveDestination(ApStatus status, IReadOnlyDictionary<ApStatus, string?> mailFolders)
+    {
         if (!mailFolders.TryGetValue(status, out var folderName) || folderName is null)
         {
             return null;
@@ -843,9 +872,33 @@ public sealed class APProcessor(
             return null;
         }
 
-        await mailSource.MoveMessageAsync(graphMessageId, destination, cancellationToken);
-        logger.LogInformation("Message {MessageId} routed to {Destination}.", graphMessageId, destination);
         return destination;
+    }
+
+    /// <summary>
+    /// This email's parsing result as its summary email shows it: which PDFs were parsed, and every problem -
+    /// identical reasons collapsed the same way as in <c>dbo.MailMessage.ErrorMessage</c>.
+    /// </summary>
+    internal static EmailParseResult BuildParseResult(MessageOutcome result)
+    {
+        if (result.PdfOutcomes is null)
+        {
+            // No per-PDF breakdown (no PDF at all, the attempt cap, a duplicate replay): the message-level
+            // reason is all there is.
+            return new EmailParseResult(
+                result.Status,
+                result.AttachmentCount,
+                result.PdfCount,
+                [],
+                result.ErrorMessage is null ? [] : [result.ErrorMessage]);
+        }
+
+        return new EmailParseResult(
+            result.Status,
+            result.AttachmentCount,
+            result.PdfCount,
+            result.PdfOutcomes.Where(pdf => pdf.MailStatus == ApStatus.MailProcessed).Select(pdf => pdf.FileName).ToList(),
+            RenderProblems(result.PdfOutcomes));
     }
 
     /// <summary>
@@ -866,11 +919,9 @@ public sealed class APProcessor(
             : "unknown time";
 
     /// <summary>
-    /// One line of the per-run summary email, mirroring <see cref="ProcessMessageAsync"/>'s completion
-    /// log line but with the received time converted from Graph's UTC into <paramref name="timeZone"/>,
-    /// since the email's whole point is answering "what happened" without opening the log file. The
-    /// routed folder is not named here - <see cref="BuildDigestBody"/> already groups entries by folder,
-    /// so naming it again per line would just repeat what the group header already says.
+    /// One message's summary line, mirroring <see cref="ProcessMessageAsync"/>'s completion log line but
+    /// with the received time converted from Graph's UTC into <paramref name="timeZone"/>. Used to tell
+    /// apart messages the completion log line collapses (see <see cref="BuildOutcomesSummary"/>).
     /// </summary>
     internal static string BuildDigestLine(
         MailMessageSummary message,
@@ -950,88 +1001,15 @@ public sealed class APProcessor(
 
     /// <summary>
     /// Collapses entries that would render identical content (same destination, same summary line,
-    /// same detail lines) down to one, keeping the first. Shared by <see cref="BuildDigestBody"/> and
-    /// the completion log line's outcomes summary in <see cref="ProcessInvoicesAsync"/>, so both agree
-    /// on what counts as "the same message" when two <c>dbo.MailMessage</c> rows describe one email.
+    /// same detail lines) down to one, keeping the first. Used by the completion log line's outcomes summary
+    /// in <see cref="ProcessInvoicesAsync"/>, so the log names each email once
+    /// when two <c>dbo.MailMessage</c> rows describe one physical email.
     /// </summary>
     private static IReadOnlyList<DigestEntry> DistinctByRenderedContent(IEnumerable<DigestEntry> entries) =>
         entries
             .GroupBy(entry => (entry.Destination, entry.SummaryLine, Detail: string.Join("\n", entry.ErrorDetailLines)))
             .Select(group => group.First())
             .ToList();
-
-    /// <summary>
-    /// The full HTML body of the per-run summary email: an intro asking the recipient to check the
-    /// mailbox folders, a totals line reusing the same <c>outcomes</c> tally already logged in
-    /// <see cref="ProcessInvoicesAsync"/>'s completion line, then one section per destination folder
-    /// (Processed, NeedsReview, Errors, in that order - skipping any with nothing routed to it), each
-    /// ordered by received date ascending.
-    /// </summary>
-    /// <remarks>
-    /// Every visual "block" (intro, totals, each section header, each message) is its own
-    /// <c>&lt;p&gt;</c>: mail clients put natural spacing between paragraphs, which is what gives the
-    /// blank line after each bolded section header and between NeedsReview/Errors messages, for free.
-    /// The Processed section is the one exception - it's deliberately packed into a single paragraph
-    /// with <c>&lt;br&gt;</c> between messages and no per-message routing text, ending in one shared
-    /// "Routed to Processed (N)." line, since a Processed message needs no more attention than "it happened".
-    /// <para>
-    /// Entries that would render identical content (same destination, same summary line, same detail
-    /// lines) are collapsed to one before building each section's messages - e.g. when the mail
-    /// pipeline records two <c>dbo.MailMessage</c> rows for what is actually one physical email (Graph
-    /// reissuing a message's id after it moves is a known way this happens), the reader should see it
-    /// once, not twice. The two counts this can produce are deliberately both shown, not merged: the
-    /// section header states the raw number of routed <c>dbo.MailMessage</c> rows, while the trailing
-    /// "Routed to X (N)." line states how many distinct messages that collapsed down to - so "2 rows,
-    /// but only 1 email" stays visible instead of silently picking one number.
-    /// </para>
-    /// </remarks>
-
-    internal static string BuildDigestBody(IReadOnlyList<DigestEntry> entries, IReadOnlyDictionary<ApStatus, int> outcomes)
-    {
-        var totals = string.Join(", ", outcomes
-            .Where(pair => pair.Key is ApStatus.MailProcessed or ApStatus.MailNeedsReview or ApStatus.MailError or ApStatus.MailSkipped)
-            .Select(pair => $"{pair.Value} {pair.Key}"));
-
-        var distinctEntries = DistinctByRenderedContent(entries);
-
-        var groupBlocks = new[] { MailDestinationFolder.Processed, MailDestinationFolder.NeedsReview, MailDestinationFolder.Errors }
-            .Select(destination => (
-                destination,
-                rawCount: entries.Count(entry => entry.Destination == destination),
-                ordered: distinctEntries
-                    .Where(entry => entry.Destination == destination)
-                    .OrderBy(entry => entry.ReceivedAt ?? DateTimeOffset.MaxValue)
-                    .ToList()))
-            .Where(group => group.ordered.Count > 0)
-            .Select(group => BuildGroupBlock(group.destination, group.rawCount, group.ordered));
-
-        return "<p>This is a summary of the AP Automation mailbox run just completed. Please verify the "
-            + "Processed, Errors, and NeedsReview folders as needed.</p>\n"
-            + $"<p>Totals: {totals}.</p>\n"
-            + string.Join("\n", groupBlocks);
-    }
-
-    private static string BuildGroupBlock(MailDestinationFolder destination, int rawCount, IReadOnlyList<DigestEntry> entries)
-    {
-        var header = $"<p><b>=== {destination} ({rawCount}) ===</b></p>";
-
-        if (destination == MailDestinationFolder.Processed)
-        {
-            var lines = entries.Select(entry => entry.SummaryLine).Append($"Routed to Processed ({entries.Count}).");
-            return $"{header}\n<p>{string.Join("<br>\n", lines)}</p>";
-        }
-
-        var messageBlocks = entries.Select(entry =>
-        {
-            var summary = $"{entry.SummaryLine} Routed to {destination}.";
-            var block = entry.ErrorDetailLines.Count == 0
-                ? summary
-                : $"{summary}<br>\n{string.Join("<br>\n", entry.ErrorDetailLines)}";
-            return $"<p>{block}</p>";
-        });
-
-        return $"{header}\n{string.Join("\n", messageBlocks)}\n<p>Routed to {destination} ({entries.Count}).</p>";
-    }
 
     /// <summary>
     /// One log line for a persisted <c>dbo.MailMessage.ErrorMessage</c> entry.

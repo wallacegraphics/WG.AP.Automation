@@ -19,6 +19,7 @@ public static class PaceServiceCollectionExtensions
             .Validate(options => !string.IsNullOrWhiteSpace(options.UserName), $"{PaceOptions.SectionName}:UserName is required.")
             .Validate(options => !string.IsNullOrWhiteSpace(options.Password), $"{PaceOptions.SectionName}:Password is required.")
             .Validate(options => options.TimeoutSeconds > 0, $"{PaceOptions.SectionName}:TimeoutSeconds must be greater than 0.")
+            .Validate(options => options.MaxAttempts >= 1, $"{PaceOptions.SectionName}:MaxAttempts must be 1 or greater.")
             .ValidateOnStart();
 
         services.AddTransient<PaceBasicAuthHandler>();

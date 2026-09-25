@@ -103,7 +103,11 @@ public sealed class PaceSubmissionRepository(
                    client.[PaceVendorAccountNumber],
                    inserted.[PaceBillBatchId],
                    inserted.[PaceBillId],
-                   inserted.[PaceBillLineId]
+                   inserted.[PaceBillLineId],
+                   invoice.[InvoiceDate],
+                   mailMessage.[Subject],
+                   mailMessage.[SenderAddress],
+                   mailMessage.[ReceivedOn]
             FROM [intgr].[PaceSubmission] AS submission
             INNER JOIN NextSubmission AS nextSubmission
                 ON nextSubmission.[PaceSubmissionId] = submission.[PaceSubmissionId]
@@ -311,9 +315,103 @@ public sealed class PaceSubmissionRepository(
     }
 
     /// <summary>
-    /// Claims Pace-final submissions (RequiresReview, or a StatusCode that always routes to Errors) whose mail
-    /// routing was never confirmed via <see cref="MarkMailRoutedAsync(long, CancellationToken)"/> - the durable
-    /// trail left behind when a crash or exception happens anywhere between CompleteAsync and the end of routing.
+    /// Loads what decides where one vendor email goes after the Pace step: the email's status from the mailbox
+    /// step, and the Pace outcome of each of its extracted invoices (only those are ever sent to Pace).
+    /// Returns null when the mail message does not exist.
+    /// </summary>
+    public async Task<MailRoutingState?> LoadMailRoutingStateAsync(long mailMessageId, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var connection = await connectionFactory.OpenAsync(cancellationToken);
+            using var results = await connection.QueryMultipleAsync(new CommandDefinition(
+            """
+            SELECT mailMessage.[MailMessageId],
+                   mailMessage.[GraphMessageId],
+                   mailMessage.[StatusId] AS [MailStatusId],
+                   mailMessage.[ErrorMessage] AS [MailErrorMessage],
+                   mailMessage.[Subject],
+                   mailMessage.[SenderAddress],
+                   mailMessage.[ReceivedOn]
+            FROM [dbo].[MailMessage] AS mailMessage
+            WHERE mailMessage.[MailMessageId] = @MailMessageId;
+
+            SELECT invoice.[InvoiceId],
+                   submission.[PaceSubmissionId],
+                   status.[StatusCode],
+                   COALESCE(submission.[RequiresReview], CAST(0 AS BIT)) AS [RequiresReview],
+                   submission.[ErrorMessage],
+                   COALESCE(submission.[AttemptCount], 0) AS [AttemptCount],
+                   submission.[NextAttemptOn],
+                   CAST(CASE WHEN submission.[NotifiedOn] IS NULL THEN 0 ELSE 1 END AS BIT) AS [Notified],
+                   CAST(CASE WHEN submission.[MailRoutedOn] IS NULL THEN 0 ELSE 1 END AS BIT) AS [MailRouted]
+            FROM [dbo].[Invoice] AS invoice
+            LEFT JOIN [intgr].[PaceSubmission] AS submission
+                ON submission.[InvoiceId] = invoice.[InvoiceId]
+            LEFT JOIN [intgr].[PaceSubmissionStatus] AS status
+                ON status.[StatusCodeId] = submission.[StatusCodeId]
+            WHERE invoice.[MailMessageId] = @MailMessageId
+              -- The same test EnqueueExtractedInvoicesAsync uses, so an invoice that can never be queued can
+              -- never hold its email in the Inbox waiting for a Pace outcome that will not come.
+              AND ((invoice.[StatusId] = @InvoiceExtractedStatus AND invoice.[FieldsJson] IS NOT NULL)
+                   OR submission.[PaceSubmissionId] IS NOT NULL)
+            ORDER BY invoice.[InvoiceId];
+            """,
+                new
+                {
+                    MailMessageId = mailMessageId,
+                    InvoiceExtractedStatus = (int)ApStatus.InvoiceExtracted
+                },
+                commandTimeout: connectionFactory.CommandTimeoutSeconds,
+                cancellationToken: cancellationToken));
+
+            var message = await results.ReadSingleOrDefaultAsync<MailRoutingStateRow>();
+
+            if (message is null)
+            {
+                return null;
+            }
+
+            var submissions = (await results.ReadAsync<MailRoutingSubmission>()).AsList();
+
+            return new MailRoutingState
+            {
+                MailMessageId = message.MailMessageId,
+                GraphMessageId = message.GraphMessageId,
+                MailStatusId = message.MailStatusId,
+                MailErrorMessage = message.MailErrorMessage,
+                Subject = message.Subject,
+                SenderAddress = message.SenderAddress,
+                ReceivedOn = message.ReceivedOn,
+                Submissions = submissions
+            };
+        }
+        catch (Exception exception)
+        {
+            logger.LogError(exception, "Failed to load the mail-routing state of mail message {MailMessageId}.", mailMessageId);
+            throw;
+        }
+    }
+
+    private sealed record MailRoutingStateRow
+    {
+        public long MailMessageId { get; init; }
+        public string GraphMessageId { get; init; } = string.Empty;
+        public int MailStatusId { get; init; }
+        public string? MailErrorMessage { get; init; }
+        public string? Subject { get; init; }
+        public string? SenderAddress { get; init; }
+        public DateTimeOffset? ReceivedOn { get; init; }
+    }
+
+    /// <summary>
+    /// Claims Pace-final submissions whose mail routing was never confirmed via
+    /// <see cref="MarkMailRoutedAsync(long, CancellationToken)"/> - the durable trail left behind when a crash or
+    /// exception happens anywhere between CompleteAsync and the end of routing. Eligible are RequiresReview rows,
+    /// rows whose StatusCode always routes to Errors, and every row whose ResponseJson carries a Pace summary
+    /// (<c>$.summary</c>): code that writes one routes the vendor email itself once the Pace step is done with
+    /// it, success included, so a success row needs the sweep as much as an error does. Rows completed before
+    /// that change carry no summary, so their emails - moved long ago by the mailbox step - are never re-moved.
     /// <para>
     /// Claims rather than reads: each returned row's RoutingClaimedOn lease is renewed in the same statement,
     /// and rows whose lease is still live are skipped. So two overlapping runs get disjoint rows, and a sweep
@@ -360,7 +458,8 @@ public sealed class PaceSubmissionRepository(
                   AND candidate.[RoutingClaimedOn] IS NOT NULL
                   AND candidate.[RoutingClaimedOn] <= @LeaseExpiredOn
                   AND (candidate.[RequiresReview] = 1
-                       OR candidate.[StatusCodeId] IN (@ErrorStatusId, @PoNotReceivedStatusId))
+                       OR candidate.[StatusCodeId] IN (@ErrorStatusId, @PoNotReceivedStatusId)
+                       OR JSON_QUERY(candidate.[ResponseJson], '$.summary') IS NOT NULL)
             )
             UPDATE submission
                SET [RoutingClaimedOn] = @Now
@@ -378,7 +477,15 @@ public sealed class PaceSubmissionRepository(
                    inserted.[PaceBillId],
                    inserted.[RequiresReview],
                    inserted.[BillVendor],
-                   CAST(CASE WHEN inserted.[NotifiedOn] IS NULL THEN 0 ELSE 1 END AS BIT) AS [AlreadyNotified]
+                   CAST(CASE WHEN inserted.[NotifiedOn] IS NULL THEN 0 ELSE 1 END AS BIT) AS [AlreadyNotified],
+                   inserted.[ResponseJson],
+                   invoice.[InvoiceDate],
+                   invoice.[Total],
+                   client.[Code] AS [ClientCode],
+                   client.[Name] AS [ClientName],
+                   mailMessage.[Subject],
+                   mailMessage.[SenderAddress],
+                   mailMessage.[ReceivedOn]
             FROM [intgr].[PaceSubmission] AS submission
             INNER JOIN Unrouted AS unrouted
                 ON unrouted.[PaceSubmissionId] = submission.[PaceSubmissionId]
