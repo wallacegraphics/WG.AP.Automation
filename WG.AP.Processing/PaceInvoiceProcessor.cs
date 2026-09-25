@@ -1,7 +1,6 @@
 using System.Text.Json;
-using System.Text.RegularExpressions;
-using System.Net;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using WG.AP.Core.Abstractions;
 using WG.AP.DataAccess;
 using WG.AP.Integrations.Pace;
@@ -9,23 +8,26 @@ using WG.AP.Processor.Logging;
 
 namespace WG.AP.Processor;
 
+/// <summary>
+/// Sends each extracted invoice to Pace, records the outcome, and - once every invoice of a vendor email has a
+/// Pace outcome - moves that email out of the Inbox, once, to the folder its worst result calls for: any error
+/// to Errors, otherwise anything needing review to NeedsReview, otherwise Processed. The mailbox step leaves
+/// a parsed email in the Inbox precisely so this is the only move it gets.
+/// </summary>
+/// <remarks>
+/// Sends no email itself: every outcome becomes a line in <see cref="RunSummary"/>, sent once at the end of the
+/// run by <see cref="RunSummaryNotifier"/>, after which <see cref="FinalizeSummaryAsync"/> records what was
+/// delivered and routed.
+/// </remarks>
 public sealed class PaceInvoiceProcessor(
     IMailSource mailSource,
     MailMessageRepository mailMessageRepository,
     PaceSubmissionRepository paceSubmissionRepository,
     IPaceInvoiceService paceInvoiceService,
-    ErrorNotifier errorNotifier,
+    RunSummary runSummary,
+    IOptions<PaceOptions> paceOptions,
     ILogger<PaceInvoiceProcessor> logger)
 {
-    /// <summary>
-    /// Subject prefix of the one summary email each run sends for its Pace step, covering every Pace error and
-    /// every needs-review invoice together - there are no per-invoice Pace alert emails.
-    /// </summary>
-    internal const string PaceSummarySubjectPrefix = "AP Automation - Pace summary";
-
-    // A stored Pace error starts by naming the invoice and PO; the summary line already names both.
-    private static readonly Regex ReasonInvoiceAndPoPrefixRegex = new(@"^Pace invoice '.*?' for PO '.*?':\s*", RegexOptions.Compiled);
-
     public Task ProcessPendingAsync(CancellationToken cancellationToken) =>
         ProcessPendingAsync(ProcessingRunContext.CurrentRunId, cancellationToken);
 
@@ -35,42 +37,75 @@ public sealed class PaceInvoiceProcessor(
         logger.LogInformation("Pace submission enqueue complete: {EnqueuedCount} invoice(s) queued.", enqueued);
 
         var processed = 0;
-        var summaryEntries = new List<PaceSummaryEntry>();
 
-        // Every submission this run tries to route, live or recovered. Whatever is still unrouted at the end
-        // has its lease released, so the next run retries it straight away rather than after the lease lapses.
-        var routingAttempts = new HashSet<long>();
+        await RecoverUnroutedSubmissionsAsync(cancellationToken);
 
-        try
+        while (true)
         {
-            await RecoverUnroutedSubmissionsAsync(summaryEntries, routingAttempts, cancellationToken);
+            var claim = await paceSubmissionRepository.ClaimNextAsync(processingRunId, cancellationToken);
 
-            while (true)
+            if (claim is null)
             {
-                var claim = await paceSubmissionRepository.ClaimNextAsync(processingRunId, cancellationToken);
-
-                if (claim is null)
-                {
-                    break;
-                }
-
-                processed++;
-                await ProcessClaimAsync(claim, summaryEntries, routingAttempts, cancellationToken);
+                break;
             }
 
-            logger.LogInformation("Pace submission processing complete: {ProcessedCount} submission(s) processed.", processed);
+            processed++;
+            await ProcessClaimAsync(claim, cancellationToken);
         }
-        finally
-        {
-            // Entries here were already finalized, so they will never be claimed again - send the summary even
-            // when a later claim threw. If this send fails too, their NotifiedOn stays NULL and the recovery
-            // sweep puts them in the next run's summary.
-            await SendPaceSummaryAsync(summaryEntries);
 
-            // Only after the summary: a row is not done until its summary line is sent, so its lease must hold
-            // until then or an overlapping run could put it in a second summary.
-            await ReleaseUnfinishedRoutingAsync(routingAttempts);
+        logger.LogInformation("Pace submission processing complete: {ProcessedCount} submission(s) processed.", processed);
+    }
+
+    /// <summary>
+    /// Runs after the run's summary emails were sent. A row is done only when its summary line was delivered
+    /// and its email was moved: rows reported in a delivered summary are marked notified, and routed once their
+    /// email was moved. Anything else keeps MailRoutedOn NULL, so the next run's sweep reports or moves it again.
+    /// </summary>
+    public async Task FinalizeSummaryAsync(IReadOnlySet<long> deliveredMailMessageIds)
+    {
+        try
+        {
+            var notified = new List<long>();
+            var routed = new List<long>();
+
+            foreach (var email in runSummary.Emails)
+            {
+                var delivered = deliveredMailMessageIds.Contains(email.MailMessageId);
+                var reportedNow = email.PaceEntries.Select(entry => entry.PaceSubmissionId).ToHashSet();
+
+                if (delivered)
+                {
+                    notified.AddRange(reportedNow);
+                }
+                else if (reportedNow.Count > 0)
+                {
+                    logger.LogWarning(
+                        "Pace summary for {EntryCount} invoice(s) could not be sent; they will be included in the next run's summary: {InvoiceIds}.",
+                        reportedNow.Count,
+                        string.Join(", ", email.PaceEntries.Select(entry => entry.InvoiceId)));
+                }
+
+                if (email.RoutedTo is not null)
+                {
+                    routed.AddRange(email.RoutedSubmissions
+                        .Where(submission => submission.AlreadyNotified || (delivered && reportedNow.Contains(submission.PaceSubmissionId)))
+                        .Select(submission => submission.PaceSubmissionId));
+                }
+            }
+
+            // CancellationToken.None: a cancelled run must still record notifications for work it already committed.
+            await paceSubmissionRepository.MarkNotifiedAsync(notified, CancellationToken.None);
+            await paceSubmissionRepository.MarkMailRoutedAsync(routed, CancellationToken.None);
         }
+        catch (Exception exception)
+        {
+            // Never mask the run's own outcome with bookkeeping; unmarked rows are simply swept again next run.
+            logger.LogError(exception, "Failed to record which Pace summary lines were delivered and which emails were routed.");
+        }
+
+        // Only after the summary: a row is not done until its summary line is sent, so its lease must hold
+        // until then or an overlapping run could put it in a second summary.
+        await ReleaseUnfinishedRoutingAsync(runSummary.RoutingAttempts);
     }
 
     private async Task ReleaseUnfinishedRoutingAsync(HashSet<long> routingAttempts)
@@ -96,66 +131,17 @@ public sealed class PaceInvoiceProcessor(
         }
     }
 
-    private async Task SendPaceSummaryAsync(List<PaceSummaryEntry> summaryEntries)
+    private async Task ProcessClaimAsync(PaceSubmissionClaim claim, CancellationToken cancellationToken)
     {
-        if (summaryEntries.Count == 0)
-        {
-            return;
-        }
+        var email = runSummary.Email(claim.MailMessageId, claim.Subject, claim.SenderAddress, claim.ReceivedOn);
+        email.AwaitingPace = true;
 
-        var invoiceIds = string.Join(", ", summaryEntries.Select(entry => entry.InvoiceId));
-
-        try
-        {
-            // CancellationToken.None: a cancelled run must still deliver notifications for work it already committed.
-            var sent = await errorNotifier.NotifyAsync(
-                BuildPaceSummarySubject(summaryEntries),
-                BuildPaceSummaryBody(summaryEntries),
-                CancellationToken.None);
-
-            if (!sent)
-            {
-                logger.LogWarning(
-                    "Pace summary for {EntryCount} invoice(s) could not be sent; they will be included in the next run's summary: {InvoiceIds}.",
-                    summaryEntries.Count,
-                    invoiceIds);
-                return;
-            }
-
-            // Only now is each entry's notification delivered. An entry whose move also succeeded is fully
-            // routed; one whose move failed is left for the sweep to redo the move alone, without reporting again.
-            await paceSubmissionRepository.MarkNotifiedAsync(
-                summaryEntries.Select(entry => entry.PaceSubmissionId).ToList(),
-                CancellationToken.None);
-            await paceSubmissionRepository.MarkMailRoutedAsync(
-                summaryEntries.Where(entry => entry.Moved).Select(entry => entry.PaceSubmissionId).ToList(),
-                CancellationToken.None);
-        }
-        catch (Exception exception)
-        {
-            // Never mask the exception that ended the claim loop with a notification or bookkeeping failure.
-            logger.LogError(
-                exception,
-                "Failed to send or record the Pace summary for {EntryCount} invoice(s): {InvoiceIds}.",
-                summaryEntries.Count,
-                invoiceIds);
-        }
-    }
-
-    private async Task ProcessClaimAsync(
-        PaceSubmissionClaim claim,
-        List<PaceSummaryEntry> summaryEntries,
-        HashSet<long> routingAttempts,
-        CancellationToken cancellationToken)
-    {
         try
         {
             if (!string.IsNullOrWhiteSpace(claim.PaceBillId) || !string.IsNullOrWhiteSpace(claim.PaceBillLineId))
             {
-                await paceSubmissionRepository.CompleteAsync(new PaceSubmissionCompletion
+                await CompleteAndRouteAsync(claim, new PaceInvoiceSubmissionResult
                 {
-                    PaceSubmissionId = claim.PaceSubmissionId,
-                    ClaimToken = claim.ClaimToken,
                     StatusCode = PaceSubmissionStatus.AlreadyEntered,
                     PaceBillBatchId = claim.PaceBillBatchId,
                     PaceBillId = claim.PaceBillId,
@@ -167,7 +153,26 @@ public sealed class PaceInvoiceProcessor(
                 return;
             }
 
-            var fields = PaceInvoiceFieldsParser.Parse(claim.FieldsJson);
+            PaceInvoiceFields fields;
+
+            try
+            {
+                fields = PaceInvoiceFieldsParser.Parse(claim.FieldsJson);
+            }
+            catch (Exception exception) when (IsProcessingFailure(exception))
+            {
+                logger.LogError(exception, "Pace submission {PaceSubmissionId} (invoice {InvoiceId}): stored invoice fields could not be parsed.", claim.PaceSubmissionId, claim.InvoiceId);
+
+                await CompleteAndRouteAsync(claim, new PaceInvoiceSubmissionResult
+                {
+                    StatusCode = PaceSubmissionStatus.Error,
+                    ErrorMessage = $"Pace invoice '{claim.InvoiceNumber}' for PO '{claim.CustomerPO}': stored invoice fields could not be processed. {exception.Message}",
+                    RequiresReview = false
+                }, cancellationToken, parseFailure: true);
+
+                return;
+            }
+
             var result = await paceInvoiceService.SubmitAsync(new PaceInvoiceSubmission
             {
                 InvoiceId = claim.InvoiceId,
@@ -179,179 +184,349 @@ public sealed class PaceInvoiceProcessor(
 
             if (result.IsTransient || result.StatusCode == PaceSubmissionStatus.RetryLater)
             {
-                var savedRetry = await paceSubmissionRepository.RetryLaterAsync(new PaceSubmissionRetry
-                {
-                    PaceSubmissionId = claim.PaceSubmissionId,
-                    ClaimToken = claim.ClaimToken,
-                    NextAttemptOn = CalculateNextAttemptOn(claim.AttemptCount),
-                    ResponseJson = result.ResponseJson,
-                    ErrorMessage = result.ErrorMessage
-                }, cancellationToken);
+                var maxAttempts = paceOptions.Value.MaxAttempts;
 
-                if (!savedRetry)
+                if (claim.AttemptCount < maxAttempts)
                 {
-                    logger.LogWarning("Pace submission {PaceSubmissionId} retry update skipped because its claim token no longer matched.", claim.PaceSubmissionId);
+                    var nextAttemptOn = CalculateNextAttemptOn(claim.AttemptCount);
+                    var savedRetry = await paceSubmissionRepository.RetryLaterAsync(new PaceSubmissionRetry
+                    {
+                        PaceSubmissionId = claim.PaceSubmissionId,
+                        ClaimToken = claim.ClaimToken,
+                        NextAttemptOn = nextAttemptOn,
+                        ResponseJson = result.ResponseJson,
+                        ErrorMessage = result.ErrorMessage
+                    }, cancellationToken);
+
+                    if (!savedRetry)
+                    {
+                        logger.LogWarning("Pace submission {PaceSubmissionId} retry update skipped because its claim token no longer matched.", claim.PaceSubmissionId);
+                    }
+
+                    email.WaitingForPace = new PaceRetryInfo(claim.AttemptCount, maxAttempts, nextAttemptOn);
+                    return;
                 }
 
-                return;
-            }
-
-            var savedCompletion = await paceSubmissionRepository.CompleteAsync(new PaceSubmissionCompletion
-            {
-                PaceSubmissionId = claim.PaceSubmissionId,
-                ClaimToken = claim.ClaimToken,
-                StatusCode = result.StatusCode,
-                ResponseJson = result.ResponseJson,
-                PaceBillBatchId = result.PaceBillBatchId,
-                PaceBillId = result.PaceBillId,
-                PaceBillLineId = result.PaceBillLineId,
-                ErrorMessage = result.ErrorMessage,
-                RequiresReview = result.RequiresReview,
-                BillVendor = result.BillVendor
-            }, cancellationToken);
-
-            if (!savedCompletion)
-            {
-                logger.LogWarning("Pace submission {PaceSubmissionId} completion skipped because its claim token no longer matched.", claim.PaceSubmissionId);
-            }
-
-            if (savedCompletion && result.RequiresReview)
-            {
-                await RouteAndMarkAsync(
-                    routingAttempts,
-                    claim.PaceSubmissionId,
+                // Pace has been unreachable for every allowed attempt. Retrying for ever would leave the email in
+                // the Inbox with nobody told, so the invoice becomes an Error and its email goes to Errors.
+                var gaveUpMessage = $"Pace invoice '{claim.InvoiceNumber}' for PO '{claim.CustomerPO}': Pace could not be reached after {claim.AttemptCount} attempts: {result.ErrorMessage ?? "no error detail was returned"}";
+                logger.LogError(
+                    "Pace invoice '{InvoiceNumber}' for PO '{PoNumber}': Pace could not be reached after {AttemptCount} attempt(s) (Pace:MaxAttempts {MaxAttempts}); giving up and routing the email to Errors. Last error: {LastError}. InvoiceId={InvoiceId}; PaceSubmissionId={PaceSubmissionId}.",
+                    claim.InvoiceNumber,
+                    claim.CustomerPO,
+                    claim.AttemptCount,
+                    maxAttempts,
+                    result.ErrorMessage,
                     claim.InvoiceId,
-                    () => RouteNeedsReviewAsync(claim, result, summaryEntries, cancellationToken),
-                    cancellationToken);
+                    claim.PaceSubmissionId);
+
+                result = new PaceInvoiceSubmissionResult
+                {
+                    StatusCode = PaceSubmissionStatus.Error,
+                    ResponseJson = result.ResponseJson,
+                    ErrorMessage = gaveUpMessage
+                };
             }
-            else if (savedCompletion && result.StatusCode is PaceSubmissionStatus.Error or PaceSubmissionStatus.PoNotReceived)
-            {
-                await RouteAndMarkAsync(
-                    routingAttempts,
-                    claim.PaceSubmissionId,
-                    claim.InvoiceId,
-                    () => RoutePaceErrorAsync(claim, result.StatusCode, result.ErrorMessage, summaryEntries, cancellationToken),
-                    cancellationToken);
-            }
+
+            await CompleteAndRouteAsync(claim, result, cancellationToken);
         }
-        catch (Exception exception) when (exception is JsonException or InvalidOperationException or FormatException or OverflowException or KeyNotFoundException or ArgumentException)
+        catch (Exception exception) when (IsProcessingFailure(exception))
         {
-            var savedCompletion = await paceSubmissionRepository.CompleteAsync(new PaceSubmissionCompletion
+            // Not a bad stored invoice: something failed while working with Pace (e.g. createBill returned no id,
+            // or Pace paged inconsistently), so it is reported as a Pace failure, with the real reason.
+            logger.LogError(exception, "Pace submission {PaceSubmissionId} (invoice {InvoiceId}) failed while processing in Pace; completed as Error.", claim.PaceSubmissionId, claim.InvoiceId);
+
+            await CompleteAndRouteAsync(claim, new PaceInvoiceSubmissionResult
             {
-                PaceSubmissionId = claim.PaceSubmissionId,
-                ClaimToken = claim.ClaimToken,
                 StatusCode = PaceSubmissionStatus.Error,
-                ErrorMessage = exception.Message,
+                ErrorMessage = $"Pace invoice '{claim.InvoiceNumber}' for PO '{claim.CustomerPO}': Pace processing failed: {exception.Message}",
                 RequiresReview = false
-            }, cancellationToken);
-
-            if (!savedCompletion)
-            {
-                logger.LogWarning("Pace submission {PaceSubmissionId} parse-error update skipped because its claim token no longer matched.", claim.PaceSubmissionId);
-            }
-
-            if (savedCompletion)
-            {
-                await RouteAndMarkAsync(
-                    routingAttempts,
-                    claim.PaceSubmissionId,
-                    claim.InvoiceId,
-                    () => RoutePaceErrorAsync(
-                        claim,
-                        PaceSubmissionStatus.Error,
-                        $"Pace invoice '{claim.InvoiceNumber}' for PO '{claim.CustomerPO}': stored invoice fields could not be processed. {exception.Message}",
-                        summaryEntries,
-                        cancellationToken),
-                    cancellationToken);
-            }
+            }, cancellationToken, parseFailure: true);
         }
     }
 
+    private static bool IsProcessingFailure(Exception exception) =>
+        exception is JsonException or InvalidOperationException or FormatException or OverflowException or KeyNotFoundException or ArgumentException;
+
     /// <summary>
-    /// Runs a mail-routing action after a Pace submission is already final/non-reclaimable, without letting a
-    /// routing failure abort the rest of the claim loop. Any exception here is logged and swallowed - the
-    /// submission's MailRoutedOn stays NULL, so RecoverUnroutedSubmissionsAsync redoes just this routing step
-    /// on the next run instead of the invoice being silently stuck. The route action itself records the row's
-    /// summary entry or marks it routed, because when that happens differs per case.
+    /// Records the Pace outcome, adds its line to the run summary, and moves the vendor email if this was the
+    /// last of its invoices Pace had to decide.
     /// </summary>
-    private async Task RouteAndMarkAsync(
-        HashSet<long> routingAttempts,
-        long paceSubmissionId,
-        long invoiceId,
-        Func<Task> routeAction,
-        CancellationToken cancellationToken)
+    private async Task CompleteAndRouteAsync(
+        PaceSubmissionClaim claim,
+        PaceInvoiceSubmissionResult result,
+        CancellationToken cancellationToken,
+        bool parseFailure = false)
     {
-        routingAttempts.Add(paceSubmissionId);
+        // Every completion carries a summary: it is what the email line is built from, and what tells the
+        // recovery sweep this row's email is routed by the Pace step (see ClaimUnroutedFinalSubmissionsAsync).
+        var storedSummary = result.Summary ?? new PaceBillSummary
+        {
+            Case = PaceInvoiceCase.Other,
+            VendorId = result.BillVendor ?? claim.PaceVendorAccountNumber,
+            InvoiceTotal = claim.Total ?? 0m
+        };
+
+        var savedCompletion = await paceSubmissionRepository.CompleteAsync(new PaceSubmissionCompletion
+        {
+            PaceSubmissionId = claim.PaceSubmissionId,
+            ClaimToken = claim.ClaimToken,
+            StatusCode = result.StatusCode,
+            ResponseJson = storedSummary.AttachTo(result.ResponseJson),
+            PaceBillBatchId = result.PaceBillBatchId,
+            PaceBillId = result.PaceBillId,
+            PaceBillLineId = result.PaceBillLineId,
+            ErrorMessage = result.ErrorMessage,
+            RequiresReview = result.RequiresReview,
+            BillVendor = result.BillVendor
+        }, cancellationToken);
+
+        if (!savedCompletion)
+        {
+            logger.LogWarning(
+                parseFailure
+                    ? "Pace submission {PaceSubmissionId} parse-error update skipped because its claim token no longer matched."
+                    : "Pace submission {PaceSubmissionId} completion skipped because its claim token no longer matched.",
+                claim.PaceSubmissionId);
+            return;
+        }
+
+        var email = runSummary.Email(claim.MailMessageId, claim.Subject, claim.SenderAddress, claim.ReceivedOn);
+        email.PaceEntries.Add(new PaceSummaryEntry(
+            PaceSummaryEntry.KindOf(result.StatusCode, result.RequiresReview),
+            claim.PaceSubmissionId,
+            claim.InvoiceId,
+            claim.InvoiceNumber,
+            claim.CustomerPO,
+            claim.InvoiceDate,
+            claim.Total,
+            result.Summary?.VendorId ?? result.BillVendor ?? claim.PaceVendorAccountNumber,
+            result.Summary?.VendorName ?? claim.ClientName,
+            result.StatusCode,
+            result.PaceBillBatchId,
+            result.PaceBillId,
+            result.ErrorMessage,
+            result.Summary));
+
+        await RouteEmailIfFinishedAsync(claim.MailMessageId, [claim.PaceSubmissionId], cancellationToken);
+    }
+
+    /// <summary>
+    /// Moves the vendor email once none of its invoices is still waiting on Pace. Never throws: the Pace
+    /// outcomes are already final by now, so a routing failure is logged and left for the next run's sweep
+    /// (MailRoutedOn stays NULL) instead of aborting the rest of the claim loop.
+    /// </summary>
+    /// <remarks>
+    /// The status is committed before the move, as in the mailbox step: a crash between the two leaves a
+    /// correctly classified message in the Inbox, which the sweep moves on the next run.
+    /// </remarks>
+    private async Task RouteEmailIfFinishedAsync(long mailMessageId, IReadOnlyCollection<long> paceSubmissionIds, CancellationToken cancellationToken)
+    {
+        runSummary.RoutingAttempts.UnionWith(paceSubmissionIds);
 
         try
         {
-            await routeAction();
+            var state = await paceSubmissionRepository.LoadMailRoutingStateAsync(mailMessageId, cancellationToken);
+
+            if (state is null)
+            {
+                return;
+            }
+
+            runSummary.RoutingAttempts.UnionWith(state.Submissions.Where(submission => submission.PaceSubmissionId is not null).Select(submission => submission.PaceSubmissionId!.Value));
+
+            var email = runSummary.Email(state.MailMessageId, state.Subject, state.SenderAddress, state.ReceivedOn);
+
+            if (email.RoutedTo is not null)
+            {
+                return;
+            }
+
+            var unfinished = state.Submissions.Where(submission => submission.StatusCode.IsUnfinishedPaceStatus()).ToList();
+
+            if (unfinished.Count > 0)
+            {
+                email.AwaitingPace = true;
+
+                var retry = unfinished
+                    .Where(submission => submission.StatusCode == PaceSubmissionStatus.RetryLater)
+                    .OrderByDescending(submission => submission.AttemptCount)
+                    .FirstOrDefault();
+
+                if (retry is not null)
+                {
+                    email.WaitingForPace ??= new PaceRetryInfo(retry.AttemptCount, paceOptions.Value.MaxAttempts, retry.NextAttemptOn);
+                }
+
+                logger.LogInformation(
+                    "Message {GraphMessageId} (mail message {MailMessageId}) stays in the Inbox: {UnfinishedCount} of its {InvoiceCount} invoice(s) are not finished in Pace yet.",
+                    state.GraphMessageId,
+                    mailMessageId,
+                    unfinished.Count,
+                    state.Submissions.Count);
+                return;
+            }
+
+            // Pace is done with every invoice of this email, so it is no longer waiting on Pace - even if the move
+            // below fails, in which case the summary simply names no folder.
+            email.AwaitingPace = false;
+            email.WaitingForPace = null;
+
+            var status = DecideMailStatus((ApStatus)state.MailStatusId, state.Submissions);
+            var destination = status switch
+            {
+                ApStatus.MailError => MailDestinationFolder.Errors,
+                ApStatus.MailNeedsReview => MailDestinationFolder.NeedsReview,
+                _ => MailDestinationFolder.Processed
+            };
+
+            await mailMessageRepository.SetStatusAsync(mailMessageId, status, BuildMailReason(state.MailErrorMessage, state.Submissions), cancellationToken);
+            await mailSource.MoveMessageAsync(state.GraphMessageId, destination, cancellationToken);
+
+            email.RoutedTo = destination;
+            email.RoutedSubmissions.AddRange(state.Submissions
+                .Where(submission => submission.PaceSubmissionId is not null)
+                .Select(submission => (submission.PaceSubmissionId!.Value, submission.Notified)));
+
+            foreach (var submission in state.Submissions)
+            {
+                var kind = PaceSummaryEntry.KindOf(submission.StatusCode, submission.RequiresReview);
+
+                if (kind == PaceSummaryKind.Error && destination == MailDestinationFolder.Errors)
+                {
+                    logger.LogInformation(
+                        "Pace validation error routed message {GraphMessageId} for invoice {InvoiceId} to Errors.",
+                        state.GraphMessageId,
+                        submission.InvoiceId);
+                }
+                else if (kind == PaceSummaryKind.NeedsReview && destination == MailDestinationFolder.NeedsReview)
+                {
+                    logger.LogInformation(
+                        "Pace invoice {InvoiceId} (needs review) routed message {GraphMessageId} to NeedsReview.",
+                        submission.InvoiceId,
+                        state.GraphMessageId);
+                }
+            }
+
+            logger.LogInformation(
+                "Message {GraphMessageId} (mail message {MailMessageId}) routed to {Destination} after the Pace step: {InvoiceCount} invoice(s) sent to Pace, mailbox status {MailboxStatus}, final status {FinalStatus}.",
+                state.GraphMessageId,
+                mailMessageId,
+                destination,
+                state.Submissions.Count,
+                (ApStatus)state.MailStatusId,
+                status);
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
             logger.LogError(
                 exception,
-                "Pace submission {PaceSubmissionId} (invoice {InvoiceId}) completed but mail routing failed; the next run will redo the routing.",
-                paceSubmissionId,
-                invoiceId);
+                "Pace submission(s) {PaceSubmissionIds} of mail message {MailMessageId} completed but mail routing failed; the next run will redo the routing.",
+                string.Join(", ", paceSubmissionIds),
+                mailMessageId);
         }
     }
 
     /// <summary>
+    /// The worst of the mailbox step's verdict and every Pace outcome: any error is Errors, otherwise anything
+    /// that needs review is NeedsReview, otherwise Processed.
+    /// </summary>
+    internal static ApStatus DecideMailStatus(ApStatus mailboxStatus, IEnumerable<MailRoutingSubmission> submissions)
+    {
+        var worst = mailboxStatus switch
+        {
+            ApStatus.MailError => ApStatus.MailError,
+            ApStatus.MailNeedsReview or ApStatus.MailSkipped or ApStatus.MailDuplicate => ApStatus.MailNeedsReview,
+            _ => ApStatus.MailProcessed
+        };
+
+        foreach (var submission in submissions)
+        {
+            var paceStatus = PaceSummaryEntry.KindOf(submission.StatusCode, submission.RequiresReview) switch
+            {
+                PaceSummaryKind.Error => ApStatus.MailError,
+                PaceSummaryKind.NeedsReview => ApStatus.MailNeedsReview,
+                _ => ApStatus.MailProcessed
+            };
+
+            if (APProcessor.Severity(paceStatus) > APProcessor.Severity(worst))
+            {
+                worst = paceStatus;
+            }
+        }
+
+        return worst;
+    }
+
+    /// <summary>
+    /// The email's stored reason: the mailbox step's own reason, followed by every Pace error or review reason
+    /// not already in it - so re-routing the same email (the recovery sweep) never repeats one.
+    /// </summary>
+    internal static string? BuildMailReason(string? mailboxReason, IEnumerable<MailRoutingSubmission> submissions)
+    {
+        var reasons = new List<string>();
+
+        if (!string.IsNullOrWhiteSpace(mailboxReason))
+        {
+            reasons.Add(mailboxReason);
+        }
+
+        foreach (var submission in submissions)
+        {
+            if (PaceSummaryEntry.KindOf(submission.StatusCode, submission.RequiresReview) != PaceSummaryKind.Success
+                && !string.IsNullOrWhiteSpace(submission.ErrorMessage)
+                && !reasons.Any(reason => reason.Contains(submission.ErrorMessage, StringComparison.Ordinal)))
+            {
+                reasons.Add(submission.ErrorMessage);
+            }
+        }
+
+        return reasons.Count == 0 ? mailboxReason : string.Join(" ", reasons);
+    }
+
+    /// <summary>
     /// Replays mail routing for submissions whose Pace outcome is already final but whose routing never got
-    /// confirmed - e.g. the process crashed, a prior run's routing exception was caught by RouteAndMarkAsync,
-    /// or the summary email could not be sent. Runs at the top of every ProcessPendingAsync call so a stuck
-    /// invoice self-heals on the next scheduled run rather than staying in the Inbox indefinitely. A row whose
+    /// confirmed - e.g. the process crashed, a prior run's routing failed, the email was still waiting on a
+    /// sibling invoice, or the summary email could not be sent. Runs at the top of every ProcessPendingAsync
+    /// call so a stuck email self-heals on the next scheduled run rather than staying in the Inbox. A row whose
     /// summary line already went out is replayed without being reported again.
     /// </summary>
-    private async Task RecoverUnroutedSubmissionsAsync(
-        List<PaceSummaryEntry> summaryEntries,
-        HashSet<long> routingAttempts,
-        CancellationToken cancellationToken)
+    private async Task RecoverUnroutedSubmissionsAsync(CancellationToken cancellationToken)
     {
         var unrouted = await paceSubmissionRepository.ClaimUnroutedFinalSubmissionsAsync(cancellationToken);
 
-        foreach (var submission in unrouted)
+        foreach (var emailGroup in unrouted.GroupBy(submission => submission.MailMessageId))
         {
-            var reason = string.IsNullOrWhiteSpace(submission.ErrorMessage)
-                ? submission.RequiresReview
-                    ? $"Pace invoice '{submission.InvoiceNumber}' for PO '{submission.CustomerPO}' requires review."
-                    : $"Pace invoice '{submission.InvoiceNumber}' for PO '{submission.CustomerPO}': Pace validation failed."
-                : submission.ErrorMessage;
+            var first = emailGroup.First();
+            var email = runSummary.Email(first.MailMessageId, first.Subject, first.SenderAddress, first.ReceivedOn);
 
-            await RouteAndMarkAsync(
-                routingAttempts,
-                submission.PaceSubmissionId,
-                submission.InvoiceId,
-                () => submission.RequiresReview
-                    ? RouteNeedsReviewAsync(
-                        submission.PaceSubmissionId,
-                        submission.InvoiceId,
-                        submission.InvoiceNumber,
-                        submission.CustomerPO,
-                        submission.BillVendor ?? submission.PaceVendorAccountNumber,
-                        submission.StatusCode,
-                        submission.PaceBillBatchId,
-                        submission.PaceBillId,
-                        reason,
-                        submission.MailMessageId,
-                        submission.GraphMessageId,
-                        submission.AlreadyNotified,
-                        summaryEntries,
-                        cancellationToken)
-                    : RoutePaceErrorAsync(
-                        submission.PaceSubmissionId,
-                        submission.InvoiceId,
-                        submission.InvoiceNumber,
-                        submission.CustomerPO,
-                        submission.StatusCode,
-                        submission.MailMessageId,
-                        submission.GraphMessageId,
-                        reason,
-                        submission.AlreadyNotified,
-                        summaryEntries,
-                        cancellationToken),
-                cancellationToken);
+            foreach (var submission in emailGroup.Where(submission => !submission.AlreadyNotified))
+            {
+                var summary = PaceBillSummary.TryReadFrom(submission.ResponseJson);
+                var reason = string.IsNullOrWhiteSpace(submission.ErrorMessage)
+                    ? submission.RequiresReview
+                        ? $"Pace invoice '{submission.InvoiceNumber}' for PO '{submission.CustomerPO}' requires review."
+                        : null
+                    : submission.ErrorMessage;
+
+                email.PaceEntries.Add(new PaceSummaryEntry(
+                    PaceSummaryEntry.KindOf(submission.StatusCode, submission.RequiresReview),
+                    submission.PaceSubmissionId,
+                    submission.InvoiceId,
+                    submission.InvoiceNumber,
+                    submission.CustomerPO,
+                    submission.InvoiceDate,
+                    submission.Total,
+                    summary?.VendorId ?? submission.BillVendor ?? submission.PaceVendorAccountNumber,
+                    summary?.VendorName ?? submission.ClientName,
+                    submission.StatusCode,
+                    submission.PaceBillBatchId,
+                    submission.PaceBillId,
+                    reason,
+                    summary is { Case: not PaceInvoiceCase.Other } ? summary : null));
+            }
+
+            await RouteEmailIfFinishedAsync(first.MailMessageId, emailGroup.Select(submission => submission.PaceSubmissionId).ToList(), cancellationToken);
         }
 
         if (unrouted.Count > 0)
@@ -366,292 +541,5 @@ public sealed class PaceInvoiceProcessor(
     {
         var delayMinutes = Math.Min(Math.Pow(2, Math.Max(1, attemptCount)), 60);
         return DateTime.UtcNow.AddMinutes(delayMinutes);
-    }
-
-    /// <param name="statusCode">
-    /// The submission's actual outcome (Error or PoNotReceived), recorded on the summary entry as-is - the
-    /// recovery path uses the stored status, so passing anything else would label the same invoice
-    /// differently depending on which path routed it.
-    /// </param>
-    private Task RoutePaceErrorAsync(
-        PaceSubmissionClaim claim,
-        string statusCode,
-        string? errorMessage,
-        List<PaceSummaryEntry> summaryEntries,
-        CancellationToken cancellationToken)
-    {
-        var message = string.IsNullOrWhiteSpace(errorMessage)
-            ? $"Pace invoice '{claim.InvoiceNumber}' for PO '{claim.CustomerPO}': Pace validation failed."
-            : errorMessage;
-
-        return RoutePaceErrorAsync(
-            claim.PaceSubmissionId,
-            claim.InvoiceId,
-            claim.InvoiceNumber,
-            claim.CustomerPO,
-            statusCode,
-            claim.MailMessageId,
-            claim.GraphMessageId,
-            message,
-            alreadyNotified: false,
-            summaryEntries,
-            cancellationToken);
-    }
-
-    /// <summary>
-    /// Takes primitive fields rather than a <see cref="PaceSubmissionClaim"/> so both live processing and
-    /// <see cref="RecoverUnroutedSubmissionsAsync"/> (which only has a persisted row, not a live claim) can
-    /// share this routing logic.
-    /// <para>
-    /// Sends no email of its own: the error is reported once, in the run's Pace summary
-    /// (<see cref="SendPaceSummaryAsync"/>), which is also where the row is marked notified/routed. The entry
-    /// is added before the move, so a failed move is still reported. A row whose summary line was already
-    /// delivered gets no entry and is marked routed as soon as its move succeeds.
-    /// </para>
-    /// </summary>
-    private async Task RoutePaceErrorAsync(
-        long paceSubmissionId,
-        long invoiceId,
-        string? invoiceNumber,
-        string? customerPO,
-        string statusCode,
-        long mailMessageId,
-        string graphMessageId,
-        string message,
-        bool alreadyNotified,
-        List<PaceSummaryEntry> summaryEntries,
-        CancellationToken cancellationToken)
-    {
-        await mailMessageRepository.SetStatusAsync(mailMessageId, ApStatus.MailError, message, cancellationToken);
-
-        PaceSummaryEntry? entry = null;
-
-        if (!alreadyNotified)
-        {
-            entry = new PaceSummaryEntry(
-                MailDestinationFolder.Errors,
-                paceSubmissionId,
-                invoiceId,
-                invoiceNumber,
-                customerPO,
-                PaceVendorAccountNumber: null,
-                statusCode,
-                PaceBillBatchId: null,
-                PaceBillId: null,
-                message);
-            summaryEntries.Add(entry);
-        }
-
-        await mailSource.MoveMessageAsync(graphMessageId, MailDestinationFolder.Errors, cancellationToken);
-
-        logger.LogInformation(
-            "Pace validation error routed message {GraphMessageId} for invoice {InvoiceId} to Errors.",
-            graphMessageId,
-            invoiceId);
-
-        if (entry is not null)
-        {
-            entry.Moved = true;
-        }
-        else
-        {
-            await paceSubmissionRepository.MarkMailRoutedAsync(paceSubmissionId, cancellationToken);
-        }
-    }
-
-    private Task RouteNeedsReviewAsync(
-        PaceSubmissionClaim claim,
-        PaceInvoiceSubmissionResult result,
-        List<PaceSummaryEntry> summaryEntries,
-        CancellationToken cancellationToken)
-    {
-        var reason = string.IsNullOrWhiteSpace(result.ErrorMessage)
-            ? $"Pace invoice '{claim.InvoiceNumber}' for PO '{claim.CustomerPO}' requires review."
-            : result.ErrorMessage;
-
-        return RouteNeedsReviewAsync(
-            claim.PaceSubmissionId,
-            claim.InvoiceId,
-            claim.InvoiceNumber,
-            claim.CustomerPO,
-            result.BillVendor ?? claim.PaceVendorAccountNumber,
-            result.StatusCode,
-            result.PaceBillBatchId,
-            result.PaceBillId,
-            reason,
-            claim.MailMessageId,
-            claim.GraphMessageId,
-            alreadyNotified: false,
-            summaryEntries,
-            cancellationToken);
-    }
-
-    /// <summary>
-    /// Takes primitive fields rather than a <see cref="PaceSubmissionClaim"/> so both live processing and
-    /// <see cref="RecoverUnroutedSubmissionsAsync"/> (which only has a persisted row, not a live claim) can
-    /// share this routing logic.
-    /// <para>
-    /// The summary goes out once, at the end of the run, so a summary-bound row is marked notified/routed there
-    /// (<see cref="SendPaceSummaryAsync"/>), not here. A row whose summary line was already delivered gets no
-    /// entry and is marked routed as soon as its move succeeds.
-    /// </para>
-    /// </summary>
-    private async Task RouteNeedsReviewAsync(
-        long paceSubmissionId,
-        long invoiceId,
-        string? invoiceNumber,
-        string? customerPO,
-        string? billVendor,
-        string statusCode,
-        string? paceBillBatchId,
-        string? paceBillId,
-        string reason,
-        long mailMessageId,
-        string graphMessageId,
-        bool alreadyNotified,
-        List<PaceSummaryEntry> summaryEntries,
-        CancellationToken cancellationToken)
-    {
-        await mailMessageRepository.SetStatusAsync(mailMessageId, ApStatus.MailNeedsReview, reason, cancellationToken);
-
-        // Added after the status is committed (so the summary never reports an unsaved route) and before the
-        // move (so a move failure does not drop this finalized submission from the summary).
-        PaceSummaryEntry? entry = null;
-
-        if (!alreadyNotified)
-        {
-            entry = new PaceSummaryEntry(
-                MailDestinationFolder.NeedsReview,
-                paceSubmissionId,
-                invoiceId,
-                invoiceNumber,
-                customerPO,
-                billVendor,
-                statusCode,
-                paceBillBatchId,
-                paceBillId,
-                reason);
-            summaryEntries.Add(entry);
-        }
-
-        await mailSource.MoveMessageAsync(graphMessageId, MailDestinationFolder.NeedsReview, cancellationToken);
-
-        logger.LogInformation(
-            "Pace invoice {InvoiceId} (no matching PO) routed message {GraphMessageId} to NeedsReview.",
-            invoiceId,
-            graphMessageId);
-
-        if (entry is not null)
-        {
-            entry.Moved = true;
-        }
-        else
-        {
-            await paceSubmissionRepository.MarkMailRoutedAsync(paceSubmissionId, cancellationToken);
-        }
-    }
-
-    private static string BuildPaceSummarySubject(IReadOnlyList<PaceSummaryEntry> entries)
-    {
-        var errorCount = entries.Count(entry => entry.Destination == MailDestinationFolder.Errors);
-        var needsReviewCount = entries.Count - errorCount;
-
-        return $"{PaceSummarySubjectPrefix} ({errorCount} {(errorCount == 1 ? "error" : "errors")}, {needsReviewCount} need review)";
-    }
-
-    private static string BuildPaceSummaryBody(IReadOnlyList<PaceSummaryEntry> entries)
-    {
-        var errors = entries.Where(entry => entry.Destination == MailDestinationFolder.Errors).ToList();
-        var needsReview = entries.Where(entry => entry.Destination == MailDestinationFolder.NeedsReview).ToList();
-        var blocks = new List<string>
-        {
-            "<p>This is a summary of the Pace step of the AP Automation run just completed. Please review the "
-            + "Errors and NeedsReview folders as needed.</p>"
-        };
-
-        if (errors.Count > 0)
-        {
-            blocks.Add($"<p><b>=== Errors ({errors.Count}) ===</b></p>");
-            blocks.AddRange(errors.Select(entry =>
-                $"<p><b>Invoice {Html(entry.InvoiceNumber ?? "unknown")}</b> (PO {Html(entry.CustomerPO ?? "unknown")}): "
-                + $"{BuildStatusLabel(entry)}{Html(BuildReasonForSummary(entry.Reason))}<br>\n{BuildMoveLine(entry)}</p>"));
-        }
-
-        if (needsReview.Count > 0)
-        {
-            blocks.Add($"<p><b>=== NeedsReview ({needsReview.Count}) ===</b></p>");
-            blocks.Add("<p>These invoices had no matching purchase order in Pace. Please verify the coding and PO number; "
-                + "entries marked 'No bill was created' need manual entry after the listed problem is fixed.</p>");
-            blocks.AddRange(needsReview.Select(entry =>
-            {
-                var billDescription = entry.StatusCode switch
-                {
-                    PaceSubmissionStatus.BillCreated =>
-                        $"Bill {Html(entry.PaceBillId)} created in batch {Html(entry.PaceBillBatchId)} using the Pace vendor default GL account/department.",
-                    PaceSubmissionStatus.DryRunPrepared =>
-                        "Pace writes are disabled; a bill would be created using the Pace vendor default GL account/department.",
-                    _ =>
-                        $"No bill was created (status {Html(entry.StatusCode)}): {Html(BuildReasonForSummary(entry.Reason))}"
-                };
-
-                return $"<p><b>Invoice {Html(entry.InvoiceNumber ?? "unknown")}</b> (PO {Html(entry.CustomerPO ?? "unknown")}, vendor {Html(entry.PaceVendorAccountNumber ?? "unknown")}): "
-                    + $"no matching Pace PO was found. {billDescription}<br>\n{BuildMoveLine(entry)}</p>";
-            }));
-        }
-
-        return string.Join("\n", blocks);
-    }
-
-    /// <summary>
-    /// PoNotReceived shares the Errors folder with real errors but is not one - the PO exists, its goods just
-    /// haven't been received in Pace yet - so its line says so up front.
-    /// </summary>
-    private static string BuildStatusLabel(PaceSummaryEntry entry) =>
-        entry.StatusCode == PaceSubmissionStatus.PoNotReceived ? "PO not received: " : string.Empty;
-
-    /// <summary>
-    /// Where the email actually is. The summary is sent at the end of the run, so this reflects the move's real
-    /// outcome - a failed move is not reported as if the email were already in its folder.
-    /// </summary>
-    private static string BuildMoveLine(PaceSummaryEntry entry) =>
-        entry.Moved
-            ? $"Moved to: {entry.Destination}"
-            : $"Could not be moved to {entry.Destination}, still in Inbox";
-
-    /// <summary>
-    /// The stored error without its leading "Pace invoice '...' for PO '...': ", since the summary line already
-    /// names the invoice and PO, and with its first letter capitalised.
-    /// </summary>
-    internal static string BuildReasonForSummary(string reason)
-    {
-        var trimmed = ReasonInvoiceAndPoPrefixRegex.Replace(reason, string.Empty).Trim();
-
-        if (trimmed.Length == 0)
-        {
-            return reason;
-        }
-
-        return char.ToUpperInvariant(trimmed[0]) + trimmed[1..];
-    }
-
-    private static string Html(string? value) => WebUtility.HtmlEncode(value) ?? string.Empty;
-
-    private sealed record PaceSummaryEntry(
-        MailDestinationFolder Destination,
-        long PaceSubmissionId,
-        long InvoiceId,
-        string? InvoiceNumber,
-        string? CustomerPO,
-        string? PaceVendorAccountNumber,
-        string StatusCode,
-        string? PaceBillBatchId,
-        string? PaceBillId,
-        string Reason)
-    {
-        /// <summary>
-        /// Set once this entry's message has been moved. Only moved entries are marked fully routed after the
-        /// summary is sent; the rest keep MailRoutedOn NULL so the sweep redoes the move.
-        /// </summary>
-        public bool Moved { get; set; }
     }
 }

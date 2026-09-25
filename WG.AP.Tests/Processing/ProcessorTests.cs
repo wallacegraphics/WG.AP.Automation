@@ -342,161 +342,39 @@ public class ProcessorTests
     private static readonly DateTimeOffset Day3 = new(2026, 8, 28, 16, 5, 58, TimeSpan.Zero);
 
     [Fact]
-    public void BuildDigestBody_IncludesIntroLineAndPutsTotalsBeforeTheGroups()
+    public void BuildParseResult_ListsParsedFilesAndEveryProblem()
     {
-        var entries = new[]
-        {
-            new APProcessor.DigestEntry(MailDestinationFolder.Processed, Day1, "line one.", []),
-        };
-        var outcomes = new Dictionary<ApStatus, int>
-        {
-            [ApStatus.MailProcessed] = 2,
-            [ApStatus.MailNeedsReview] = 1,
-            [ApStatus.MailError] = 0,
-            [ApStatus.MailSkipped] = 3,
-        };
+        var result = new APProcessor.MessageOutcome(
+            ApStatus.MailNeedsReview,
+            "unused",
+            InvoiceCount: 3,
+            AttachmentCount: 3,
+            PdfCount: 3,
+            SuccessCount: 2,
+            [
+                ("a.pdf", ApStatus.MailProcessed, null),
+                ("scan_001.pdf", ApStatus.MailNeedsReview, "'scan_001.pdf': missing InvoiceDate."),
+                ("b.pdf", ApStatus.MailProcessed, null)
+            ]);
 
-        var body = APProcessor.BuildDigestBody(entries, outcomes);
+        var parse = APProcessor.BuildParseResult(result);
 
-        Assert.Contains("verify the", body, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("2 MailProcessed", body);
-        Assert.Contains("1 MailNeedsReview", body);
-        Assert.Contains("0 MailError", body);
-        Assert.Contains("3 MailSkipped", body);
-        Assert.True(body.IndexOf("Totals:", StringComparison.Ordinal) < body.IndexOf("=== Processed", StringComparison.Ordinal));
+        Assert.Equal(ApStatus.MailNeedsReview, parse.Status);
+        Assert.Equal(3, parse.AttachmentCount);
+        Assert.Equal(3, parse.PdfCount);
+        Assert.Equal(["a.pdf", "b.pdf"], parse.ParsedFiles);
+        Assert.Equal(["'scan_001.pdf': missing InvoiceDate."], parse.Problems);
     }
 
     [Fact]
-    public void BuildDigestBody_GroupsAreOrderedProcessedThenNeedsReviewThenErrors_RegardlessOfInputOrder()
+    public void BuildParseResult_WithNoPdfBreakdown_UsesTheMessageLevelReason()
     {
-        var entries = new[]
-        {
-            new APProcessor.DigestEntry(MailDestinationFolder.Errors, Day1, "error line.", []),
-            new APProcessor.DigestEntry(MailDestinationFolder.Processed, Day1, "processed line.", []),
-            new APProcessor.DigestEntry(MailDestinationFolder.NeedsReview, Day1, "review line.", []),
-        };
-        var outcomes = new Dictionary<ApStatus, int>();
+        var result = new APProcessor.MessageOutcome(ApStatus.MailSkipped, "No PDF attachment(s); 2 non-PDF attachment(s) received.", 0, 2, 0, 0);
 
-        var body = APProcessor.BuildDigestBody(entries, outcomes);
+        var parse = APProcessor.BuildParseResult(result);
 
-        var processedIndex = body.IndexOf("=== Processed", StringComparison.Ordinal);
-        var needsReviewIndex = body.IndexOf("=== NeedsReview", StringComparison.Ordinal);
-        var errorsIndex = body.IndexOf("=== Errors", StringComparison.Ordinal);
-
-        Assert.True(processedIndex < needsReviewIndex);
-        Assert.True(needsReviewIndex < errorsIndex);
-    }
-
-    [Fact]
-    public void BuildDigestBody_OrdersEntriesWithinAGroupByReceivedDateAscending_NullsLast()
-    {
-        var entries = new[]
-        {
-            new APProcessor.DigestEntry(MailDestinationFolder.Processed, Day3, "latest.", []),
-            new APProcessor.DigestEntry(MailDestinationFolder.Processed, null, "unknown time.", []),
-            new APProcessor.DigestEntry(MailDestinationFolder.Processed, Day1, "earliest.", []),
-            new APProcessor.DigestEntry(MailDestinationFolder.Processed, Day2, "middle.", []),
-        };
-        var outcomes = new Dictionary<ApStatus, int>();
-
-        var body = APProcessor.BuildDigestBody(entries, outcomes);
-
-        var earliest = body.IndexOf("earliest.", StringComparison.Ordinal);
-        var middle = body.IndexOf("middle.", StringComparison.Ordinal);
-        var latest = body.IndexOf("latest.", StringComparison.Ordinal);
-        var unknown = body.IndexOf("unknown time.", StringComparison.Ordinal);
-
-        Assert.True(earliest < middle);
-        Assert.True(middle < latest);
-        Assert.True(latest < unknown);
-    }
-
-    [Fact]
-    public void BuildDigestBody_TwoEntriesThatRenderIdentically_CollapseToOne()
-    {
-        // Mirrors two dbo.MailMessage rows for what is actually one physical email (e.g. Graph
-        // reissuing the message's id after a folder move) - received a millisecond apart, so the
-        // summary line (formatted to whole seconds) and detail lines are byte-identical.
-        var entries = new[]
-        {
-            new APProcessor.DigestEntry(MailDestinationFolder.NeedsReview, Day1, "same message.", ["&nbsp;&nbsp;&nbsp;&nbsp;79 PDF(s) failed: same reason."]),
-            new APProcessor.DigestEntry(MailDestinationFolder.NeedsReview, Day1.AddMilliseconds(1), "same message.", ["&nbsp;&nbsp;&nbsp;&nbsp;79 PDF(s) failed: same reason."]),
-        };
-        var outcomes = new Dictionary<ApStatus, int>();
-
-        var body = APProcessor.BuildDigestBody(entries, outcomes);
-
-        Assert.Contains("=== NeedsReview (2) ===", body);
-        Assert.Contains("Routed to NeedsReview (1).", body);
-        Assert.Single(System.Text.RegularExpressions.Regex.Matches(body, "same message\\."));
-    }
-
-    [Fact]
-    public void BuildDigestBody_ProcessedGroup_HasNoBlankLinesAndOneTrailingRoutedLine()
-    {
-        var entries = new[]
-        {
-            new APProcessor.DigestEntry(MailDestinationFolder.Processed, Day1, "first message.", []),
-            new APProcessor.DigestEntry(MailDestinationFolder.Processed, Day2, "second message.", []),
-        };
-        var outcomes = new Dictionary<ApStatus, int>();
-
-        var body = APProcessor.BuildDigestBody(entries, outcomes);
-
-        Assert.Contains(
-            "<p><b>=== Processed (2) ===</b></p>\n<p>first message.<br>\nsecond message.<br>\nRouted to Processed (2).</p>",
-            body);
-        Assert.DoesNotContain("first message. Routed to Processed.", body);
-    }
-
-    [Fact]
-    public void BuildDigestBody_NeedsReviewGroup_SeparatesMessagesIntoTheirOwnParagraphAndKeepsPerMessageRouting()
-    {
-        var entries = new[]
-        {
-            new APProcessor.DigestEntry(MailDestinationFolder.NeedsReview, Day1, "first message.", ["&nbsp;&nbsp;&nbsp;&nbsp;detail one."]),
-            new APProcessor.DigestEntry(MailDestinationFolder.NeedsReview, Day2, "second message.", []),
-        };
-        var outcomes = new Dictionary<ApStatus, int>();
-
-        var body = APProcessor.BuildDigestBody(entries, outcomes);
-
-        Assert.Contains(
-            "<p><b>=== NeedsReview (2) ===</b></p>\n<p>first message. Routed to NeedsReview.<br>\n&nbsp;&nbsp;&nbsp;&nbsp;detail one.</p>\n<p>second message. Routed to NeedsReview.</p>\n<p>Routed to NeedsReview (2).</p>",
-            body);
-    }
-
-    [Fact]
-    public void BuildDigestBody_HeaderShowsRawRowCount_TrailingLineShowsDistinctRoutedCount()
-    {
-        // Two dbo.MailMessage rows for one physical email (e.g. Graph reissuing the message's id
-        // after a move) collapse to one displayed block, but the header still states how many raw
-        // rows are behind it - the two numbers are deliberately different and both visible.
-        var entries = new[]
-        {
-            new APProcessor.DigestEntry(MailDestinationFolder.NeedsReview, Day1, "same message.", []),
-            new APProcessor.DigestEntry(MailDestinationFolder.NeedsReview, Day1.AddMilliseconds(1), "same message.", []),
-        };
-        var outcomes = new Dictionary<ApStatus, int>();
-
-        var body = APProcessor.BuildDigestBody(entries, outcomes);
-
-        Assert.Contains("<p><b>=== NeedsReview (2) ===</b></p>", body);
-        Assert.Contains("<p>Routed to NeedsReview (1).</p>", body);
-    }
-
-    [Fact]
-    public void BuildDigestBody_SectionHeaderIsBoldAndInItsOwnParagraph()
-    {
-        var entries = new[]
-        {
-            new APProcessor.DigestEntry(MailDestinationFolder.Processed, Day1, "a message.", []),
-        };
-        var outcomes = new Dictionary<ApStatus, int>();
-
-        var body = APProcessor.BuildDigestBody(entries, outcomes);
-
-        Assert.Contains("<p><b>=== Processed (1) ===</b></p>", body);
+        Assert.Empty(parse.ParsedFiles);
+        Assert.Equal(["No PDF attachment(s); 2 non-PDF attachment(s) received."], parse.Problems);
     }
 
     [Fact]

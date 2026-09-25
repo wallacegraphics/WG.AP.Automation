@@ -30,4 +30,7 @@ public sealed record PaceInvoiceSubmissionResult
     public string? ErrorMessage { get; init; }
 
     public bool RequiresReview { get; init; }
+
+    /// <summary>What the PO/receipt rules decided, for the run summary email; null when they never ran.</summary>
+    public PaceBillSummary? Summary { get; init; }
 }

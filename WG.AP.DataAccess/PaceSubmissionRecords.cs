@@ -73,6 +73,55 @@ public sealed record PaceSubmissionClaim
     public string? PaceBillBatchId { get; init; }
     public string? PaceBillId { get; init; }
     public string? PaceBillLineId { get; init; }
+
+    // For the run summary email: which vendor email this invoice came from, and when it was dated.
+    public DateOnly? InvoiceDate { get; init; }
+    public string? Subject { get; init; }
+    public string? SenderAddress { get; init; }
+    public DateTimeOffset? ReceivedOn { get; init; }
+}
+
+public static class PaceSubmissionStatusExtensions
+{
+    /// <summary>
+    /// True for a status the Pace step can still change (queued, being worked, or waiting to retry): an email
+    /// is routed only once none of its invoices is in one of these.
+    /// </summary>
+    public static bool IsUnfinishedPaceStatus(this string? statusCode) =>
+        statusCode is null or PaceSubmissionStatus.Pending or PaceSubmissionStatus.InProgress or PaceSubmissionStatus.RetryLater;
+}
+
+/// <summary>
+/// Everything needed to decide where one vendor email goes once the Pace step has finished with it: its
+/// status from the mailbox step and the Pace outcome of every invoice that was sent to Pace.
+/// </summary>
+public sealed record MailRoutingState
+{
+    public required long MailMessageId { get; init; }
+    public required string GraphMessageId { get; init; }
+    public required int MailStatusId { get; init; }
+    public string? MailErrorMessage { get; init; }
+    public string? Subject { get; init; }
+    public string? SenderAddress { get; init; }
+    public DateTimeOffset? ReceivedOn { get; init; }
+    public required IReadOnlyList<MailRoutingSubmission> Submissions { get; init; }
+}
+
+/// <summary>
+/// One extracted invoice of a <see cref="MailRoutingState"/>. <see cref="PaceSubmissionId"/> is null when the
+/// invoice has not been queued for Pace yet, which counts as unfinished.
+/// </summary>
+public sealed record MailRoutingSubmission
+{
+    public required long InvoiceId { get; init; }
+    public long? PaceSubmissionId { get; init; }
+    public string? StatusCode { get; init; }
+    public bool RequiresReview { get; init; }
+    public string? ErrorMessage { get; init; }
+    public int AttemptCount { get; init; }
+    public DateTime? NextAttemptOn { get; init; }
+    public bool Notified { get; init; }
+    public bool MailRouted { get; init; }
 }
 
 public sealed record PaceSubmissionCompletion
@@ -129,6 +178,16 @@ public sealed record PaceUnroutedSubmission
     /// redo only the status update and move, never notify again.
     /// </summary>
     public required bool AlreadyNotified { get; init; }
+
+    // For rebuilding the run summary email's line for this invoice exactly as the live run would have.
+    public string? ResponseJson { get; init; }
+    public DateOnly? InvoiceDate { get; init; }
+    public decimal? Total { get; init; }
+    public string? ClientCode { get; init; }
+    public string? ClientName { get; init; }
+    public string? Subject { get; init; }
+    public string? SenderAddress { get; init; }
+    public DateTimeOffset? ReceivedOn { get; init; }
 }
 
 public sealed record PaceSubmissionRetry

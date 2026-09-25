@@ -17,7 +17,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Architecture
 
-This is a .NET 10 solution (`WG.AP.Automation.slnx`) automating AP (accounts payable) invoice intake from a mailbox. Mailbox intake, PDF invoice extraction, and the SQL database that records all of it are implemented. Pace integration and reporting are still scaffolds.
+This is a .NET 10 solution (`WG.AP.Automation.slnx`) automating AP (accounts payable) invoice intake from a mailbox. Mailbox intake, PDF invoice extraction, Pace bill creation, and the SQL database that records all of it are implemented. Reporting is still a scaffold.
 
 **Projects:**
 - `WG.AP.Core` — dependency-free abstractions only (`Abstractions/IMailSource.cs`, `IMailSender.cs`, plus DTOs: `MailMessageSummary`, `MailAttachmentSummary`, `MailDestinationFolder`, `MailSendRequest`, `MailboxDeltaResult`, `IMailboxSyncStateStore`). No reference to `Microsoft.Graph`/`Azure.Identity` — downstream consumers depend on the contract, not the Graph SDK.
@@ -26,7 +26,8 @@ This is a .NET 10 solution (`WG.AP.Automation.slnx`) automating AP (accounts pay
 - `WG.AP.Database` — the SQL Database Project (`Microsoft.Build.Sql` SDK, **2.2.0 or later required** — 1.x cannot restore under the .NET 10 SDK). 10 tables, seeds as `MERGE` in post-deployment, Dev/Prod publish profiles, plus `Tests/constraints.sql`. See `docs/references/database-schema.md`.
 - `WG.AP.Processing` (assembly/namespace `WG.AP.Processor`, project folder `WG.AP.Processing` — the names don't match) — the entry point. A console app hosted via `Host.CreateApplicationBuilder`; `Program.cs` wires up all DI and config; `APProcessor` is the top-level orchestrator; `Logging/` holds a custom file-logging provider.
 - `WG.AP.Invoice` — PDF invoice extraction: `PdfInvoiceFieldExtractor` (deterministic regex tier, Ollama fallback), `SanmarPdfHeaderExtractor`, `OllamaClient`, `InvoiceFieldsJsonParser`, and the `InvoiceFields`/`ExtractionRequest` models. Excel/manifest handling was removed — attachments still arrive, nothing reads them.
-- `WG.AP.Reporting`, `WG.AP.Integrations.Pace` — still empty scaffolds, wired with project references but no implementation.
+- `WG.AP.Integrations.Pace` — the Pace bill integration: `PaceInvoiceService` applies the six PO/receipt cases (only `PurchaseOrderReceipt.status = 'R'` receipts are billed) and returns a `PaceBillSummary` with each outcome; `PaceBillBatchResolver` finds or creates the daily bill batch; `Generated/PaceClient.cs` is the NSwag client. `PaceInvoiceProcessor` (in `WG.AP.Processing`) drives it from the `intgr.PaceSubmission` outbox and moves each vendor email once, after its last invoice, to the worst result's folder. `RunSummary`/`RunSummaryNotifier` then send one summary email per vendor email, covering parsing and Pace. See `docs/references/database-schema.md`.
+- `WG.AP.Reporting` — still an empty scaffold, wired with project references but no implementation.
 - `WG.AP.Tests` — xunit tests referencing every other project. `Email/FakeGraphHandler.cs` fakes the Graph HTTP layer (routes by method + URL match) so Graph-dependent tests run with no real tenant, credentials, or network access.
 
 **The mailbox pipeline** (`Program.cs` → `APProcessor` → `MailboxSyncProcessor` → `GraphMailboxProcessor` → `IMailboxSyncStateStore`):
